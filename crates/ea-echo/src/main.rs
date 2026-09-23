@@ -12,6 +12,11 @@
 //! - `hang`       -- never returns, so callers must rely on their own timeout
 //! - `watch_poll` -- returns an empty JSON array, standing in for the
 //!   change-polling tool every real connector will expose
+//!
+//! Passed `--hang-handshake`, the process starts and then does nothing at all:
+//! it never answers `initialize`, standing in for a connector whose handshake
+//! wedges. Any other arguments are ignored, so a test can tag its own child
+//! with e.g. `--tag whatever` and find it again.
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -84,6 +89,11 @@ impl ServerHandler for EchoServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--hang-handshake") {
+        // Spawned, alive, and permanently silent: the client's handshake never
+        // completes. Used to prove one wedged connector cannot stall another.
+        std::future::pending::<()>().await;
+    }
     let service = EchoServer::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

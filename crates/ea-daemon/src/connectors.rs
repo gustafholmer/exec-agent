@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,7 +22,6 @@ use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
 
 /// A connected MCP client, driven by `rmcp`'s background service loop. The
 /// child process dies when the last handle is dropped.
@@ -36,8 +35,15 @@ const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
 /// per-request timeout should always fire first -- it is the one that also
 /// sends `notifications/cancelled` so the server can stop working -- and the
 /// outer guard only catches a transport wedged so badly that even the send
-/// never completes.
+/// never completes. Reaching the outer guard therefore means the transport is
+/// unusable, not merely slow: see [`Registry::discard_wedged_client`].
 const TIMEOUT_GRACE: Duration = Duration::from_millis(500);
+
+/// How long a connector gets to complete the MCP handshake before the daemon
+/// gives up, kills the child and reports the connector as down. A handshake is
+/// a single round trip against a freshly spawned process; a connector that
+/// cannot manage it in this long is not going to.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Default poll interval when `connector.toml` does not name one.
 const DEFAULT_WATCH_INTERVAL_SECS: u64 = 300;
@@ -204,21 +210,66 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Per-connector state.
+///
+/// Everything that has to be serialised is serialised *here* rather than
+/// across the whole registry. A connector whose child never answers the
+/// handshake holds only its own slot, so first contact with every other
+/// connector is unaffected.
+#[derive(Default)]
+struct Slot {
+    /// Held across a connection attempt, so two concurrent first calls to the
+    /// same connector cannot race into two child processes. This is the only
+    /// lock a wedged handshake blocks, and only this connector waits on it.
+    connecting: tokio::sync::Mutex<()>,
+    /// The warm client, if there is one. A `std` mutex on purpose: it is never
+    /// held across an `await`, so reading the cache -- or counting live
+    /// clients -- can never be delayed by a connector that is busy or wedged.
+    client: Mutex<Option<Arc<Client>>>,
+}
+
+impl Slot {
+    /// The cached client, if it is still alive. A client whose service loop has
+    /// ended (the child is gone) is dropped here, so the caller respawns.
+    fn cached(&self) -> Option<Arc<Client>> {
+        let mut guard = lock(&self.client);
+        match guard.as_ref() {
+            Some(client) if !client.is_closed() => Some(client.clone()),
+            Some(_) => {
+                *guard = None;
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+/// Lock a `std` mutex, ignoring poisoning: every one of them guards a plain
+/// cache entry, so a panic elsewhere leaves nothing inconsistent to protect.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Owns one lazily spawned, long-lived MCP client per connector.
 ///
 /// Clients are kept warm because spawning a child and completing the MCP
-/// handshake costs far more than a tool call. The two rules that keep that
-/// cache honest:
+/// handshake costs far more than a tool call. The rules that keep that cache
+/// honest:
 ///
 /// * a connection that fails is never cached, so a connector that was down at
 ///   first touch is retried on the next call;
-/// * a call that times out does **not** evict the client, but a call that fails
-///   at the transport (the child died) does. A slow call must not cost the
-///   daemon a connector for the rest of its life; a dead child must not be
-///   talked to forever.
+/// * a connection that does not complete within the handshake timeout is
+///   abandoned and its child killed;
+/// * a call that hits `rmcp`'s own per-request timeout does **not** evict the
+///   client -- that timeout cancels the request politely and leaves the client
+///   usable -- but a call that fails at the transport, or that blows through
+///   the outer backstop, does. A slow call must not cost the daemon a connector
+///   for the rest of its life; a dead or wedged child must not be talked to
+///   forever.
 pub struct Registry {
     manifests: HashMap<String, ConnectorManifest>,
-    clients: Mutex<HashMap<String, Arc<Client>>>,
+    slots: Mutex<HashMap<String, Arc<Slot>>>,
+    handshake_timeout: Duration,
 }
 
 impl Registry {
@@ -229,8 +280,16 @@ impl Registry {
             .collect::<HashMap<_, _>>();
         Self {
             manifests,
-            clients: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Override how long a connector gets to complete its MCP handshake.
+    /// The default is [`DEFAULT_HANDSHAKE_TIMEOUT`].
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Names of every known connector, sorted.
@@ -246,24 +305,33 @@ impl Registry {
 
     /// Number of connectors with a live client. Used by tests to prove the
     /// cache is doing its job.
-    pub async fn live_client_count(&self) -> usize {
-        self.clients.lock().await.len()
+    pub fn live_client_count(&self) -> usize {
+        let slots: Vec<Arc<Slot>> = lock(&self.slots).values().cloned().collect();
+        slots.iter().filter(|slot| slot.cached().is_some()).count()
     }
 
     /// Ask a connector what it can do, spawning it if it is not up yet.
     pub async fn list_tools(&self, connector: &str) -> Result<Vec<ToolDescriptor>> {
         let client = self.client_for(connector).await?;
         // `list_all_tools` walks the cursor for us; connectors are expected to
-        // advertise a handful of tools, not a paginated catalogue.
-        let listed = tokio::time::timeout(LIST_TOOLS_TIMEOUT, client.peer().list_all_tools())
-            .await
-            .map_err(|_| {
-                anyhow!("connector {connector}: tools/list timed out after {LIST_TOOLS_TIMEOUT:?}")
-            })?;
+        // advertise a handful of tools, not a paginated catalogue. It carries
+        // no deadline of its own, so this timeout is the only one -- and
+        // dropping the future abandons the response slot, which is why the
+        // client goes with it.
+        let listed =
+            match tokio::time::timeout(LIST_TOOLS_TIMEOUT, client.peer().list_all_tools()).await {
+                Ok(listed) => listed,
+                Err(_elapsed) => {
+                    self.discard_wedged_client(connector, &client);
+                    return Err(anyhow!(
+                        "connector {connector}: tools/list timed out after {LIST_TOOLS_TIMEOUT:?}"
+                    ));
+                }
+            };
         let listed = match listed {
             Ok(listed) => listed,
             Err(err) => {
-                self.handle_service_error(connector, &client, &err).await;
+                self.handle_service_error(connector, &client, &err);
                 return Err(anyhow!("connector {connector}: tools/list failed: {err}"));
             }
         };
@@ -311,15 +379,25 @@ impl Registry {
         .await;
 
         let result = match outcome {
+            // The backstop. The inner deadline did not even get the chance to
+            // fire, so this client is wedged, not slow -- and the future we
+            // just dropped left a response slot registered behind it.
             Err(_elapsed) => {
-                return Err(timeout_error(connector, tool, timeout));
+                self.discard_wedged_client(connector, &client);
+                return Err(anyhow!(
+                    "connector {connector}: tool {tool} timed out after {:?} without the \
+                     transport answering; the connector client was discarded",
+                    timeout + TIMEOUT_GRACE
+                ));
             }
             Ok(Ok(result)) => result,
+            // `rmcp`'s own timeout: the request was cancelled cleanly and the
+            // client stays usable.
             Ok(Err(ServiceError::Timeout { .. })) => {
                 return Err(timeout_error(connector, tool, timeout));
             }
             Ok(Err(err)) => {
-                self.handle_service_error(connector, &client, &err).await;
+                self.handle_service_error(connector, &client, &err);
                 return Err(anyhow!("connector {connector}: tool {tool} failed: {err}"));
             }
         };
@@ -337,8 +415,11 @@ impl Registry {
     /// Close every live client and drop it. Safe to call more than once.
     pub async fn shutdown(&self) {
         let clients: Vec<Arc<Client>> = {
-            let mut guard = self.clients.lock().await;
-            guard.drain().map(|(_, client)| client).collect()
+            let slots: Vec<Arc<Slot>> = lock(&self.slots).drain().map(|(_, slot)| slot).collect();
+            slots
+                .iter()
+                .filter_map(|slot| lock(&slot.client).take())
+                .collect()
         };
         for client in clients {
             match Arc::try_unwrap(client) {
@@ -353,39 +434,61 @@ impl Registry {
         }
     }
 
+    /// This connector's slot, creating it on first touch.
+    fn slot(&self, connector: &str) -> Arc<Slot> {
+        lock(&self.slots)
+            .entry(connector.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Get the live client for `connector`, spawning one if needed.
     ///
-    /// The lock is held across the spawn so two concurrent first calls cannot
-    /// race into two child processes. It is *not* held across tool calls, which
-    /// is what lets a `hang` on one connector coexist with work on another.
+    /// Connecting is serialised per connector, never globally, so two
+    /// concurrent first calls to the *same* connector share one child while a
+    /// slow connector delays nobody but its own callers.
     async fn client_for(&self, connector: &str) -> Result<Arc<Client>> {
         let manifest = self
             .manifests
             .get(connector)
             .ok_or_else(|| anyhow!("unknown connector: {connector}"))?;
 
-        let mut guard = self.clients.lock().await;
-        if let Some(client) = guard.get(connector) {
-            if !client.is_closed() {
-                return Ok(client.clone());
-            }
-            // The service loop has ended -- the child is gone. Respawn.
-            guard.remove(connector);
+        let slot = self.slot(connector);
+        if let Some(client) = slot.cached() {
+            return Ok(client);
         }
-        // A failed connection is never inserted, so the next call retries.
-        let client = Arc::new(connect(manifest).await?);
-        guard.insert(connector.to_string(), client.clone());
+
+        let _connecting = slot.connecting.lock().await;
+        // Someone else may have connected while we waited for the gate.
+        if let Some(client) = slot.cached() {
+            return Ok(client);
+        }
+        // A failed connection is never cached, so the next call retries.
+        let client = Arc::new(connect(manifest, self.handshake_timeout).await?);
+        *lock(&slot.client) = Some(client.clone());
         Ok(client)
     }
 
-    /// Evict `client` if -- and only if -- the failure means the child is gone
-    /// and the map still points at this exact client.
-    async fn handle_service_error(
-        &self,
-        connector: &str,
-        client: &Arc<Client>,
-        err: &ServiceError,
-    ) {
+    /// Drop `client` from the cache if -- and only if -- the slot still points
+    /// at this exact client, so a late failure cannot evict a replacement.
+    fn evict(&self, connector: &str, client: &Arc<Client>) -> bool {
+        let slot = lock(&self.slots).get(connector).cloned();
+        let Some(slot) = slot else {
+            return false;
+        };
+        let mut guard = lock(&slot.client);
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            *guard = None;
+            return true;
+        }
+        false
+    }
+
+    /// Evict `client` if -- and only if -- the failure means the child is gone.
+    fn handle_service_error(&self, connector: &str, client: &Arc<Client>, err: &ServiceError) {
         let transport_dead = matches!(
             err,
             ServiceError::TransportClosed | ServiceError::TransportSend(_)
@@ -393,14 +496,26 @@ impl Registry {
         if !transport_dead {
             return;
         }
-        let mut guard = self.clients.lock().await;
-        if guard
-            .get(connector)
-            .is_some_and(|current| Arc::ptr_eq(current, client))
-        {
-            guard.remove(connector);
+        if self.evict(connector, client) {
             tracing::warn!(connector, error = %err, "evicting connector client after transport failure");
         }
+    }
+
+    /// Throw `client` away after the outer backstop fired.
+    ///
+    /// The backstop only fires for a transport that could not complete inside
+    /// `inner timeout + grace`, which means `rmcp`'s own deadline never got to
+    /// run: the future we dropped abandoned a registered response slot rather
+    /// than unregistering it. Reusing such a client leaks one slot per call, so
+    /// it is evicted *and* its service loop cancelled -- which takes the child
+    /// process with it. The next call gets a fresh connector.
+    fn discard_wedged_client(&self, connector: &str, client: &Arc<Client>) {
+        self.evict(connector, client);
+        client.cancellation_token().cancel();
+        tracing::warn!(
+            connector,
+            "discarding connector client: the transport did not answer within the backstop"
+        );
     }
 }
 
@@ -408,7 +523,14 @@ fn timeout_error(connector: &str, tool: &str, timeout: Duration) -> anyhow::Erro
     anyhow!("connector {connector}: tool {tool} timed out after {timeout:?}")
 }
 
-async fn connect(manifest: &ConnectorManifest) -> Result<Client> {
+/// Spawn the connector's child process and complete the MCP handshake, or give
+/// up after `handshake_timeout`.
+///
+/// On giving up the child is killed *before* the handshake future is dropped:
+/// `TokioChildProcess`'s own `Drop` merely spawns a kill task, which is not
+/// guaranteed to run, and a connector that ignores the protocol would otherwise
+/// be left running with the daemon's pipes in hand.
+async fn connect(manifest: &ConnectorManifest, handshake_timeout: Duration) -> Result<Client> {
     let program = resolve_command(&manifest.command)
         .with_context(|| format!("connector {}", manifest.name))?;
     let mut command = tokio::process::Command::new(&program);
@@ -422,13 +544,41 @@ async fn connect(manifest: &ConnectorManifest) -> Result<Client> {
             program.display()
         )
     })?;
-    let client = ().serve(transport).await.with_context(|| {
-        format!(
-            "connector {}: MCP handshake with {} failed",
-            manifest.name,
-            program.display()
-        )
-    })?;
+    let child_pid = transport.id();
+
+    let handshake = ().serve(transport);
+    tokio::pin!(handshake);
+    let client = match tokio::time::timeout(handshake_timeout, &mut handshake).await {
+        Ok(result) => result.with_context(|| {
+            format!(
+                "connector {}: MCP handshake with {} failed",
+                manifest.name,
+                program.display()
+            )
+        })?,
+        Err(_elapsed) => {
+            // `handshake` still owns the child handle, so this pid cannot yet
+            // have been reaped and reused.
+            if let Some(pid) = child_pid {
+                // SAFETY: `kill` with a pid we own is always sound; a failure
+                // (the child already exited) is nothing to act on.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            // Let the handshake notice the closed pipe and unwind rather than
+            // being dropped mid-write.
+            let _ = tokio::time::timeout(TIMEOUT_GRACE, &mut handshake).await;
+            tracing::warn!(
+                connector = %manifest.name,
+                program = %program.display(),
+                "killed connector child: MCP handshake did not complete"
+            );
+            bail!(
+                "connector {}: MCP handshake with {} timed out after {handshake_timeout:?}",
+                manifest.name,
+                program.display()
+            );
+        }
+    };
     tracing::info!(connector = %manifest.name, program = %program.display(), "connector client started");
     Ok(client)
 }
@@ -518,6 +668,19 @@ mod tests {
             )
         })
         .clone()
+    }
+
+    /// A manifest pointing at the `ea-echo` fixture binary, under an arbitrary
+    /// connector name and with arbitrary arguments, so a test can stand up two
+    /// distinct connectors from the one fixture.
+    fn echo_manifest(name: &str, args: &[&str]) -> ConnectorManifest {
+        ConnectorManifest {
+            name: name.to_string(),
+            dir: fixture_root().join("echo"),
+            command: "ea-echo".to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            watch_interval: Duration::from_secs(3600),
+        }
     }
 
     fn echo_registry() -> Registry {
@@ -619,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn two_calls_reuse_one_client() {
         let registry = echo_registry();
-        assert_eq!(registry.live_client_count().await, 0);
+        assert_eq!(registry.live_client_count(), 0);
         for _ in 0..2 {
             registry
                 .call(
@@ -631,9 +794,9 @@ mod tests {
                 .await
                 .expect("echo call");
         }
-        assert_eq!(registry.live_client_count().await, 1);
+        assert_eq!(registry.live_client_count(), 1);
         registry.shutdown().await;
-        assert_eq!(registry.live_client_count().await, 0);
+        assert_eq!(registry.live_client_count(), 0);
     }
 
     #[tokio::test]
@@ -647,7 +810,7 @@ mod tests {
             err.to_string().contains("unknown connector"),
             "unexpected error: {err}"
         );
-        assert_eq!(registry.live_client_count().await, 0);
+        assert_eq!(registry.live_client_count(), 0);
 
         let err = registry.list_tools("nope").await.unwrap_err();
         assert!(
@@ -670,7 +833,7 @@ mod tests {
         assert!(message.contains("explode"), "unexpected error: {message}");
         assert!(message.contains("boom"), "unexpected error: {message}");
         // A failing tool is not a failing connector.
-        assert_eq!(registry.live_client_count().await, 1);
+        assert_eq!(registry.live_client_count(), 1);
         registry.shutdown().await;
     }
 
@@ -685,7 +848,7 @@ mod tests {
             err.to_string().contains("no_such_tool"),
             "unexpected error: {err}"
         );
-        assert_eq!(registry.live_client_count().await, 1);
+        assert_eq!(registry.live_client_count(), 1);
         registry.shutdown().await;
     }
 
@@ -709,7 +872,7 @@ mod tests {
         );
 
         // The whole point: the connector is still there afterwards.
-        assert_eq!(registry.live_client_count().await, 1);
+        assert_eq!(registry.live_client_count(), 1);
         let out = registry
             .call(
                 "echo",
@@ -720,7 +883,140 @@ mod tests {
             .await
             .expect("echo must still work after a timeout");
         assert_eq!(out, "still alive");
-        assert_eq!(registry.live_client_count().await, 1);
+        assert_eq!(registry.live_client_count(), 1);
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_hanging_handshake_does_not_block_other_connectors() {
+        ensure_echo_binary();
+        let registry = Arc::new(
+            Registry::new(vec![
+                echo_manifest("stuck", &["--hang-handshake"]),
+                echo_manifest("echo", &[]),
+            ])
+            .with_handshake_timeout(Duration::from_secs(3)),
+        );
+
+        let stuck = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.list_tools("stuck").await }
+        });
+        // Let the stuck connector get as far as its handshake.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let started = Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.call(
+                "echo",
+                "echo",
+                serde_json::json!({ "text": "unblocked" }),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("a wedged connector must not block first contact with another")
+        .expect("echo call");
+        assert_eq!(out, "unblocked");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "echo waited {:?} on the stuck connector's handshake",
+            started.elapsed()
+        );
+
+        // And the wedged connector gives up rather than hanging for ever.
+        let err = stuck
+            .await
+            .expect("the stuck task must finish")
+            .expect_err("a handshake that never completes must be an error");
+        assert!(
+            err.to_string().contains("handshake") && err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(registry.live_client_count(), 1);
+        registry.shutdown().await;
+    }
+
+    /// The backstop half of the timeout story, opposite
+    /// `a_timed_out_call_does_not_poison_the_connector`: `rmcp`'s inner timeout
+    /// keeps the client, the outer backstop throws it away.
+    ///
+    /// This drives [`Registry::discard_wedged_client`] directly rather than
+    /// through a genuinely wedged transport. Reaching the outer branch through
+    /// `call` needs `rmcp`'s 1024-deep peer channel to be full *and* the child
+    /// stopped mid-write, which is more machinery than the branch is worth; see
+    /// the task report.
+    #[tokio::test]
+    async fn the_backstop_discards_the_client_and_the_next_call_respawns() {
+        let registry = echo_registry();
+        registry
+            .call(
+                "echo",
+                "echo",
+                serde_json::json!({ "text": "before" }),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("echo call");
+        assert_eq!(registry.live_client_count(), 1);
+        let wedged = registry.slot("echo").cached().expect("a warm client");
+
+        registry.discard_wedged_client("echo", &wedged);
+        assert_eq!(
+            registry.live_client_count(),
+            0,
+            "the backstop must not leave the wedged client cached"
+        );
+
+        let out = registry
+            .call(
+                "echo",
+                "echo",
+                serde_json::json!({ "text": "after" }),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the next call must respawn the connector");
+        assert_eq!(out, "after");
+        let fresh = registry.slot("echo").cached().expect("a warm client");
+        assert!(
+            !Arc::ptr_eq(&wedged, &fresh),
+            "the discarded client must not come back"
+        );
+        assert_eq!(registry.live_client_count(), 1);
+        registry.shutdown().await;
+    }
+
+    /// Eviction is keyed on identity: a late failure reported against a client
+    /// that has already been replaced must leave the replacement alone.
+    #[tokio::test]
+    async fn eviction_never_touches_a_replacement_client() {
+        let registry = echo_registry();
+        registry
+            .call(
+                "echo",
+                "echo",
+                serde_json::json!({ "text": "one" }),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("echo call");
+        let first = registry.slot("echo").cached().expect("a warm client");
+        registry.discard_wedged_client("echo", &first);
+        registry
+            .call(
+                "echo",
+                "echo",
+                serde_json::json!({ "text": "two" }),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("echo call");
+
+        // A stale report about the first client must not evict the second.
+        assert!(!registry.evict("echo", &first));
+        assert_eq!(registry.live_client_count(), 1);
         registry.shutdown().await;
     }
 }
