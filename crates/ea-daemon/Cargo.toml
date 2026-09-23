@@ -26,3 +26,5 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true

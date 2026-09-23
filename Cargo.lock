@@ -278,9 +278,11 @@ name = "ea-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "ea-core",
  "libc",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

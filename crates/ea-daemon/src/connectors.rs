@@ -39,6 +39,12 @@ const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
 /// unusable, not merely slow: see [`Registry::discard_wedged_client`].
 const TIMEOUT_GRACE: Duration = Duration::from_millis(500);
 
+/// The deadline the executor gives a tool call when it has no opinion of its
+/// own -- which is always: choosing how long a connector may take is the
+/// registry's business, not the gate's. Callers that do need their own
+/// deadline use [`Registry::call`] directly.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long a connector gets to complete the MCP handshake before the daemon
 /// gives up, kills the child and reports the connector as down. A handshake is
 /// a single round trip against a freshly spawned process; a connector that
