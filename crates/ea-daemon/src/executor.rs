@@ -66,18 +66,29 @@ pub struct Executor<C: ToolCaller> {
     runs: RunStore,
     policy: Policy,
     caller: C,
-    /// Action ids with a connector call in flight right now.
+    /// Action ids with a connector call in flight right now — the *first* of
+    /// two claim layers.
     ///
-    /// The store's transitions already stop a second execution from *recording*
-    /// a second outcome, but that guard only fires after the connector has been
-    /// called — too late for a voucher that has already been posted. A
-    /// double-tapped Telegram button arrives as two concurrent
+    /// The store's status transitions already stop a second execution from
+    /// *recording* a second outcome, but that guard only fires after the
+    /// connector has been called — too late for a voucher that has already been
+    /// posted. A double-tapped Telegram button arrives as two concurrent
     /// [`Executor::execute_approved`] calls in this one process, so this set is
-    /// what makes the second one a no-op rather than a second side effect.
+    /// what makes the second one a cheap no-op rather than a second side
+    /// effect, with an error that names the real reason.
+    ///
+    /// It is deliberately **not** the authority. It lives in memory and is
+    /// released on drop, which means it is gone the instant the `run` future is
+    /// dropped by a `tokio::time::timeout` or a `JoinHandle::abort`, and gone
+    /// entirely if the process dies. The authority is
+    /// [`ActionStore::claim_for_execution`], taken immediately before the
+    /// connector call and never released. See [`Executor::run`].
     in_flight: Mutex<HashSet<i64>>,
 }
 
-/// Releases an in-flight claim however the execution ends, panic included.
+/// Releases the in-memory in-flight claim however the execution ends, panic
+/// included. It does **not** release the durable claim, which is one-way by
+/// design.
 struct Claim<'a> {
     in_flight: &'a Mutex<HashSet<i64>>,
     id: i64,
@@ -144,6 +155,30 @@ impl<C: ToolCaller> Executor<C> {
     /// action and to the `runs` row, and `Ok` is still returned. Letting a
     /// connector error escape here would let one bad tool call abort a whole
     /// scheduled job.
+    ///
+    /// # The two claim layers
+    ///
+    /// 1. [`Executor::claim`] — an in-memory set, released on every exit path.
+    ///    It stops the ordinary concurrent double tap cheaply and gives the
+    ///    loser a clear error. It is *not* authoritative: dropping this future
+    ///    releases it, and a process restart forgets it.
+    /// 2. [`ActionStore::claim_for_execution`] — one conditional UPDATE
+    ///    stamping `executed_at` while the row is still `approved`. Taken
+    ///    immediately before the connector call and **never released**. This is
+    ///    the authority: after it succeeds, no second call to this action can
+    ///    ever reach the connector, whatever happens next — a store fault on
+    ///    `mark_executed`, a `timeout` dropping this future with the voucher
+    ///    already posted, or the process dying mid-call.
+    ///
+    /// The residue in those cases is an `approved` row with a non-null
+    /// `executed_at`: a half-state that says "started, outcome unknown". That
+    /// is the point. It is not re-executable, and it is recognisable to a
+    /// future recovery pass in a way that a plain `approved` row is not.
+    ///
+    /// The `runs` row is opened *before* the durable claim so that even a crash
+    /// between the two leaves a trace, and it carries the action id from the
+    /// start rather than only at `finish` — an abandoned `running` row with no
+    /// id cannot be tied back to the money it was spending.
     async fn run(&self, id: i64) -> anyhow::Result<Action> {
         let _claim = self.claim(id)?;
 
@@ -158,9 +193,23 @@ impl<C: ToolCaller> Executor<C> {
             );
         }
 
-        let run_id = self
-            .runs
-            .start(RUN_KIND, &format!("{}.{}", action.connector, action.tool))?;
+        let run_id = self.runs.start(
+            RUN_KIND,
+            &format!("{}.{}", action.connector, action.tool),
+            &[id],
+        )?;
+
+        // The last thing before the side effect, and the only thing between
+        // this line and the connector call.
+        if !self.actions.claim_for_execution(id)? {
+            let detail = format!(
+                "action {id} is already claimed for execution \
+                 (approved with a non-null executed_at); refusing to call the connector again"
+            );
+            self.runs
+                .finish(run_id, "error", Some(&detail), &[id], None)?;
+            bail!(detail);
+        }
 
         let called = self
             .caller
@@ -187,7 +236,9 @@ impl<C: ToolCaller> Executor<C> {
         updated
     }
 
-    /// Claim `id` for execution, or refuse because it is already running.
+    /// Take the in-memory in-flight claim on `id`, or refuse because a call is
+    /// already in flight in this process. Not authoritative — see
+    /// [`Executor::run`].
     fn claim(&self, id: i64) -> anyhow::Result<Claim<'_>> {
         let mut guard = match self.in_flight.lock() {
             Ok(guard) => guard,
@@ -242,6 +293,16 @@ mod tests {
         /// Held across the await so two concurrent executions genuinely
         /// overlap in the concurrency test.
         delay: Duration,
+        /// The database, for the two tests that need to look at it — or break
+        /// it — from *inside* the connector call. That instant is the one the
+        /// findings are about: the side effect has landed and nothing has been
+        /// recorded yet.
+        db: Option<Arc<Mutex<Connection>>>,
+        /// `runs` rows as they looked mid-call: (outcome, action_ids).
+        runs_mid_call: Mutex<Vec<(String, Vec<i64>)>>,
+        /// Flip the connection read-only just before returning, so every store
+        /// write after the call fails the way a real store fault would.
+        poison_db: bool,
     }
 
     impl FakeCaller {
@@ -258,6 +319,9 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 behaviour,
                 delay: Duration::ZERO,
+                db: None,
+                runs_mid_call: Mutex::new(Vec::new()),
+                poison_db: false,
             }
         }
 
@@ -266,8 +330,26 @@ mod tests {
             self
         }
 
+        /// Snapshot the `runs` table while the call is in flight.
+        fn watching_db(mut self, conn: Arc<Mutex<Connection>>) -> Self {
+            self.db = Some(conn);
+            self
+        }
+
+        /// Snapshot the `runs` table, then make the database read-only, so the
+        /// store writes that follow a *successful* call all fail.
+        fn poisoning_db(mut self, conn: Arc<Mutex<Connection>>) -> Self {
+            self.db = Some(conn);
+            self.poison_db = true;
+            self
+        }
+
         fn calls(&self) -> Vec<(String, String, Value)> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn runs_mid_call(&self) -> Vec<(String, Vec<i64>)> {
+            self.runs_mid_call.lock().unwrap().clone()
         }
     }
 
@@ -277,6 +359,31 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((connector.to_string(), tool.to_string(), args));
+
+            if let Some(db) = &self.db {
+                let conn = db.lock().unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT outcome, action_ids FROM runs ORDER BY id")
+                    .unwrap();
+                let rows: Vec<(String, Vec<i64>)> = stmt
+                    .query_map([], |row| {
+                        let ids: Option<String> = row.get(1)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            ids.and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                drop(stmt);
+                *self.runs_mid_call.lock().unwrap() = rows;
+                if self.poison_db {
+                    conn.pragma_update(None, "query_only", true).unwrap();
+                }
+            }
+
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -569,6 +676,185 @@ record_voucher = "approve"
             .unwrap();
         assert!(ex.execute_approved(denied.id).await.is_err());
         assert!(ex.caller().calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_approved_refuses_an_action_whose_durable_claim_is_taken() {
+        let (h, actions, runs) = harness();
+        let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
+
+        let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
+        h.actions.approve(queued.id).unwrap();
+
+        // Somebody already owns this execution: the previous process before it
+        // died, a sibling daemon, a recovery job. The row is still `approved`,
+        // which is exactly the state that used to look safe to re-run.
+        assert!(h.actions.claim_for_execution(queued.id).unwrap());
+
+        let err = ex
+            .execute_approved(queued.id)
+            .await
+            .expect_err("a claimed action must not be executed a second time");
+        assert!(format!("{err:#}").contains("already claimed"), "{err:#}");
+        assert!(
+            ex.caller().calls().is_empty(),
+            "a claimed action must make zero connector calls"
+        );
+        assert_eq!(
+            h.actions.get(queued.id).unwrap().unwrap().status,
+            ActionStatus::Approved,
+            "and the refusal must not rewrite the half-state"
+        );
+
+        let rows = h.runs_rows();
+        assert_eq!(rows.len(), 1, "the refusal is itself worth recording");
+        assert_eq!(rows[0].1, "error");
+        assert_eq!(rows[0].2, vec![queued.id]);
+    }
+
+    /// Finding 1. The connector call lands, then the store write fails. The
+    /// action is left `approved` — the status it had before — and the old code
+    /// released its only claim on the way out, so the next retry posted the
+    /// voucher again.
+    #[tokio::test]
+    async fn a_store_fault_after_a_successful_call_does_not_make_the_action_claimable_again() {
+        let (h, actions, runs) = harness();
+        let ex = Executor::new(
+            actions,
+            runs,
+            policy(),
+            FakeCaller::ok().poisoning_db(h.conn.clone()),
+        );
+
+        let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
+        h.actions.approve(queued.id).unwrap();
+
+        let err = ex
+            .execute_approved(queued.id)
+            .await
+            .expect_err("the store writes after the call all failed");
+        assert!(format!("{err:#}").contains("readonly"), "{err:#}");
+        assert_eq!(
+            ex.caller().calls().len(),
+            1,
+            "the voucher was posted before the store broke"
+        );
+
+        // The operator fixes the store / the daemon restarts.
+        h.conn
+            .lock()
+            .unwrap()
+            .pragma_update(None, "query_only", false)
+            .unwrap();
+
+        let row = h.actions.get(queued.id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            ActionStatus::Approved,
+            "the outcome never got recorded"
+        );
+        assert!(
+            row.executed_at.is_some(),
+            "but the claim did, before the call — that is the whole fix"
+        );
+        assert!(
+            !h.actions.claim_for_execution(queued.id).unwrap(),
+            "nobody may claim it again"
+        );
+
+        let again = ex
+            .execute_approved(queued.id)
+            .await
+            .expect_err("a retry must refuse");
+        assert!(
+            format!("{again:#}").contains("already claimed"),
+            "{again:#}"
+        );
+        assert_eq!(
+            ex.caller().calls().len(),
+            1,
+            "exactly one voucher posted, ever"
+        );
+    }
+
+    /// Finding 2. A later caller wraps the execution in a timeout. The `run`
+    /// future is dropped mid-call, which releases the in-memory claim while the
+    /// connector call may already have landed.
+    #[tokio::test]
+    async fn a_dropped_execution_stays_claimed_and_cannot_be_retried() {
+        let (h, actions, runs) = harness();
+        let ex = Executor::new(
+            actions,
+            runs,
+            policy(),
+            FakeCaller::ok().slow(Duration::from_secs(10)),
+        );
+
+        let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
+        h.actions.approve(queued.id).unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(30), ex.execute_approved(queued.id)).await;
+        assert!(
+            outcome.is_err(),
+            "the timeout must fire and drop the future"
+        );
+        assert_eq!(
+            ex.caller().calls().len(),
+            1,
+            "the connector call had already started"
+        );
+
+        let row = h.actions.get(queued.id).unwrap().unwrap();
+        assert_eq!(row.status, ActionStatus::Approved);
+        assert!(
+            row.executed_at.is_some(),
+            "the durable claim outlives the dropped future"
+        );
+
+        let err = ex
+            .execute_approved(queued.id)
+            .await
+            .expect_err("a retry after the drop must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("already claimed"),
+            "the durable layer, not the in-memory one, must be what refuses: {message}"
+        );
+        assert!(
+            !message.contains("already being executed"),
+            "the in-memory claim really was released by the drop: {message}"
+        );
+        assert_eq!(
+            ex.caller().calls().len(),
+            1,
+            "a dropped execution must never become a second side effect"
+        );
+    }
+
+    /// Finding 3. A crash mid-call leaves only the `running` row behind. If it
+    /// does not name the action, nothing can tie `"fortnox.record_voucher"`
+    /// back to the money it was spending.
+    #[tokio::test]
+    async fn a_run_row_carries_the_action_id_before_finish_runs() {
+        let (h, actions, runs) = harness();
+        let ex = Executor::new(
+            actions,
+            runs,
+            policy(),
+            FakeCaller::ok().watching_db(h.conn.clone()),
+        );
+
+        let (action, _) = ex.submit(input("canvas", "list_courses")).await.unwrap();
+
+        let mid = ex.caller().runs_mid_call();
+        assert_eq!(mid.len(), 1, "one run row existed during the call");
+        assert_eq!(mid[0].0, "running", "and it had not finished yet");
+        assert_eq!(
+            mid[0].1,
+            vec![action.id],
+            "yet it already named the action it was executing"
+        );
     }
 
     /// A double-tapped Telegram button. Two taps, one voucher.

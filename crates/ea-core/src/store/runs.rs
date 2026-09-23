@@ -50,11 +50,23 @@ impl RunStore {
     /// Starts a run, recording it as `running`. Returns the new run's id, so
     /// the caller can pass it back to [`RunStore::finish`] once the agent
     /// session completes.
-    pub fn start(&self, kind: &str, prompt: &str) -> anyhow::Result<i64> {
+    ///
+    /// `action_ids` is written **at insert**, not only at
+    /// [`RunStore::finish`]. A run that is abandoned -- the process killed
+    /// mid-connector-call, the future dropped -- never reaches `finish`, and a
+    /// `running` row whose prompt is `"fortnox.record_voucher"` with no id
+    /// cannot be tied back to the action it was spending money on. Recording
+    /// the ids up front is what makes an orphaned `running` row a usable lead
+    /// instead of a shrug. Pass `&[]` for runs that are not about a specific
+    /// action (a scheduled agent session, say); `finish` overwrites the column
+    /// with whatever the run actually touched.
+    pub fn start(&self, kind: &str, prompt: &str, action_ids: &[i64]) -> anyhow::Result<i64> {
+        let action_ids_json = serde_json::to_string(action_ids)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO runs (kind, prompt, outcome, started_at) VALUES (?1,?2,'running',?3)",
-            params![kind, prompt, Utc::now().to_rfc3339()],
+            "INSERT INTO runs (kind, prompt, outcome, action_ids, started_at)
+             VALUES (?1,?2,'running',?3,?4)",
+            params![kind, prompt, action_ids_json, Utc::now().to_rfc3339()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -124,20 +136,40 @@ mod tests {
     fn start_records_a_running_run() {
         let (_dir, conn) = temp_store();
         let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas").unwrap();
+        let id = store.start("scheduled", "check canvas", &[]).unwrap();
         let run = store.get(id).unwrap().unwrap();
         assert_eq!(run.kind, "scheduled");
         assert_eq!(run.prompt, "check canvas");
         assert_eq!(run.outcome, "running");
         assert!(run.finished_at.is_none());
         assert!(run.duration_ms.is_none());
+        assert!(run.action_ids.is_empty());
+    }
+
+    #[test]
+    fn start_records_the_action_ids_before_finish_runs() {
+        let (_dir, conn) = temp_store();
+        let store = RunStore::new(conn);
+        let id = store
+            .start("execute", "fortnox.record_voucher", &[7])
+            .unwrap();
+
+        // Nothing has finished; this is the state a crash mid-call leaves.
+        let run = store.get(id).unwrap().unwrap();
+        assert_eq!(run.outcome, "running");
+        assert!(run.finished_at.is_none());
+        assert_eq!(
+            run.action_ids,
+            vec![7],
+            "an orphaned running row must still name the action it was executing"
+        );
     }
 
     #[test]
     fn finish_records_outcome_detail_actions_and_cost() {
         let (_dir, conn) = temp_store();
         let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas").unwrap();
+        let id = store.start("scheduled", "check canvas", &[]).unwrap();
         let run = store
             .finish(
                 id,
@@ -158,7 +190,7 @@ mod tests {
     fn finish_computes_a_nonnegative_duration() {
         let (_dir, conn) = temp_store();
         let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas").unwrap();
+        let id = store.start("scheduled", "check canvas", &[]).unwrap();
         let run = store.finish(id, "ok", None, &[], None).unwrap();
         assert!(run.duration_ms.unwrap() >= 0);
     }
