@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
   "crates/ea-core",
+  "crates/ea-daemon",
+  "crates/ea-cli",
 ]
 
 [workspace.package]

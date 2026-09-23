@@ -1,18 +1,20 @@
 [package]
-name = "ea-core"
+name = "ea-daemon"
 version = "0.1.0"
 edition.workspace = true
 
+[[bin]]
+name = "ea-daemon"
+path = "src/main.rs"
+
 [dependencies]
+ea-core = { path = "../ea-core" }
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-rusqlite.workspace = true
-chrono.workspace = true
 tokio.workspace = true
-uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
