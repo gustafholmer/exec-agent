@@ -1,0 +1,5 @@
+[echo]
+echo = "auto"
+explode = "auto"
+hang = "auto"
+watch_poll = "auto"

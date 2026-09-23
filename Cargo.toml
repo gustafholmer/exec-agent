@@ -4,11 +4,12 @@ members = [
   "crates/ea-core",
   "crates/ea-daemon",
   "crates/ea-cli",
+  "crates/ea-echo",
 ]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -24,7 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
-rmcp = "0.3"
+rmcp = { version = "3.4", features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
 teloxide = { version = "0.13", features = ["macros"] }
 uuid = { version = "1", features = ["v4"] }
 rust_decimal = "1"
