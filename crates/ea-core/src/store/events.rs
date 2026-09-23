@@ -51,64 +51,67 @@ impl EventStore {
     /// Idempotent per `(source, external_id)`. Returns `(event, is_new)`.
     /// A changed payload updates in place and clears triage, so a moved
     /// meeting or a part-paid invoice gets re-scored rather than going stale.
+    ///
+    /// The whole read-decide-write sequence runs under a single lock
+    /// acquisition so two concurrent calls for a brand-new key can't both
+    /// observe "not found" and both attempt the insert.
     pub fn record(&self, input: RecordInput) -> anyhow::Result<(Event, bool)> {
         let payload = serde_json::to_string(&input.payload)?;
+        let conn = self.conn.lock().unwrap();
 
-        let existing: Option<(i64, String)> = {
-            let conn = self.conn.lock().unwrap();
-            conn.query_row(
+        let existing: Option<(i64, String)> = conn
+            .query_row(
                 "SELECT id, payload FROM events WHERE source = ?1 AND external_id = ?2",
                 params![input.source, input.external_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .ok()
-        };
+            .ok();
 
         if let Some((id, old_payload)) = existing {
             if old_payload != payload {
-                let conn = self.conn.lock().unwrap();
                 conn.execute(
                     "UPDATE events SET payload = ?1, salience = NULL, triaged_at = NULL
                      WHERE id = ?2",
                     params![payload, id],
                 )?;
             }
-            let event = self
-                .get(id)?
-                .ok_or_else(|| anyhow!("event {id} vanished"))?;
+            let event =
+                Self::get_locked(&conn, id)?.ok_or_else(|| anyhow!("event {id} vanished"))?;
             return Ok((event, false));
         }
 
-        let id = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO events (source, external_id, kind, payload, created_at)
-                 VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    input.source,
-                    input.external_id,
-                    input.kind,
-                    payload,
-                    Utc::now().to_rfc3339()
-                ],
-            )?;
-            conn.last_insert_rowid()
-        };
-        Ok((
-            self.get(id)?
-                .ok_or_else(|| anyhow!("event {id} vanished"))?,
-            true,
-        ))
+        conn.execute(
+            "INSERT INTO events (source, external_id, kind, payload, created_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                input.source,
+                input.external_id,
+                input.kind,
+                payload,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        let event = Self::get_locked(&conn, id)?.ok_or_else(|| anyhow!("event {id} vanished"))?;
+        Ok((event, true))
     }
 
-    pub fn get(&self, id: i64) -> anyhow::Result<Option<Event>> {
-        let conn = self.conn.lock().unwrap();
+    /// Reads by id using an already-locked connection. `record()` needs this
+    /// to read back the row it just wrote without releasing and re-acquiring
+    /// the (non-reentrant) mutex, which would reopen the very race this
+    /// store exists to close.
+    fn get_locked(conn: &Connection, id: i64) -> anyhow::Result<Option<Event>> {
         let mut stmt = conn.prepare("SELECT * FROM events WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![id], hydrate)?;
         Ok(match rows.next() {
             Some(row) => Some(row?),
             None => None,
         })
+    }
+
+    pub fn get(&self, id: i64) -> anyhow::Result<Option<Event>> {
+        let conn = self.conn.lock().unwrap();
+        Self::get_locked(&conn, id)
     }
 
     pub fn untriaged(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
@@ -264,6 +267,49 @@ mod tests {
         let untriaged = store.untriaged(100).unwrap();
         assert_eq!(untriaged.len(), 1);
         assert_eq!(untriaged[0].id, first.id);
+    }
+
+    #[test]
+    fn concurrent_record_of_a_brand_new_key_is_idempotent() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let (_dir, conn) = temp_store();
+        let store_a = EventStore::new(conn.clone());
+        let store_b = EventStore::new(conn.clone());
+        // A barrier makes both threads arrive at `record()` at the same
+        // instant instead of serialising by luck of thread-spawn order,
+        // widening the window in which a check-then-act race could show up.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let ba = barrier.clone();
+        let handle_a = thread::spawn(move || {
+            ba.wait();
+            store_a.record(input("canvas", "race-1", serde_json::json!({ "n": 1 })))
+        });
+        let bb = barrier.clone();
+        let handle_b = thread::spawn(move || {
+            bb.wait();
+            store_b.record(input("canvas", "race-1", serde_json::json!({ "n": 1 })))
+        });
+
+        let result_a = handle_a.join().unwrap();
+        let result_b = handle_b.join().unwrap();
+
+        let (event_a, is_new_a) = result_a.expect("first concurrent record() must not error");
+        let (event_b, is_new_b) = result_b.expect("second concurrent record() must not error");
+
+        assert_eq!(event_a.id, event_b.id);
+        assert_ne!(
+            is_new_a, is_new_b,
+            "exactly one of the two concurrent calls must report is_new == true"
+        );
+
+        let locked = conn.lock().unwrap();
+        let count: i64 = locked
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
