@@ -5,6 +5,7 @@ members = [
   "crates/ea-daemon",
   "crates/ea-cli",
   "crates/ea-echo",
+  "crates/ea-propose",
 ]
 
 [workspace.package]

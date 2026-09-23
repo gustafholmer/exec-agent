@@ -13,5 +13,6 @@
 //! every client of the socket arbitrary tool calls with the gate bypassed.
 
 pub mod connectors;
+pub mod daemon;
 pub mod executor;
 pub mod ipc;
