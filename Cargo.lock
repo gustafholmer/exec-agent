@@ -227,6 +227,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ea-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
