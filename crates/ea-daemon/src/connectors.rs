@@ -168,13 +168,13 @@ fn load_manifest(path: &Path) -> Result<ConnectorManifest> {
 /// Failing to resolve is an error rather than a fall-through to a bare command
 /// name: a connector whose binary is missing should say so, not produce an
 /// opaque `No such file or directory` from `spawn` some time later.
-fn resolve_command(command: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_command(command: &str) -> Result<PathBuf> {
     let as_path = Path::new(command);
     if as_path.is_absolute() {
         if is_executable_file(as_path) {
             return Ok(as_path.to_path_buf());
         }
-        bail!("connector command {command} is not an executable file");
+        bail!("{command} is not an executable file");
     }
 
     let mut tried: Vec<PathBuf> = Vec::new();
@@ -196,7 +196,7 @@ fn resolve_command(command: &str) -> Result<PathBuf> {
         }
     }
     bail!(
-        "connector command {command} not found next to the running executable or on PATH \
+        "{command} not found next to the running executable or on PATH \
          ({} candidates tried)",
         tried.len()
     )
