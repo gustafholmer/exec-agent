@@ -7,16 +7,17 @@
 //! (`ea_core::policy` behind [`Executor::submit`]) rather than being restated
 //! per endpoint.
 //!
-//! Today there is exactly one method, `propose`, because there is exactly one
-//! thing in the system that can change the outside world. Note what is
-//! deliberately absent, and must stay absent: any method that reaches a
-//! connector directly. A tool call is an action, and an action reaches a
-//! connector only through the gate. `connectors.call` was removed from this
-//! socket once already for exactly that reason; do not put it back.
+//! There are exactly two methods: `status`, a liveness check with no state
+//! behind it, and `propose`, because there is exactly one thing in the system
+//! that can change the outside world. Note what is deliberately absent, and
+//! must stay absent: any method that reaches a connector directly. A tool
+//! call is an action, and an action reaches a connector only through the
+//! gate. `connectors.call` was removed from this socket once already for
+//! exactly that reason; do not put it back.
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use chrono::Duration;
 use ea_core::store::actions::ProposeInput;
 use serde::Deserialize;
@@ -29,6 +30,17 @@ use crate::ipc;
 /// How long a proposal waits for a human before it expires. The brief's
 /// default, and the only one there is until a caller asks for another.
 pub const DEFAULT_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// The longest TTL a caller may ask for: 30 days.
+///
+/// A proposal is a thing a human taps within days, so 30 days is already
+/// generous headroom over the default. It also keeps `Utc::now() + ttl`
+/// (`ActionStore::propose`) nowhere near `DateTime<Utc>`'s range limit, so
+/// the bound closes both panic sites a wire-supplied `ttl_secs` could hit:
+/// `Duration::seconds` overflowing on a value like `i64::MAX`, and the later
+/// `DateTime + Duration` overflowing on a value (like `9e15`) that
+/// `try_seconds` itself accepts.
+pub const MAX_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Params of the `propose` method.
 ///
@@ -47,7 +59,7 @@ pub struct ProposeParams {
     pub preview: String,
     #[serde(default)]
     pub rationale: String,
-    /// Overrides [`DEFAULT_TTL_SECS`]. Must be positive.
+    /// Overrides [`DEFAULT_TTL_SECS`]. Must be in `1..=MAX_TTL_SECS`.
     #[serde(default)]
     pub ttl_secs: Option<i64>,
 }
@@ -59,16 +71,26 @@ fn empty_object() -> Value {
 impl ProposeParams {
     fn into_input(self) -> anyhow::Result<ProposeInput> {
         let ttl_secs = self.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
-        if ttl_secs <= 0 {
-            bail!("propose: ttl_secs must be positive, got {ttl_secs}");
+        // Validate before constructing anything from `ttl_secs`: this is a
+        // wire-supplied i64, and both `Duration::seconds` and the later
+        // `DateTime + Duration` in `ActionStore::propose` can overflow and
+        // panic on values that reach them unchecked (i64::MAX; 9e15, which
+        // survives `try_seconds` but overflows once added to `Utc::now()`).
+        if ttl_secs <= 0 || ttl_secs > MAX_TTL_SECS {
+            bail!(
+                "propose: ttl_secs must be between 1 and {MAX_TTL_SECS} (30 days), got {ttl_secs}"
+            );
         }
+        let ttl = Duration::try_seconds(ttl_secs).ok_or_else(|| {
+            anyhow!("propose: ttl_secs {ttl_secs} is out of range (must be between 1 and {MAX_TTL_SECS})")
+        })?;
         Ok(ProposeInput {
             connector: self.connector,
             tool: self.tool,
             args: self.args,
             preview: self.preview,
             rationale: self.rationale,
-            ttl: Duration::seconds(ttl_secs),
+            ttl,
         })
     }
 }
@@ -89,6 +111,10 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// a list you can read in ten seconds rather than something scattered
     /// through `main`.
     pub fn register(self: &Arc<Self>, server: &mut ipc::Server) {
+        server.register("status", |_| {
+            Box::pin(async { Ok(serde_json::json!({ "status": "ok" })) })
+        });
+
         let this = Arc::clone(self);
         server.register("propose", move |params| {
             let this = Arc::clone(&this);
@@ -342,6 +368,72 @@ record_voucher = "approve"
         p["ttl_secs"] = json!(0);
         let err = f.daemon.propose(p).await.unwrap_err();
         assert!(format!("{err:#}").contains("ttl_secs"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_sensible_ttl_still_works() {
+        let f = Fixture::new();
+        let mut p = params("fortnox", "record_voucher");
+        p["ttl_secs"] = json!(3600);
+        let action = f.daemon.propose(p).await.unwrap();
+        let created: chrono::DateTime<chrono::Utc> = action["created_at"]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap()
+            .into();
+        let expires: chrono::DateTime<chrono::Utc> = action["expires_at"]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap()
+            .into();
+        assert_eq!((expires - created).num_seconds(), 3600);
+    }
+
+    /// Review focus. `ttl_secs` is a wire-supplied i64 that used to reach
+    /// `Duration::seconds` (panics on `i64::MAX`) and, past that, the
+    /// `Utc::now() + ttl` in `ActionStore::propose` (panics on a value like
+    /// `9e15`, which survives `try_seconds`). Both panics used to happen
+    /// inside the connection task, so the caller saw a hang-up instead of an
+    /// error. Every out-of-bounds value here must instead come back as a
+    /// clean IPC error naming the bound, over a real socket, with the socket
+    /// still serving afterwards.
+    #[tokio::test]
+    async fn an_out_of_bounds_ttl_is_a_clean_ipc_error_and_the_daemon_keeps_serving() {
+        let f = Fixture::new();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("d.sock");
+        let mut server = ipc::Server::new(&path);
+        f.daemon.register(&mut server);
+        let handle = server.spawn().await.unwrap();
+
+        let client = ea_core::ipc::Client::new(&path);
+
+        for bad_ttl in [i64::MAX, 9_000_000_000_000_000i64, i64::MIN, 0i64, -1i64] {
+            let mut p = params("fortnox", "record_voucher");
+            p["ttl_secs"] = json!(bad_ttl);
+            let err = client
+                .call("propose", p)
+                .await
+                .expect_err(&format!("ttl_secs {bad_ttl} must be refused, not accepted"));
+            let text = format!("{err:#}");
+            assert!(text.contains("ttl_secs"), "{bad_ttl}: {text}");
+            assert!(
+                text.contains(&MAX_TTL_SECS.to_string()),
+                "{bad_ttl}: error must name the bound: {text}"
+            );
+        }
+
+        // The connection task must not have panicked on any of the above: the
+        // same socket still answers a valid request afterwards.
+        let action = client
+            .call("propose", params("canvas", "list_courses"))
+            .await
+            .expect("the daemon must survive every out-of-bounds ttl_secs");
+        assert_eq!(action["status"], "executed");
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]

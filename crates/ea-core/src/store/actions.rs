@@ -113,7 +113,14 @@ impl ActionStore {
 
     pub fn propose(&self, input: ProposeInput) -> anyhow::Result<Action> {
         let now = Utc::now();
-        let expires = now + input.ttl;
+        // `DateTime + Duration` panics on overflow. The daemon validates
+        // `ttl_secs` against a sane bound before it ever reaches here, but
+        // this is the store's own defense: a checked add so a future or
+        // different caller gets an error instead of taking the whole
+        // connection down.
+        let expires = now
+            .checked_add_signed(input.ttl)
+            .ok_or_else(|| anyhow!("propose: ttl overflows when added to the current time"))?;
         let id = {
             let conn = self.conn.lock().unwrap();
             conn.execute(
