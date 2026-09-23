@@ -11,6 +11,9 @@
 //!   disallowed on the command line. The only mutation a session can cause is
 //!   a `propose_action` call on the `ea-propose` MCP server, which lands in the
 //!   approval queue rather than in the world.
+//! * **A session may call exactly the tools on the allowlist.** `--allowedTools`
+//!   is a closed list, today of one entry. See [`ALLOWED_TOOLS`] for why it is
+//!   written out rather than derived.
 //! * **A session sees exactly the connectors it was scoped to.** The MCP config
 //!   is built by [`McpConfig::for_session`] from an explicit request list, and
 //!   `--strict-mcp-config` stops the CLI adding any of the user's own. A
@@ -66,6 +69,39 @@ pub const PROPOSE_SERVER: &str = "ea-propose";
 /// Tools removed from every session. A session reads and proposes; it does not
 /// act. See the module docs.
 pub const DISALLOWED_TOOLS: &str = "Write,Edit,Bash,NotebookEdit";
+
+/// The one tool [`PROPOSE_SERVER`] exposes.
+pub const PROPOSE_TOOL: &str = "propose_action";
+
+/// The complete list of MCP tools a session may call, as `--allowedTools`.
+///
+/// Measured against the real CLI (2.1.267): under `--permission-prompts none`
+/// an MCP tool that is *absent* from `--allowedTools` is denied, and with no
+/// `--allowedTools` at all **every** MCP tool is denied -- including
+/// `propose_action`, the one tool the whole system routes writes through. So
+/// this flag is not a hardening extra; without it a session cannot propose
+/// anything.
+///
+/// Three properties of the CLI's matching are load-bearing here:
+///
+/// * the name is `mcp__<server>__<tool>`, double underscores at both joins,
+///   with the server named exactly as it is keyed in `--mcp-config`;
+/// * a bare `mcp__<server>` is a **whole-server wildcard** -- it allows every
+///   tool that server exposes, now and after the server gains more -- so this
+///   list never contains one;
+/// * `--disallowedTools` still wins over `--allowedTools`.
+///
+/// It is written out rather than derived from the policy's `Mode::Auto`.
+/// `auto` means "the gate executes this without a human tap", not "read-only":
+/// deriving the allowlist from it would hand a session direct access to every
+/// auto *write* tool, bypassing both the gate and the `actions` ledger. The
+/// only way a session touches the world is by proposing.
+///
+/// Connector read tools are deliberately absent. They arrive in a later task
+/// through an explicit `session_tools` declaration in `connector.toml`, which
+/// is a decision a connector author makes on purpose -- not a side effect of a
+/// session being scoped to that connector.
+pub const ALLOWED_TOOLS: &str = "mcp__ea-propose__propose_action";
 
 /// How long a session may run before the daemon takes it apart. Generous: a
 /// triage session that reads a calendar and a mailbox can legitimately take
@@ -196,7 +232,9 @@ impl McpConfig {
         requested: &[String],
     ) -> Result<Self> {
         let mut servers = BTreeMap::new();
-        servers.insert(PROPOSE_SERVER.to_string(), server_entry(propose, &[]));
+        // No `cwd`: the propose server reads nothing from disk and inherits
+        // the session's own working directory.
+        servers.insert(PROPOSE_SERVER.to_string(), server_entry(propose, &[], None));
 
         for name in requested {
             if name == PROPOSE_SERVER {
@@ -211,7 +249,10 @@ impl McpConfig {
                 .ok_or_else(|| anyhow!("session requested unknown connector `{name}`"))?;
             let program = resolve_command(&manifest.command)
                 .with_context(|| format!("connector {}", manifest.name))?;
-            servers.insert(name.clone(), server_entry(&program, &manifest.args));
+            servers.insert(
+                name.clone(),
+                server_entry(&program, &manifest.args, Some(&manifest.dir)),
+            );
         }
 
         Ok(Self { servers })
@@ -230,11 +271,22 @@ impl McpConfig {
     }
 }
 
-fn server_entry(program: &Path, args: &[String]) -> Value {
-    json!({
+/// One `mcpServers` entry.
+///
+/// `cwd` matters for a connector: the daemon spawns one with
+/// `current_dir(&manifest.dir)` precisely so it can keep credentials beside its
+/// manifest, and a session-spawned copy is the same program with the same
+/// expectations. Without it that copy runs in the deliberately empty session
+/// working directory and cannot find its own files.
+fn server_entry(program: &Path, args: &[String], cwd: Option<&Path>) -> Value {
+    let mut entry = json!({
         "command": program.to_string_lossy(),
         "args": args,
-    })
+    });
+    if let (Some(object), Some(cwd)) = (entry.as_object_mut(), cwd) {
+        object.insert("cwd".to_string(), json!(cwd.to_string_lossy()));
+    }
+    entry
 }
 
 /// The argument vector for one session, minus the program name.
@@ -251,6 +303,11 @@ pub fn build_argv(req: &SessionRequest, mcp: &McpConfig) -> Vec<String> {
         // propose_action tool on the ea-propose MCP server.
         "--disallowedTools".into(),
         DISALLOWED_TOOLS.into(),
+        // A closed allowlist. Absent this flag the CLI denies every MCP tool
+        // under `--permission-prompts none`, propose_action included, and the
+        // session has no way to act at all. See ALLOWED_TOOLS.
+        "--allowedTools".into(),
+        ALLOWED_TOOLS.into(),
         "--append-system-prompt".into(),
         req.system_prompt.clone(),
         "--mcp-config".into(),
@@ -324,7 +381,13 @@ pub fn parse_output(stdout: &str) -> Result<SessionOutcome> {
 
     Ok(SessionOutcome {
         text,
-        structured: object.get("structured_output").cloned(),
+        // A CLI that emits `structured_output: null` (no schema was asked
+        // for, or the model did not satisfy one) means "absent", not "the
+        // JSON value null".
+        structured: object
+            .get("structured_output")
+            .cloned()
+            .filter(|value| !value.is_null()),
         session_id: object
             .get("session_id")
             .and_then(Value::as_str)
@@ -379,11 +442,16 @@ impl Pump {
             let mut chunk = [0u8; 8192];
             loop {
                 match pipe.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => sink
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .extend_from_slice(&chunk[..n]),
+                    // An interrupted read is not end of stream: treating it as
+                    // one truncates the session's output silently, which
+                    // downgrades a good answer to "not JSON".
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
         });
@@ -525,31 +593,40 @@ impl SessionRunner {
         let stdout_pump = Pump::start(stdout_pipe);
         let stderr_pump = Pump::start(stderr_pipe);
 
-        let timed_out = match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(status) => {
-                status.context("waiting for the claude child")?;
-                false
-            }
+        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(status) => Some(status.context("waiting for the claude child")?),
             Err(_elapsed) => {
                 self.take_apart(&mut child, pid).await;
-                true
+                None
             }
         };
 
         let stdout = String::from_utf8_lossy(&stdout_pump.finish().await).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_pump.finish().await).into_owned();
 
-        if timed_out {
+        let Some(status) = status else {
             bail!(
                 "claude session timed out after {:?}: {}",
                 self.timeout,
                 preview(&stderr)
             );
-        }
+        };
         if stdout.trim().is_empty() && !stderr.trim().is_empty() {
             // The CLI reports argument and auth failures on stderr and exits
             // without writing JSON; surfacing that beats "wrote nothing".
             bail!("claude wrote nothing to stdout: {}", preview(&stderr));
+        }
+        // A non-zero exit is a failed session even when something parseable
+        // reached stdout. The CLI is a self-updating binary: a future version
+        // that reports a failure only in its exit code, or that dies on a
+        // signal after printing a partial document, must not be recorded `ok`.
+        if !status.success() {
+            let detail = if stderr.trim().is_empty() {
+                preview(&stdout)
+            } else {
+                preview(&stderr)
+            };
+            bail!("claude exited with {status}: {detail}");
         }
         Ok(stdout)
     }
@@ -589,8 +666,12 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
+    use ea_core::policy::Policy;
+    use ea_core::store::actions::ActionStore;
     use rusqlite::Connection;
     use tempfile::TempDir;
+
+    use crate::executor::{Executor, ToolCaller};
 
     fn temp_store() -> (TempDir, RunStore) {
         let dir = TempDir::new().unwrap();
@@ -664,6 +745,124 @@ mod tests {
         for tool in ["Write", "Edit", "Bash", "NotebookEdit"] {
             assert!(listed.contains(&tool), "{tool} missing from {value}");
         }
+    }
+
+    /// The `--allowedTools` value, split into entries.
+    fn allowlist(argv: &[String]) -> Vec<&str> {
+        flag_value(argv, "--allowedTools")
+            .expect("--allowedTools is required: without it the CLI denies every MCP tool")
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_allowlist_is_exactly_the_propose_tool() {
+        // Measured against the real CLI (2.1.267): with no --allowedTools,
+        // every MCP tool -- propose_action included -- is denied under
+        // --permission-prompts none. The flag is what makes a session able to
+        // do the one thing it exists for.
+        let argv = build_argv(&request(), &config(&[]));
+        assert_eq!(allowlist(&argv), vec!["mcp__ea-propose__propose_action"]);
+    }
+
+    #[test]
+    fn the_allowlist_entry_names_the_server_exactly_as_the_mcp_config_keys_it() {
+        // `mcp__<server>__<tool>`, double underscores at both joins, with the
+        // server spelled as it is keyed in --mcp-config. A typo here is a
+        // silent denial, not an error.
+        assert_eq!(
+            ALLOWED_TOOLS,
+            format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL}")
+        );
+        let argv = build_argv(&request(), &config(&[]));
+        let raw = flag_value(&argv, "--mcp-config").unwrap();
+        let value: Value = serde_json::from_str(raw).unwrap();
+        assert!(
+            value["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key(PROPOSE_SERVER),
+            "the allowlist names a server the config does not define"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_never_contains_a_bare_server_wildcard() {
+        // Measured: `--allowedTools mcp__probe` let a tool the probe had never
+        // been allowed run. A bare server name is a whole-server wildcard --
+        // every tool that server has now, and every tool it gains later.
+        let argv = build_argv(&request(), &config(&["calendar", "mail", "fortnox"]));
+        for entry in allowlist(&argv) {
+            let Some(rest) = entry.strip_prefix("mcp__") else {
+                continue;
+            };
+            assert!(
+                rest.contains("__"),
+                "`{entry}` is a whole-server wildcard, not a single tool"
+            );
+        }
+    }
+
+    #[test]
+    fn scoping_a_session_to_connectors_does_not_widen_the_allowlist() {
+        // Handing a session a connector makes that connector's tools *visible*
+        // to the CLI; it must not make them *callable*. A connector read tool
+        // reaches a session only through a deliberate declaration, never as a
+        // side effect of scoping. This test is the tripwire for that: widening
+        // the list implicitly fails it loudly.
+        let none = build_argv(&request(), &config(&[]));
+        let many = build_argv(
+            &request().with_connectors(["calendar", "mail", "fortnox"]),
+            &config(&["calendar", "mail", "fortnox"]),
+        );
+        assert_eq!(
+            allowlist(&none),
+            allowlist(&many),
+            "connectors must not add anything to the allowlist"
+        );
+        assert_eq!(allowlist(&many), vec![ALLOWED_TOOLS]);
+        for connector in ["calendar", "mail", "fortnox"] {
+            assert!(
+                !flag_value(&many, "--allowedTools")
+                    .unwrap()
+                    .contains(connector),
+                "connector `{connector}` leaked into the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn disallowed_tools_still_wins_over_the_allowlist() {
+        // The CLI resolves --disallowedTools first, so the two lists must stay
+        // disjoint for either to mean what it says.
+        let argv = build_argv(&request(), &config(&[]));
+        let denied: Vec<&str> = flag_value(&argv, "--disallowedTools")
+            .unwrap()
+            .split(',')
+            .collect();
+        for entry in allowlist(&argv) {
+            assert!(
+                !denied.contains(&entry),
+                "`{entry}` is both allowed and denied"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connector_runs_beside_its_own_manifest() {
+        // connectors.rs spawns a connector with current_dir(&manifest.dir) so
+        // it can keep credentials beside its manifest; a session-spawned copy
+        // must land in the same place, not in the empty session cwd.
+        let argv = build_argv(&request(), &config(&["calendar"]));
+        let raw = flag_value(&argv, "--mcp-config").unwrap();
+        let value: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(value["mcpServers"]["calendar"]["cwd"], "/tmp");
+        assert!(
+            value["mcpServers"]["ea-propose"].get("cwd").is_none(),
+            "the propose server reads nothing from disk; it inherits the session cwd"
+        );
     }
 
     #[test]
@@ -846,6 +1045,17 @@ mod tests {
     }
 
     #[test]
+    fn a_null_structured_output_is_absent_not_a_json_null() {
+        let raw = json!({
+            "type": "result",
+            "result": "ok",
+            "structured_output": Value::Null,
+        })
+        .to_string();
+        assert_eq!(parse_output(&raw).unwrap().structured, None);
+    }
+
+    #[test]
     fn empty_stdout_is_an_error_not_a_panic() {
         assert!(parse_output("").is_err());
         assert!(parse_output("   \n\t ").is_err());
@@ -986,6 +1196,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_non_zero_exit_fails_the_run_even_with_parseable_stdout() {
+        // The failure mode this closes: a CLI that prints a plausible document
+        // and then exits non-zero was recorded `ok`, cost and all.
+        let (dir, store) = temp_store();
+        let body = success_json();
+        let claude = fake_claude(
+            dir.path(),
+            "claude-exit-3",
+            &format!("#!/bin/sh\ncat <<'JSON'\n{body}\nJSON\nexit 3\n"),
+        );
+        let runner = runner(store, claude, dir.path());
+
+        let err = runner.run(request()).await.unwrap_err();
+        assert!(err.to_string().contains("exited with"), "{err}");
+
+        let run = runner.runs.get(1).unwrap().unwrap();
+        assert_eq!(run.outcome, "error");
+        assert_eq!(run.cost_usd, None, "a failed session must not book a cost");
+    }
+
+    #[tokio::test]
     async fn an_overrunning_session_is_interrupted_before_it_is_terminated() {
         let (dir, store) = temp_store();
         let witness = dir.path().join("got-sigint");
@@ -999,10 +1230,11 @@ mod tests {
                 witness.display()
             ),
         );
-        // A second, not milliseconds: the deadline runs from `spawn`, and a
+        // Seconds, not milliseconds: the deadline runs from `spawn`, and a
         // shell that has not yet reached its `trap` line dies on the default
-        // SIGINT action instead of recording it.
-        let runner = runner(store, claude, dir.path()).with_timeout(Duration::from_secs(1));
+        // SIGINT action instead of recording it. Two rather than one because
+        // one was observed to lose that race on a loaded machine.
+        let runner = runner(store, claude, dir.path()).with_timeout(Duration::from_secs(2));
 
         let err = runner.run(request()).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -1063,38 +1295,136 @@ mod tests {
             .clone()
     }
 
-    /// One real session against the installed CLI. Spends a little
-    /// subscription usage, so it is not part of the default suite.
+    /// Refuses every connector call. The policy below queues the action for a
+    /// human, so reaching a connector at all would mean the gate was bypassed.
+    struct NeverCalls;
+
+    impl ToolCaller for NeverCalls {
+        async fn call(&self, connector: &str, tool: &str, _args: Value) -> Result<String> {
+            panic!("the gate executed {connector}.{tool} without an approval");
+        }
+    }
+
+    /// One real session against the installed CLI, driving a real
+    /// `propose_action` call all the way into the `actions` table.
     ///
+    /// This is the test that proves the allowlist: without `--allowedTools` the
+    /// CLI denies `mcp__ea-propose__propose_action` outright, the model says it
+    /// could not call the tool, and no row lands. Asserting only on the text
+    /// and the cost -- which is what this test used to do -- passes over that
+    /// happily, which is how a session that could not propose anything shipped.
+    ///
+    /// The whole stack is real: a daemon on a temp socket, the real
+    /// `ea-propose` binary spawned by the real CLI as an MCP server, the real
+    /// policy gate, and a real sqlite file. Only the connector is absent, and
+    /// deliberately: the policy queues the action for a human, so
+    /// [`NeverCalls`] asserts nothing executed.
+    ///
+    /// Spends a little subscription usage, so it is not in the default suite.
     /// Run it with:
-    ///   cargo test -p ea-daemon --lib session -- --ignored --nocapture
-    #[tokio::test]
+    ///   PATH="$HOME/.cargo/bin:$PATH" \
+    ///     cargo test -p ea-daemon --lib session -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "spawns the real claude CLI and spends subscription usage"]
-    async fn end_to_end_against_the_real_cli() {
-        ensure_propose_binary();
-        let (dir, store) = temp_store();
+    async fn a_real_session_proposes_an_action_end_to_end() {
+        let propose_bin = ensure_propose_binary();
+        let dir = TempDir::new().unwrap();
+
+        // `ea-propose` finds the daemon at `$EA_STATE_DIR/daemon.sock`, and it
+        // is spawned by the CLI, not by this process. A wrapper script is how
+        // the environment reaches it without this test mutating its own
+        // process environment (which is global, and would race every other
+        // test in the binary).
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let socket = state.join("daemon.sock");
+        let propose = fake_claude(
+            dir.path(),
+            "ea-propose-wrapper",
+            &format!(
+                "#!/bin/sh\nEA_STATE_DIR='{}' exec '{}' \"$@\"\n",
+                state.display(),
+                propose_bin.display(),
+            ),
+        );
+
+        let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
+            ea_core::db::open(&state.join("state.db")).unwrap(),
+        ));
+        let actions = ActionStore::new(Arc::clone(&conn));
+        let executor = Executor::new(
+            ActionStore::new(Arc::clone(&conn)),
+            RunStore::new(Arc::clone(&conn)),
+            Policy::parse("[notes]\nadd_note = \"approve\"\n").unwrap(),
+            NeverCalls,
+        );
+        let mut server = crate::ipc::Server::new(&socket);
+        crate::daemon::Daemon::new(Arc::new(executor)).register(&mut server);
+        let daemon = server.spawn().await.expect("binding the daemon socket");
+
         let cwd = dir.path().join("session-cwd");
-        let runner = SessionRunner::discover(store, cwd, Vec::new())
-            .expect("resolving claude and ea-propose")
-            .with_timeout(Duration::from_secs(180));
+        let runner = SessionRunner::new(
+            RunStore::new(Arc::clone(&conn)),
+            resolve_command(CLAUDE_BIN).expect("locating the claude CLI"),
+            propose,
+            cwd.clone(),
+            Vec::new(),
+        )
+        .with_timeout(Duration::from_secs(240));
+        std::fs::create_dir_all(&cwd).unwrap();
 
         let req = SessionRequest::new(
             "smoke",
-            "Reply with exactly: ok",
-            "You answer in as few words as possible.",
+            "Call the propose_action tool exactly once, with connector \"notes\", \
+             tool \"add_note\", args {\"text\": \"hello from the end-to-end test\"}, \
+             preview \"Add a note saying hello\", and rationale \"the end-to-end test \
+             asked for it\". Then reply with one short sentence saying what the tool \
+             told you. Do not call it a second time.",
+            "You are a test fixture. Use the tool you are given and answer briefly.",
         );
-        let outcome = runner.run(req).await.expect("the session must succeed");
+        let outcome = runner.run(req).await;
+        // Shut the socket down before unwrapping, so a failure does not also
+        // leak the listener task.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                daemon.shutdown().await;
+                panic!("the session must succeed: {err:#}");
+            }
+        };
 
-        assert!(
-            outcome.text.to_lowercase().contains("ok"),
-            "unexpected text: {:?}",
+        let pending = actions.pending().expect("reading the actions table");
+        daemon.shutdown().await;
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "exactly one action row must have landed; the session said: {:?}",
             outcome.text
         );
-        assert!(outcome.session_id.is_some(), "a session id must come back");
+        let action = &pending[0];
+        assert_eq!(action.connector, "notes");
+        assert_eq!(action.tool, "add_note");
+        assert_eq!(action.status.as_str(), "proposed");
+        assert!(
+            action.preview.to_lowercase().contains("note"),
+            "the preview a human reads must survive the round trip: {:?}",
+            action.preview
+        );
 
+        assert!(outcome.session_id.is_some(), "a session id must come back");
         let run = runner.runs.get(1).unwrap().unwrap();
         assert_eq!(run.outcome, "ok");
         let cost = run.cost_usd.expect("the run row must record a cost");
         assert!(cost > 0.0, "cost should be positive, got {cost}");
+
+        println!("session said: {}", outcome.text);
+        println!(
+            "action {} {}.{} status={} cost=${cost}",
+            action.id,
+            action.connector,
+            action.tool,
+            action.status.as_str(),
+        );
     }
 }
