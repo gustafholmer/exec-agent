@@ -625,6 +625,26 @@ impl TokenManager {
                 ))
             })?;
 
+        // An EMPTY rotation is not a rotation. `FortnoxTokenResponse` requires
+        // the field, but `""` deserialises happily, and saving it would
+        // overwrite the one credential that keeps this integration alive with
+        // nothing. The grant is already in trouble either way — Fortnox has
+        // retired the presented token — but the two outcomes are not equal:
+        // persisting the blank hides the breakage until the access token
+        // expires an hour later and the failure surfaces somewhere unrelated,
+        // which is exactly how this owner's last grant lapsed unnoticed.
+        // Refuse, keep what is stored, and say so now.
+        // `bin/authorize.rs` guards the same case on the initial exchange.
+        if response.refresh_token.trim().is_empty() {
+            return Err(FortnoxError::Auth(format!(
+                "Fortnox answered the refresh with an EMPTY refresh token. Nothing was \
+                 saved — overwriting the stored one with a blank would kill the grant \
+                 silently. The stored refresh token is the one Fortnox just retired, so \
+                 the integration is down until someone re-authorises. {}",
+                rerun_authorize()
+            )));
+        }
+
         let updated = StoredTokens {
             access_token: response.access_token,
             // ROTATED. Fortnox has just retired `stored.refresh_token`; if
@@ -729,6 +749,8 @@ pub(crate) mod test_support {
         fail: bool,
         /// Makes concurrent callers actually overlap.
         delay: Duration,
+        /// What the rotation hands back as the new refresh token.
+        rotated: &'static str,
     }
 
     impl CountingRefresh {
@@ -738,6 +760,7 @@ pub(crate) mod test_support {
                 presented: Mutex::new(Vec::new()),
                 fail: false,
                 delay: Duration::ZERO,
+                rotated: "rotatedRefresh",
             })
         }
 
@@ -747,6 +770,7 @@ pub(crate) mod test_support {
                 presented: Mutex::new(Vec::new()),
                 fail: false,
                 delay: Duration::from_millis(50),
+                rotated: "rotatedRefresh",
             })
         }
 
@@ -756,6 +780,20 @@ pub(crate) mod test_support {
                 presented: Mutex::new(Vec::new()),
                 fail: true,
                 delay: Duration::ZERO,
+                rotated: "rotatedRefresh",
+            })
+        }
+
+        /// A 200 whose `refresh_token` is blank. Fortnox is not supposed to
+        /// do this; the guard in `access_token_at` exists because nothing
+        /// stops it from deserialising if it does.
+        pub(crate) fn blank_rotation() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                presented: Mutex::new(Vec::new()),
+                fail: false,
+                delay: Duration::ZERO,
+                rotated: "   ",
             })
         }
 
@@ -791,7 +829,7 @@ pub(crate) mod test_support {
                 }
                 Ok(FortnoxTokenResponse {
                     access_token: "newAccess".to_string(),
-                    refresh_token: "rotatedRefresh".to_string(),
+                    refresh_token: self.rotated.to_string(),
                     expires_in: 3600,
                     scope: "bookkeeping".to_string(),
                     token_type: "bearer".to_string(),
@@ -1212,6 +1250,45 @@ mod tests {
         assert!(rendered.contains("could NOT be saved"), "{rendered}");
         assert!(rendered.contains(AUTHORIZE_COMMAND), "{rendered}");
         // The refresh really happened: the old token is dead on Fortnox's side.
+        assert_eq!(refresh.presented(), vec!["oldRefresh".to_string()]);
+    }
+
+    /// An empty rotation must never be persisted.
+    ///
+    /// Without the guard this test fails in the quietest possible way: the
+    /// call succeeds, returns `newAccess`, and leaves a blank refresh token in
+    /// the store. Nothing goes wrong for another hour, and when it does the
+    /// failure surfaces somewhere unrelated, weeks away from what caused it.
+    /// That is how the owner's previous grant lapsed. So: refuse, keep what
+    /// was stored, and say it out loud.
+    #[tokio::test]
+    async fn an_empty_rotated_refresh_token_is_refused_and_never_overwrites_the_stored_one() {
+        let store = MemStore::new(Some(tokens("old", "oldRefresh", "2026-01-01T12:00:00Z")));
+        let refresh = CountingRefresh::blank_rotation();
+        let manager = TokenManager::new(store.clone(), refresh.clone());
+
+        let err = manager
+            .access_token_at(false, at("2026-01-01T11:59:30Z"))
+            .await
+            .expect_err("a blank rotation must not be accepted");
+
+        let rendered = err.to_string();
+        assert!(matches!(err, FortnoxError::Auth(_)), "{err:?}");
+        assert!(rendered.contains("EMPTY refresh token"), "{rendered}");
+        assert!(rendered.contains(AUTHORIZE_COMMAND), "{rendered}");
+
+        // Nothing was written, and the stored grant is untouched.
+        assert_eq!(
+            store.saves.load(Ordering::SeqCst),
+            0,
+            "nothing may be saved"
+        );
+        let stored = store.current().expect("the old tokens are still there");
+        assert_eq!(stored.refresh_token, "oldRefresh");
+        assert_eq!(stored.access_token, "old");
+
+        // The refresh did happen — the failure is Fortnox's answer, not a
+        // short-circuit before the call.
         assert_eq!(refresh.presented(), vec!["oldRefresh".to_string()]);
     }
 
