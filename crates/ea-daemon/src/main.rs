@@ -40,7 +40,7 @@ use ea_daemon::budget::Budget;
 use ea_daemon::chat::{ChatResponder, ChatService};
 use ea_daemon::config::DaemonConfig;
 use ea_daemon::connectors::{self, Registry};
-use ea_daemon::daemon::{Daemon, Deps, SHUTDOWN_DRAIN};
+use ea_daemon::daemon::{self, Daemon, Deps, SHUTDOWN_DRAIN};
 use ea_daemon::executor::Executor;
 use ea_daemon::ipc;
 use ea_daemon::jobs::{self, Pusher, TriageDeps};
@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         chat,
         pusher,
         notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        kv: KvStore::new(Arc::clone(&conn)),
         connectors: connector_names,
     });
 
@@ -299,6 +300,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("ea-daemon listening on {}", socket_path.display());
 
     // --- run ---------------------------------------------------------------
+    // `ea pause` is durable state, not a flag that dies with the process: the
+    // plist sets `KeepAlive`, so a crash or a reboot restarts this daemon
+    // unattended, and "unattended" is precisely the situation the owner
+    // paused for. Applied before `start`, so no tick can slip through in
+    // between. The write side lives in `Daemon::pause`/`resume`, never in
+    // `Scheduler::pause` -- the shutdown drain below calls that one.
+    let pause = daemon::restore_pause(&KvStore::new(Arc::clone(&conn)), &scheduler);
+    if pause.paused {
+        tracing::warn!(
+            since = ?pause.since,
+            "restored a persisted pause: no job will run until `ea resume`"
+        );
+    }
     let ticker = scheduler.start();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let poller = update_loop.map(|lp| tokio::spawn(lp.run(shutdown_rx)));
@@ -309,6 +323,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shutting down");
     // Pause first: the drain's bound only means anything if nothing new can be
     // spawned while it waits.
+    //
+    // Deliberately the scheduler primitive and not `Daemon::pause`: this is a
+    // shutdown, not the owner asking to stop. `Daemon::pause` persists, and
+    // persisting here would make every clean shutdown come back paused under
+    // `KeepAlive` and never run again.
     scheduler.pause();
     ticker.abort();
     let _ = shutdown_tx.send(true);

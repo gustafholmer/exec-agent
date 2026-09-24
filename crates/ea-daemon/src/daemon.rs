@@ -39,9 +39,10 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use ea_core::store::actions::{ActionStore, ProposeInput};
 use ea_core::store::events::EventStore;
+use ea_core::store::kv::KvStore;
 use ea_core::store::runs::RunStore;
 use ea_core::store::schedules::ScheduleStore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::chat::ChatService;
@@ -74,6 +75,58 @@ pub const DEFAULT_LOG_LIMIT: i64 = 20;
 /// entire ledger into one IPC line (the protocol's own line cap would then
 /// truncate it into unparseable JSON).
 pub const MAX_LOG_LIMIT: i64 = 500;
+
+/// The `kv` key the owner's pause intent is recorded under.
+///
+/// Written by [`Daemon::pause`] and [`Daemon::resume`] -- the IPC operations
+/// the owner actually invokes -- and by nothing else. In particular never by
+/// [`Scheduler::pause`]; see the note on [`Daemon::pause`].
+pub const PAUSED_KEY: &str = "scheduler.paused";
+
+/// How long a pause may stand before `status` starts saying it is expensive.
+///
+/// Thirty days, against the 45 the Fortnox OAuth refresh token survives
+/// unused: a fortnight of headroom is enough for the owner to see the warning
+/// on a trip and act on it, and short enough that a pause set and forgotten in
+/// the first week of a long absence is still recoverable.
+const PAUSE_WARN_AFTER_DAYS: i64 = 30;
+
+/// How long the Fortnox refresh token survives unused, in days. Only used to
+/// phrase the warning.
+const FORTNOX_REFRESH_LAPSE_DAYS: i64 = 45;
+
+/// The owner's pause intent, as persisted in `kv` under [`PAUSED_KEY`].
+///
+/// `since` exists for the trade-off a durable pause buys: before this, a
+/// reboot accidentally rescued a forgotten pause, and now nothing does. The
+/// answer is not an expiry that silently un-pauses -- that would give the
+/// original defect back -- but making the state legible, so `status` can say
+/// how long the daemon has been down and what that is about to cost.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PauseState {
+    pub paused: bool,
+    /// When the pause was recorded. `None` whenever `paused` is false.
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Apply the persisted pause intent to `scheduler`, and answer what it was.
+///
+/// `main` calls this before `scheduler.start()`, so that a daemon that was
+/// paused when the machine rebooted comes back paused rather than quietly
+/// resuming polling and spending -- the plist sets `KeepAlive`, so the restart
+/// the owner never sees is the normal case, and "away from the machine" is
+/// exactly the situation `pause` exists for.
+///
+/// Unreadable or unparseable state degrades to "not paused" (via
+/// [`KvStore::get_json`]): refusing to start would be a worse failure than
+/// running, and the owner can see the daemon is running.
+pub fn restore_pause(kv: &KvStore, scheduler: &Scheduler) -> PauseState {
+    let state: PauseState = kv.get_json(PAUSED_KEY).unwrap_or_default();
+    if state.paused {
+        scheduler.pause();
+    }
+    state
+}
 
 /// Params of the `propose` method.
 ///
@@ -198,6 +251,10 @@ pub struct Deps<C: ToolCaller> {
     /// Read-only here: `status` reports how much is waiting for a digest
     /// nobody delivers yet, and how much the cap has thrown away.
     pub notify_log: NotificationLog,
+    /// Where `pause` and `resume` record the owner's intent so it survives a
+    /// restart, and where `status` reads it back from. The same `kv` table
+    /// `notify_log` uses, under [`PAUSED_KEY`].
+    pub kv: KvStore,
     pub connectors: Vec<String>,
 }
 
@@ -213,6 +270,7 @@ pub struct Daemon<C: ToolCaller> {
     chat: Arc<ChatService>,
     pusher: Option<Arc<dyn Pusher>>,
     notify_log: NotificationLog,
+    kv: KvStore,
     connectors: Vec<String>,
     started_at: DateTime<Utc>,
 }
@@ -230,6 +288,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             chat: deps.chat,
             pusher: deps.pusher,
             notify_log: deps.notify_log,
+            kv: deps.kv,
             connectors: deps.connectors,
             started_at: Utc::now(),
         })
@@ -276,6 +335,11 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// `status` — is the daemon up, is it paused, what is waiting, and what is
     /// broken.
     ///
+    /// `paused` is the live flag; `paused_since`, `paused_for_days` and
+    /// `pause_warning` come from the persisted record, so the owner can tell a
+    /// paused daemon from a broken one, and can see a pause they set weeks ago
+    /// and forgot.
+    ///
     /// The `jobs` array is the part worth caring about. A connector whose
     /// token has lapsed fails every poll until its breaker trips, and then
     /// goes completely silent; without `tripped` and `last_error` here the
@@ -304,9 +368,19 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             })
             .collect();
 
+        let pause: PauseState = self.kv.get_json(PAUSED_KEY).unwrap_or_default();
+        let paused_for_days = pause.since.map(|since| (Utc::now() - since).num_days());
+
         Ok(json!({
             "status": "ok",
             "paused": self.scheduler.is_paused(),
+            // From the persisted record rather than the in-memory flag, so
+            // that a `paused: true` with a null `paused_since` is visible for
+            // what it is: a pause that did not reach disk and will not
+            // survive the next restart.
+            "paused_since": pause.since.map(|t| t.to_rfc3339()),
+            "paused_for_days": paused_for_days,
+            "pause_warning": self.pause_warning(&pause),
             "pending_actions": pending.len(),
             // Events triage could not score and gave up on. Nonzero means the
             // daemon has decided not to look at something; that must be
@@ -398,20 +472,70 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         serde_json::to_value(runs).context("log: serialising the runs")
     }
 
-    /// `pause` — stop the scheduler spawning anything new.
+    /// What `status` says about a pause that has stood long enough to cost
+    /// something.
+    ///
+    /// Making the pause durable removed the accident that used to rescue a
+    /// forgotten one, and the concrete casualty is the Fortnox OAuth grant:
+    /// its refresh token dies after 45 days unused, and re-authorising is a
+    /// manual browser round trip. So say so, out loud, in the one place the
+    /// owner looks — and only say it when there is a Fortnox connector to
+    /// lose. Deliberately *only* a warning: nothing here un-pauses the daemon
+    /// on its own, because a pause that expires by itself is the defect this
+    /// whole change fixes.
+    fn pause_warning(&self, pause: &PauseState) -> Option<String> {
+        let since = pause.since?;
+        if !pause.paused || !self.connectors.iter().any(|c| c == "fortnox") {
+            return None;
+        }
+        let days = (Utc::now() - since).num_days();
+        (days >= PAUSE_WARN_AFTER_DAYS).then(|| {
+            format!(
+                "paused for {days} days: the Fortnox refresh token lapses after \
+                 {FORTNOX_REFRESH_LAPSE_DAYS} days unused, and re-authorising is manual. \
+                 Run `ea resume` before then."
+            )
+        })
+    }
+
+    /// `pause` — stop the scheduler spawning anything new, durably.
     ///
     /// Does not touch work already in flight: a poll that is halfway through
     /// writing events finishes. Reaches no connector.
+    ///
+    /// The durable write belongs *here*, in the operation the owner invokes,
+    /// and must never move down into [`Scheduler::pause`]: `main` calls that
+    /// primitive as the first step of the shutdown drain, so persisting there
+    /// would make every clean shutdown record `paused = true` and, under the
+    /// plist's `KeepAlive`, bring the daemon back paused and never running
+    /// again. See `a_clean_shutdown_does_not_persist_a_pause`.
     pub async fn pause(&self, _params: Value) -> anyhow::Result<Value> {
+        // In memory first, and unconditionally: "stop spending" must take
+        // effect even if the durable write then fails. The error is still
+        // propagated rather than swallowed, because a pause the owner thinks
+        // will outlive a reboot and does not is the defect this fixes.
         self.scheduler.pause();
-        tracing::info!("scheduler paused over IPC");
-        Ok(json!({ "paused": true }))
+        let since = Utc::now();
+        self.kv
+            .set_json(
+                PAUSED_KEY,
+                &PauseState {
+                    paused: true,
+                    since: Some(since),
+                },
+            )
+            .context("recording the pause so it survives a restart")?;
+        tracing::info!(%since, "scheduler paused over IPC, and persisted");
+        Ok(json!({ "paused": true, "since": since.to_rfc3339() }))
     }
 
-    /// `resume` — undo `pause`.
+    /// `resume` — undo `pause`, including the persisted part of it.
     pub async fn resume(&self, _params: Value) -> anyhow::Result<Value> {
         self.scheduler.resume();
-        tracing::info!("scheduler resumed over IPC");
+        self.kv
+            .set_json(PAUSED_KEY, &PauseState::default())
+            .context("clearing the persisted pause")?;
+        tracing::info!("scheduler resumed over IPC, and the persisted pause cleared");
         Ok(json!({ "paused": false }))
     }
 
@@ -803,6 +927,7 @@ record_voucher = "approve"
                 chat: Arc::clone(&chat),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
                 notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+                kv: KvStore::new(Arc::clone(&conn)),
                 connectors: vec!["canvas".to_string()],
             });
 
@@ -955,6 +1080,141 @@ record_voucher = "approve"
         assert!(!f.scheduler.is_paused());
     }
 
+    // -- a pause that survives a restart ------------------------------------
+
+    /// What `main` builds on the next start: a fresh `Scheduler` -- the old
+    /// process's `AtomicBool` went with it -- over the same database, plus the
+    /// startup restore `main` runs before `scheduler.start()`.
+    fn restart(f: &Fixture, connectors: &[&str]) -> (Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
+        let scheduler = Arc::new(Scheduler::new(3));
+        let kv = KvStore::new(Arc::clone(&f.conn));
+        let daemon = Daemon::build(Deps {
+            executor: Arc::clone(&f.daemon.executor),
+            actions: f.daemon.actions.clone(),
+            events: f.daemon.events.clone(),
+            runs: f.daemon.runs.clone(),
+            scheduler: Arc::clone(&scheduler),
+            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+            chat: Arc::clone(&f.daemon.chat),
+            pusher: None,
+            notify_log: NotificationLog::new(kv.clone()),
+            kv: kv.clone(),
+            connectors: connectors.iter().map(|c| (*c).to_string()).collect(),
+        });
+        restore_pause(&kv, &scheduler);
+        (scheduler, daemon)
+    }
+
+    /// The defect: `paused` was an in-memory flag and the plist sets
+    /// `KeepAlive`, so the reboot the owner is away for un-paused the daemon
+    /// and it resumed polling and spending on its own.
+    #[tokio::test]
+    async fn a_pause_survives_a_restart() {
+        let f = Fixture::new();
+        f.call("pause", Value::Null).await.unwrap();
+
+        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        assert!(
+            scheduler.is_paused(),
+            "a restart while paused must come back paused"
+        );
+        let status = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(status["paused"], true);
+        assert!(
+            status["paused_since"].is_string(),
+            "status must report the persisted truth, not just the flag: {status}"
+        );
+    }
+
+    /// The other half, and the one that matters more: nothing may come back
+    /// paused that was not paused on purpose.
+    #[tokio::test]
+    async fn a_restart_while_running_stays_running() {
+        let f = Fixture::new();
+        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        assert!(!scheduler.is_paused());
+        let status = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(status["paused"], false);
+        assert!(status["paused_since"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_clears_the_persisted_pause() {
+        let f = Fixture::new();
+        f.call("pause", Value::Null).await.unwrap();
+        f.call("resume", Value::Null).await.unwrap();
+
+        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        assert!(
+            !scheduler.is_paused(),
+            "resume must outlive the process too"
+        );
+        assert_eq!(daemon.status(Value::Null).await.unwrap()["paused"], false);
+    }
+
+    /// Constraint on the fix, as a test. `main` calls `Scheduler::pause` as
+    /// the first step of the shutdown drain, so if persistence is ever moved
+    /// down into that primitive, every clean shutdown records `paused = true`
+    /// and, under the plist's `KeepAlive`, the daemon comes back paused and
+    /// never runs again. That is a total, silent failure of the product; this
+    /// test fails the moment someone "simplifies" the fix that way.
+    #[tokio::test]
+    async fn a_clean_shutdown_does_not_persist_a_pause() {
+        let f = Fixture::new();
+
+        // The shutdown sequence from `main`, in order.
+        f.scheduler.pause();
+        f.scheduler.drain(Duration::from_secs(1)).await;
+
+        let kv = KvStore::new(Arc::clone(&f.conn));
+        assert_eq!(
+            kv.get(PAUSED_KEY).unwrap(),
+            None,
+            "the shutdown drain's pause must never be recorded as the owner's intent"
+        );
+
+        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        assert!(
+            !scheduler.is_paused(),
+            "a daemon restarted after a clean shutdown must run"
+        );
+        assert_eq!(daemon.status(Value::Null).await.unwrap()["paused"], false);
+    }
+
+    /// The cost of making the pause durable: a forgotten pause now stays. The
+    /// mitigation is visibility, not an expiry -- `status` says how long, and
+    /// says out loud that the Fortnox grant is on a clock.
+    #[tokio::test]
+    async fn status_says_how_long_a_pause_has_stood_and_warns_about_fortnox() {
+        let f = Fixture::new();
+        let kv = KvStore::new(Arc::clone(&f.conn));
+        kv.set_json(
+            PAUSED_KEY,
+            &PauseState {
+                paused: true,
+                since: Some(Utc::now() - chrono::Duration::days(40)),
+            },
+        )
+        .unwrap();
+
+        let (_scheduler, daemon) = restart(&f, &["canvas", "fortnox"]);
+        let status = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(status["paused"], true);
+        assert_eq!(status["paused_for_days"], 40);
+        let warning = status["pause_warning"].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("45") && warning.to_lowercase().contains("fortnox"),
+            "a month-old pause must name the grant it is about to kill: {status}"
+        );
+
+        // No Fortnox wired, nothing to lose to a lapse, no warning.
+        let (_scheduler, daemon) = restart(&f, &["canvas"]);
+        let status = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(status["paused_for_days"], 40);
+        assert!(status["pause_warning"].is_null(), "{status}");
+    }
+
     #[tokio::test]
     async fn chat_appends_a_message_and_returns_the_conversation_id() {
         let f = Fixture::new();
@@ -1044,6 +1304,7 @@ record_voucher = "approve"
             chat: Arc::clone(&f2.daemon.chat),
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f2.conn))),
+            kv: KvStore::new(Arc::clone(&f2.conn)),
             connectors: vec!["canvas".to_string()],
         });
         let status = daemon.status(Value::Null).await.unwrap();
@@ -1148,6 +1409,7 @@ record_voucher = "approve"
             chat: Arc::clone(&f.daemon.chat),
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
+            kv: KvStore::new(Arc::clone(&f.conn)),
             connectors: vec!["canvas".to_string()],
         });
         (f, scheduler, daemon)
@@ -1752,6 +2014,7 @@ record_voucher = "approve"
             chat,
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
+            kv: KvStore::new(Arc::clone(&f.conn)),
             connectors: Vec::new(),
         });
         daemon.chat(json!({ "message": "hi" })).await.unwrap();

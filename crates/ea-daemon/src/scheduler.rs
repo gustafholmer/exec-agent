@@ -344,6 +344,14 @@ impl Scheduler {
             .collect()
     }
 
+    /// Stop spawning new invocations. In-memory only, and deliberately so.
+    ///
+    /// Two callers: `Daemon::pause`, which is the owner asking, and `main`'s
+    /// shutdown drain, which is not. Recording the owner's intent here would
+    /// therefore write `paused = true` on every clean shutdown and, under the
+    /// plist's `KeepAlive`, bring the daemon back paused and never running
+    /// again. Durability lives in `Daemon::pause`/`Daemon::resume`; keep it
+    /// there.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
     }

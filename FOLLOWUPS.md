@@ -3,26 +3,22 @@
 Things the final review of Phase 4 found and we deliberately did not fix, with
 enough detail to act on later. None is a safety hole; the policy gate holds.
 
-## 1. `ea pause` does not survive a restart
+## 1. `ea pause` does not survive a restart — FIXED
 
-`paused` is an in-memory `AtomicBool` (`crates/ea-daemon/src/scheduler.rs:265`)
-and the launchd plist sets `KeepAlive`, so a crash or reboot silently resumes a
-paused daemon. Predates Phase 4.
+`Daemon::pause`/`resume` now record the owner's intent in `kv` under
+`scheduler.paused`, and `main` applies it before `scheduler.start()`. The
+persistence deliberately does *not* live in `Scheduler::pause`: `main` calls
+that primitive as the first step of the shutdown drain, so persisting there
+would record every clean shutdown as a pause and, under the plist's
+`KeepAlive`, bring the daemon back paused and never running again. The
+regression test is `daemon::tests::a_clean_shutdown_does_not_persist_a_pause`.
 
-For a holiday, set `daily_session_budget = 0` instead — it lives in the config
-file, so it is persistent by construction.
-
-Two constraints on any fix:
-
-- **Do not persist inside `Scheduler::pause`.** `main.rs:312` calls it as the
-  first step of the shutdown drain, so every clean shutdown would write
-  `paused = true`, and under `KeepAlive` the daemon would never run again.
-  Persist in `Daemon::pause`/`resume` instead — that needs a `KvStore` in
-  `Deps`, and the wiring already builds one at `main.rs:291` — then read it
-  before `scheduler.start()` at `main.rs:302`. Roughly 40 lines.
-- **Decide the trade-off deliberately.** Today a reboot accidentally rescues a
-  forgotten pause. Persist it and a forgotten pause instead runs the Fortnox
-  refresh token past its 45-day lapse limit and kills the grant.
+The trade-off this entry used to name — a reboot no longer rescues a
+forgotten pause — was settled by visibility, not by an expiry: nothing
+un-pauses the daemon on its own. `ea status` reports `paused_since` and
+`paused_for_days`, and after 30 days adds a `pause_warning` naming the Fortnox
+refresh token's 45-day lapse — the one connector a long pause permanently
+breaks.
 
 ## 2. `notion.create_page` is graded `auto`
 
