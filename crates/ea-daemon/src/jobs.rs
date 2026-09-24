@@ -50,7 +50,20 @@ pub const WATCH_TOOL: &str = "watch_poll";
 /// mailbox folder, whatever the connector's world is, and it is running on its
 /// own clock with nobody waiting. Still bounded, because the scheduler's
 /// overlap guard means a wedged poll would stop that connector entirely.
-pub const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// **Ninety seconds, and strictly less than any connector's poll interval.**
+/// It was 120, which is exactly the Google connector's `watch_interval_secs`:
+/// a poll that used its whole budget would finish precisely as the next tick
+/// was due, so a connector that is merely slow would run polls back to back
+/// forever with no idle gap — and, because the overlap guard skips a tick
+/// whose predecessor is still running, the effective interval would silently
+/// double rather than the slowness being reported. A deadline below the
+/// interval means a slow poll is *cut off and recorded as a failure*, which is
+/// the outcome that produces a breaker trip and an entry in `ea status`
+/// instead of a connector that quietly falls behind. The gap is checked
+/// against every connector's manifest by
+/// `no_connector_polls_faster_than_a_poll_is_allowed_to_take`.
+pub const WATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How many untriaged events one triage pass considers. The brief's number.
 pub const TRIAGE_SCAN_LIMIT: i64 = 200;
@@ -126,8 +139,13 @@ pub async fn run_watch_poll<C: ToolCaller>(
         );
     }
 
+    // [`WATCH_TIMEOUT`], not the executor's generic 30 seconds. A poll is a
+    // whole connector's world — Google's is up to 54 HTTP round trips across
+    // two accounts — and 30 seconds is a budget it cannot meet on a slow link,
+    // which would time out every tick and trip the breaker on a connector
+    // that is working.
     let raw = caller
-        .call(connector, WATCH_TOOL, serde_json::json!({}))
+        .call_with_timeout(connector, WATCH_TOOL, serde_json::json!({}), WATCH_TIMEOUT)
         .await
         .with_context(|| format!("polling connector {connector}"))?;
 
@@ -503,6 +521,9 @@ mod tests {
     struct FakeConnector {
         replies: Mutex<Vec<anyhow::Result<String>>>,
         calls: Mutex<Vec<(String, String)>>,
+        /// The deadline each call arrived with — `None` for a call that came
+        /// through `ToolCaller::call`, which carries none.
+        deadlines: Mutex<Vec<Option<Duration>>>,
     }
 
     impl FakeConnector {
@@ -510,11 +531,34 @@ mod tests {
             Arc::new(Self {
                 replies: Mutex::new(replies.into_iter().rev().collect()),
                 calls: Mutex::new(Vec::new()),
+                deadlines: Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn deadlines(&self) -> Vec<Option<Duration>> {
+            self.deadlines.lock().unwrap().clone()
+        }
+
+        fn answer(
+            &self,
+            connector: &str,
+            tool: &str,
+            deadline: Option<Duration>,
+        ) -> anyhow::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((connector.to_string(), tool.to_string()));
+            self.deadlines.lock().unwrap().push(deadline);
+            self.replies
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| Ok("[]".to_string()))
         }
     }
 
@@ -525,15 +569,17 @@ mod tests {
             tool: &str,
             _args: serde_json::Value,
         ) -> anyhow::Result<String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((connector.to_string(), tool.to_string()));
-            self.replies
-                .lock()
-                .unwrap()
-                .pop()
-                .unwrap_or_else(|| Ok("[]".to_string()))
+            self.answer(connector, tool, None)
+        }
+
+        async fn call_with_timeout(
+            &self,
+            connector: &str,
+            tool: &str,
+            _args: serde_json::Value,
+            timeout: Duration,
+        ) -> anyhow::Result<String> {
+            self.answer(connector, tool, Some(timeout))
         }
     }
 
@@ -658,6 +704,30 @@ mod tests {
             "the source is the daemon's, not the connector's"
         );
         assert_eq!(stored[0].payload["title"], "Essay");
+    }
+
+    /// The constant was dead. `WATCH_TIMEOUT` existed from Phase 1 and
+    /// nothing referenced it: every poll got the executor's generic 30
+    /// seconds instead, which is not a budget a connector that walks two
+    /// Google accounts can meet on a slow link. Thirty seconds of timeouts,
+    /// five ticks apart, is a tripped breaker on a connector that works.
+    #[tokio::test]
+    async fn a_poll_gets_the_watch_deadline_and_not_the_executors_default() {
+        let dir = TempDir::new().unwrap();
+        let conn = db(&dir);
+        let events = EventStore::new(conn);
+        let caller = FakeConnector::with(vec![Ok("[]".to_string())]);
+
+        run_watch_poll("canvas", &caller, &events, &canvas_policy())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            caller.deadlines(),
+            vec![Some(WATCH_TIMEOUT)],
+            "the poll must name its own deadline; `None` means it went through the \
+             deadline-less `call` and took the executor's 30 seconds"
+        );
     }
 
     /// Polling is idempotent: the same assignment reported twice is one event.

@@ -32,10 +32,19 @@ pub const RUN_KIND: &str = "execute";
 
 /// The one thing the executor is allowed to do to the outside world.
 ///
-/// Deliberately narrow: no timeout, no retry policy, no connector discovery.
-/// The executor decides *whether* a call happens, never *how* — choosing a
-/// deadline is the registry's business, and a test double should not have to
-/// pretend to have one.
+/// Deliberately narrow: no retry policy, no connector discovery. The executor
+/// decides *whether* a call happens, never *how*.
+///
+/// [`ToolCaller::call`] carries no deadline, because the executor has no
+/// opinion about one: choosing how long a connector may take is the
+/// registry's business, and a test double should not have to pretend to have
+/// a clock. [`ToolCaller::call_with_timeout`] exists for the one caller that
+/// *does* have an opinion — the scheduler's `watch_poll`, whose work is a
+/// whole connector's world rather than one action, and whose deadline
+/// ([`crate::jobs::WATCH_TIMEOUT`]) is therefore its own. Its default body
+/// ignores the deadline and defers to `call`, which is right for a test
+/// double and wrong for anything that really reaches a process, so
+/// [`Registry`] overrides it.
 ///
 /// Native `async fn` in a trait, not `#[async_trait]`: the executor is generic
 /// over its caller, so the trait never needs to be object-safe, and the
@@ -48,6 +57,17 @@ pub trait ToolCaller {
         tool: &str,
         args: Value,
     ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send;
+
+    /// [`ToolCaller::call`] with a caller-chosen deadline.
+    fn call_with_timeout(
+        &self,
+        connector: &str,
+        tool: &str,
+        args: Value,
+        _timeout: std::time::Duration,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+        self.call(connector, tool, args)
+    }
 }
 
 /// Sharing one caller between the executor and the scheduler's poll jobs.
@@ -65,6 +85,20 @@ impl<T: ToolCaller + Send + Sync + ?Sized> ToolCaller for std::sync::Arc<T> {
     ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
         T::call(self, connector, tool, args)
     }
+
+    /// Forwarded explicitly. Inheriting the default here would silently drop
+    /// the caller's deadline on the way through the `Arc` — and the daemon
+    /// only ever holds its registry behind one, so the default would mean
+    /// *nothing in production* ever got the deadline it asked for.
+    fn call_with_timeout(
+        &self,
+        connector: &str,
+        tool: &str,
+        args: Value,
+        timeout: std::time::Duration,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+        T::call_with_timeout(self, connector, tool, args, timeout)
+    }
 }
 
 impl ToolCaller for Registry {
@@ -75,6 +109,16 @@ impl ToolCaller for Registry {
         args: Value,
     ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
         Registry::call(self, connector, tool, args, DEFAULT_CALL_TIMEOUT)
+    }
+
+    fn call_with_timeout(
+        &self,
+        connector: &str,
+        tool: &str,
+        args: Value,
+        timeout: std::time::Duration,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+        Registry::call(self, connector, tool, args, timeout)
     }
 }
 
@@ -915,5 +959,63 @@ record_voucher = "approve"
         );
         let rows = h.runs_rows();
         assert_eq!(rows.len(), 1, "one execution, one run row");
+    }
+
+    // -- the deadline seam --------------------------------------------------
+
+    /// Records the deadline it was called with, and nothing else.
+    #[derive(Default)]
+    struct DeadlineSpy {
+        seen: Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl ToolCaller for DeadlineSpy {
+        async fn call(
+            &self,
+            _connector: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> anyhow::Result<String> {
+            self.seen.lock().unwrap().push(None);
+            Ok(String::new())
+        }
+
+        async fn call_with_timeout(
+            &self,
+            _connector: &str,
+            _tool: &str,
+            _args: Value,
+            timeout: Duration,
+        ) -> anyhow::Result<String> {
+            self.seen.lock().unwrap().push(Some(timeout));
+            Ok(String::new())
+        }
+    }
+
+    /// The daemon holds its registry behind an `Arc` and nothing else. If the
+    /// `Arc` impl inherited the trait's default `call_with_timeout` — which
+    /// drops the deadline and defers to `call` — then every caller-chosen
+    /// deadline in the daemon would be silently discarded on the way through,
+    /// and `watch_poll` would be back on the executor's 30 seconds with no
+    /// test to say so.
+    #[tokio::test]
+    async fn an_arc_forwards_the_callers_deadline_rather_than_swallowing_it() {
+        let spy = std::sync::Arc::new(DeadlineSpy::default());
+        let caller: std::sync::Arc<DeadlineSpy> = std::sync::Arc::clone(&spy);
+
+        ToolCaller::call_with_timeout(
+            &caller,
+            "canvas",
+            "watch_poll",
+            Value::Null,
+            Duration::from_secs(90),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            spy.seen.lock().unwrap().clone(),
+            vec![Some(Duration::from_secs(90))]
+        );
     }
 }

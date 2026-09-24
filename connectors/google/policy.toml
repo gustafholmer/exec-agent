@@ -1,0 +1,26 @@
+# What a session may do with the Google connector.
+#
+# A tool with no rule here falls through to the gate's `approve` default, so
+# the list is checked against the server's registered tools in both
+# directions by ea-google's policy-coverage tests.
+#
+# The section name must be this directory's basename: `Policy::load_dirs`
+# rejects a connector that declares a foreign section, because a policy file
+# that could name another connector would be a privilege-escalation path.
+[google]
+list_events = "auto"
+find_conflicts = "auto"
+list_mail = "auto"
+get_mail = "auto"
+watch_poll = "auto"
+
+# The only write in this connector. A draft costs nothing and sends nothing,
+# but it does appear in the owner's mailbox with their name on it, so a human
+# sees it before it is written.
+create_draft = { mode = "approve", note = "drafts are cheap, but they appear in your mailbox" }
+
+# No such tool exists, and none should. The gate matches a rule by name, so
+# declaring the denial now means it is already in force if anybody ever adds
+# one. The OAuth scopes exclude `gmail.send` as well, so this is the second of
+# two locks, not the only one.
+send_mail = "deny"
