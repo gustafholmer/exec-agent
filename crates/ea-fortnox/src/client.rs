@@ -23,9 +23,28 @@
 //!
 //! Both surface as [`FortnoxError::Api`] carrying the status, immediately.
 //! The upstream TypeScript sleeps and retries a 429 up to three times inside
-//! this method; here the caller (the daemon's scheduler, which already owns
-//! backoff, budgets and a clock) decides. A client that sleeps inside a tool
-//! call hides the rate limit from the thing whose job it is to react to it.
+//! this method. This client does not sleep: a client that sleeps inside a tool
+//! call hides the rate limit from the thing whose job it is to react to it,
+//! and it burns the daemon's own call deadline while it waits. When Fortnox
+//! sends a `Retry-After`, its value is carried into the [`FortnoxError::Api`]
+//! body so a caller that *does* back off has the number Fortnox asked for.
+//!
+//! **What actually happens to a 429 today, and the gap it leaves.** Nothing
+//! retries. `crates/ea-daemon/src/executor.rs` (`Executor::run`, called from
+//! `execute_approved`; the `Err(err)` arm around `mark_failed`) marks the
+//! action **failed** on any error from the connector — no retry, no backoff,
+//! no requeue — and closes the run row with `"error"`. So a 429 on
+//! `record_expense` or `attach_receipt` is terminal: the expense is not
+//! booked, the action sits in a failed state, and a person has to approve it
+//! again. The earlier claim in this module that "the caller owns backoff"
+//! described an intended design, not the code; no caller owns it yet.
+//!
+//! Whoever builds that retry policy — it belongs in the scheduler or the
+//! executor, not here — wants: the status from [`FortnoxError::status`], the
+//! `Retry-After` now in the error body, and a rule that a 429 or a 5xx is
+//! retryable while a 4xx is not. Deliberately not built in this task: a
+//! connector-level retry would be invisible to the daemon's budgets and
+//! deadlines, which is the mistake the upstream TypeScript makes.
 //!
 //! # Credentials
 //!
@@ -34,6 +53,18 @@
 //! deserialising, `.without_url()` on every `reqwest` error, a hand-written
 //! `Debug`, no `unwrap`/`expect`/`panic!` outside tests, and the access token
 //! only ever in an `Authorization` header — never in a URL, an error or a log.
+//!
+//! Two related rules, because this client also carries customer accounting
+//! data and receipt bytes:
+//!
+//! - A **successful** response body is never quoted into an error. A 2xx that
+//!   is not JSON, or is JSON this build cannot read, is reported by its byte
+//!   length and content type only. It is not a credential, but it is very
+//!   likely a company's ledger, and it would land in a log line. Error-status
+//!   bodies are still quoted (truncated) by [`parse_fortnox_error`]: a Fortnox
+//!   error response carries a diagnostic, not the books.
+//! - A [`FormPart`]'s **value** never reaches an error message. Only its
+//!   `name` does. The bytes are a receipt scan or an invoice PDF.
 
 use std::fmt;
 use std::sync::Arc;
@@ -42,7 +73,7 @@ use std::time::Duration;
 use reqwest::Url;
 
 use crate::auth::TokenManager;
-use crate::errors::{parse_fortnox_error, snippet, FortnoxError};
+use crate::errors::{parse_fortnox_error, FortnoxError};
 
 /// Fortnox's REST base. The trailing slash matters: [`Url::join`] replaces the
 /// last path segment without it.
@@ -62,6 +93,64 @@ const MAX_PAGES: usize = 500;
 
 /// A query string, as pairs. Numbers are the caller's to stringify.
 pub type Query<'a> = &'a [(&'a str, &'a str)];
+
+/// One part of a `multipart/form-data` post — a description, not a body.
+///
+/// Fortnox's `inbox` endpoint (the only upload path this client has) takes a
+/// file part. `reqwest::multipart::Form` is consumed by the send and is
+/// neither `Clone` nor reusable, so the retry in [`FortnoxClient::request`]
+/// cannot re-send one. A `FormPart` is plain borrowed data and the form is
+/// **rebuilt** from it for each attempt.
+///
+/// `bytes` is a customer's receipt or invoice. It never reaches an error
+/// message, a log or a `Debug`; only [`FormPart::name`] does.
+#[derive(Clone, Copy)]
+pub struct FormPart<'a> {
+    /// The form field name, e.g. `file`. Safe to name in an error.
+    pub name: &'a str,
+    /// The part's bytes. Never rendered anywhere.
+    pub bytes: &'a [u8],
+    /// The `filename` in the part's `Content-Disposition`, when it is a file.
+    pub filename: Option<&'a str>,
+    /// The part's own content type. `None` leaves it to the server.
+    pub mime: Option<&'a str>,
+}
+
+impl fmt::Debug for FormPart<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The bytes and the filename are the customer's document; the length
+        // is the most that may be said about them.
+        f.debug_struct("FormPart")
+            .field("name", &self.name)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .field("filename", &self.filename.map(|_| "<redacted>"))
+            .field("mime", &self.mime)
+            .finish()
+    }
+}
+
+/// What to put in a request's body, described rather than built.
+///
+/// The 401 retry sends the request a second time, so the body has to be
+/// producible twice. A `serde_json::Value` could simply be borrowed twice; a
+/// multipart form cannot. Describing the body and building it inside
+/// [`FortnoxClient::send`] makes both cases uniform, and makes the retry's
+/// body provably a fresh one rather than a reused handle.
+///
+/// An enum rather than a `dyn Fn() -> Body` closure: the description is
+/// inspectable, it costs no lifetime gymnastics across an `async fn`, and it
+/// cannot return something different on the second call the way a closure
+/// over mutable state could.
+#[derive(Clone, Copy)]
+enum BodySpec<'a> {
+    /// No body at all — a `GET`.
+    None,
+    /// A JSON body, with `Content-Type: application/json`.
+    Json(&'a serde_json::Value),
+    /// A `multipart/form-data` body, rebuilt per attempt. `reqwest` sets the
+    /// content type and its boundary.
+    Form(&'a [FormPart<'a>]),
+}
 
 /// The Fortnox REST client.
 pub struct FortnoxClient {
@@ -149,7 +238,8 @@ impl FortnoxClient {
         path: &str,
         query: Query<'_>,
     ) -> Result<serde_json::Value, FortnoxError> {
-        self.request(reqwest::Method::GET, path, query, None).await
+        self.request(reqwest::Method::GET, path, query, BodySpec::None)
+            .await
     }
 
     /// `POST {base}{path}?{query}` with a JSON body, decoded as JSON.
@@ -159,7 +249,24 @@ impl FortnoxClient {
         body: &serde_json::Value,
         query: Query<'_>,
     ) -> Result<serde_json::Value, FortnoxError> {
-        self.request(reqwest::Method::POST, path, query, Some(body))
+        self.request(reqwest::Method::POST, path, query, BodySpec::Json(body))
+            .await
+    }
+
+    /// `POST {base}{path}?{query}` with a `multipart/form-data` body.
+    ///
+    /// Fortnox's `inbox` endpoint takes an uploaded file this way and answers
+    /// with the created `File`; that is the first half of attaching a receipt
+    /// to a voucher. The form is built from `parts` **once per attempt**, so
+    /// the 401 retry sends a fresh, complete body rather than an already
+    /// consumed one — see [`BodySpec`].
+    pub async fn post_form(
+        &self,
+        path: &str,
+        parts: &[FormPart<'_>],
+        query: Query<'_>,
+    ) -> Result<serde_json::Value, FortnoxError> {
+        self.request(reqwest::Method::POST, path, query, BodySpec::Form(parts))
             .await
     }
 
@@ -189,7 +296,7 @@ impl FortnoxClient {
             paged.push(("page", page_number.as_str()));
 
             let response = self
-                .request(reqwest::Method::GET, path, &paged, None)
+                .request(reqwest::Method::GET, path, &paged, BodySpec::None)
                 .await?;
 
             if let Some(serde_json::Value::Array(items)) = response.get(list_key) {
@@ -228,7 +335,7 @@ impl FortnoxClient {
         method: reqwest::Method,
         path: &str,
         query: Query<'_>,
-        body: Option<&serde_json::Value>,
+        body: BodySpec<'_>,
     ) -> Result<serde_json::Value, FortnoxError> {
         let url = self.url(path, query)?;
 
@@ -245,7 +352,12 @@ impl FortnoxClient {
         // its stated expiry, so a 401 has to be able to provoke a refresh —
         // but a second 401 means the *fresh* token was refused too, and
         // retrying again would only hammer a revoked grant.
-        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        //
+        // An `if`, never a `while`: rewriting this as a loop makes the
+        // terminal-401 test hang rather than fail, which is the production
+        // failure mode in miniature.
+        let retried = response.status() == reqwest::StatusCode::UNAUTHORIZED;
+        let response = if retried {
             let renewed = self.tokens.access_token(true).await.map_err(|err| {
                 let detail = err.to_string();
                 FortnoxError::Auth(format!(
@@ -253,12 +365,37 @@ impl FortnoxClient {
                      refresh failed too: {detail}"
                 ))
             })?;
+            // `body` is a description, so this builds a *new* body. That is
+            // the whole reason it is a description: a multipart form is
+            // consumed by the send above and could not be sent again.
             self.send(&method, url, &renewed, body).await?
         } else {
             response
         };
 
-        self.read(response, &method, &whence).await
+        let result = self.read(response, &method, &whence).await;
+
+        // A 401 can only reach `read` after the retry above, so this is the
+        // second one: the refreshed token was refused too. That is not a
+        // transient failure, it is a grant that no longer exists, and the only
+        // fix is a person in a browser — so the message has to say so and name
+        // the command. (The status stays 401 and the variant stays `Api`: this
+        // is still Fortnox answering.)
+        if retried {
+            return result.map_err(|err| match err {
+                FortnoxError::Api { status: 401, body } => FortnoxError::Api {
+                    status: 401,
+                    body: format!(
+                        "{body} — the token was refreshed once and refused again, so the \
+                         Fortnox grant is gone (revoked in Fortnox's UI, or the refresh \
+                         token lapsed). Re-authorise with `{}`.",
+                        crate::auth::AUTHORIZE_COMMAND
+                    ),
+                },
+                other => other,
+            });
+        }
+        result
     }
 
     fn url(&self, path: &str, query: Query<'_>) -> Result<Url, FortnoxError> {
@@ -280,21 +417,29 @@ impl FortnoxClient {
     }
 
     /// One bearer-authenticated request, with the URL kept out of the error.
+    ///
+    /// The body is built here, from its description, on every call — so the
+    /// 401 retry gets a fresh one.
     async fn send(
         &self,
         method: &reqwest::Method,
         url: Url,
         token: &str,
-        body: Option<&serde_json::Value>,
+        body: BodySpec<'_>,
     ) -> Result<reqwest::Response, FortnoxError> {
-        let mut request = self
+        let request = self
             .http
             .request(method.clone(), url)
             .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "application/json");
-        if let Some(body) = body {
-            request = request.json(body);
-        }
+        let request = match body {
+            BodySpec::None => request,
+            BodySpec::Json(value) => request.json(value),
+            // No explicit `Content-Type`: `reqwest` sets
+            // `multipart/form-data` together with the boundary it generated,
+            // and setting it by hand would strip the boundary.
+            BodySpec::Form(parts) => request.multipart(build_form(parts)?),
+        };
         request.send().await.map_err(|err| {
             FortnoxError::Transport(format!("{method} to Fortnox failed: {}", err.without_url()))
         })
@@ -313,6 +458,10 @@ impl FortnoxClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // Read before the body is consumed. Kept for the error path: without
+        // it, a caller that wants to honour Fortnox's own backoff has nothing
+        // to honour.
+        let retry_after = retry_after_of(response.headers());
 
         let body = response.text().await.map_err(|err| {
             FortnoxError::Transport(format!(
@@ -322,7 +471,10 @@ impl FortnoxClient {
         })?;
 
         if !status.is_success() {
-            return Err(parse_fortnox_error(status.as_u16(), &body));
+            return Err(with_retry_after(
+                parse_fortnox_error(status.as_u16(), &body),
+                retry_after,
+            ));
         }
 
         // A 204, or a 200 with nothing in it. Fortnox answers some writes
@@ -335,13 +487,19 @@ impl FortnoxClient {
         // consent page arrives with a cheerful 200 and, without this check,
         // either fails to deserialise with an opaque message or reads as an
         // empty list of rows.
+        //
+        // The body itself is NOT quoted. A 2xx from this API is a company's
+        // accounting data — vouchers, suppliers, account balances — and this
+        // message goes to a log. The content type and the length are enough to
+        // tell an HTML login page from a truncated JSON reply, and neither can
+        // carry a row of someone's ledger.
         if !is_json(&content_type) {
             return Err(FortnoxError::Api {
                 status: status.as_u16(),
                 body: format!(
                     "{method} {whence} answered with content-type {content_type:?}, which is \
-                     not JSON. Body began: {}",
-                    snippet(&body)
+                     not JSON ({} bytes, not quoted: a success body is customer data)",
+                    body.len()
                 ),
             });
         }
@@ -349,10 +507,89 @@ impl FortnoxClient {
         serde_json::from_str(&body).map_err(|err| FortnoxError::Api {
             status: status.as_u16(),
             body: format!(
-                "{method} {whence} answered JSON this build cannot read ({err}). Body began: {}",
-                snippet(&body)
+                "{method} {whence} answered JSON this build cannot read: {} at line {}, \
+                 column {} of {} bytes of {content_type:?} (the body is not quoted: a \
+                 success body is customer data)",
+                classify(&err),
+                err.line(),
+                err.column(),
+                body.len()
             ),
         })
+    }
+}
+
+/// Build the multipart body for one attempt.
+///
+/// The only way this fails is a `mime` the caller made up. The error names the
+/// part and the mime — never the filename and never the bytes.
+fn build_form(parts: &[FormPart<'_>]) -> Result<reqwest::multipart::Form, FortnoxError> {
+    let mut form = reqwest::multipart::Form::new();
+    for part in parts {
+        // `Part::bytes` wants owned data and the body is consumed by the send,
+        // so each attempt copies. Receipts are kilobytes; correctness under
+        // retry is worth the copy.
+        let mut built = reqwest::multipart::Part::bytes(part.bytes.to_vec());
+        if let Some(filename) = part.filename {
+            built = built.file_name(filename.to_string());
+        }
+        if let Some(mime) = part.mime {
+            built = built.mime_str(mime).map_err(|err| {
+                FortnoxError::Transport(format!(
+                    "the multipart part {:?} was given the content type {mime:?}, which is not \
+                     a media type ({})",
+                    part.name,
+                    err.without_url()
+                ))
+            })?;
+        }
+        form = form.part(part.name.to_string(), built);
+    }
+    Ok(form)
+}
+
+/// `serde_json`'s *classification* of a parse failure — "syntax", "data",
+/// "eof", "io" — without its message, which can quote the input.
+fn classify(err: &serde_json::Error) -> &'static str {
+    match err.classify() {
+        serde_json::error::Category::Io => "an I/O error",
+        serde_json::error::Category::Syntax => "a syntax error",
+        serde_json::error::Category::Data => "a value of the wrong shape",
+        serde_json::error::Category::Eof => "an unexpected end of input",
+    }
+}
+
+/// `Retry-After`, as Fortnox sent it, if it is short and printable.
+///
+/// Both legal forms are kept verbatim (a count of seconds, or an HTTP date):
+/// parsing here would silently drop the one this client did not anticipate.
+/// The value is server-supplied, so it is length- and character-bounded before
+/// it is allowed into a message.
+fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let printable = |c: char| c.is_ascii_graphic() || c == ' ';
+    if raw.is_empty() || raw.len() > 64 || !raw.chars().all(printable) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Carry a `Retry-After` into an [`FortnoxError::Api`] body.
+///
+/// Nothing retries a 429 today (see the module docs), so this is the only
+/// place the number survives at all; a caller that later grows a backoff
+/// policy needs it, and re-reading it from a consumed response is impossible.
+fn with_retry_after(err: FortnoxError, retry_after: Option<String>) -> FortnoxError {
+    match (err, retry_after) {
+        (FortnoxError::Api { status, body }, Some(retry_after)) => FortnoxError::Api {
+            status,
+            body: format!("{body} (Retry-After: {retry_after})"),
+        },
+        (err, _) => err,
     }
 }
 
@@ -576,6 +813,36 @@ mod tests {
             2,
             "exactly two requests: the original and one retry"
         );
+        // A fresh token refused too is a dead grant, and only a person can fix
+        // that. The error has to name the command they must run, or the owner
+        // sees "HTTP 401" and has nothing to do with it.
+        let rendered = err.to_string();
+        assert!(rendered.contains("unauthorized"), "{rendered}");
+        assert!(
+            rendered.contains(crate::auth::AUTHORIZE_COMMAND),
+            "the terminal 401 must name the authorize command: {rendered}"
+        );
+    }
+
+    /// The hint belongs to the *second* 401 only. A 403, or a 401 the retry
+    /// recovered from, must not tell the owner to re-authorise.
+    #[tokio::test]
+    async fn a_403_is_not_dressed_up_as_a_dead_grant() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw("forbidden", "text/plain"))
+            .mount(&server)
+            .await;
+
+        let (client, refresh, _store) = client_for(&server);
+        let err = client.get("accounts", &[]).await.expect_err("a 403");
+
+        assert_eq!(err.status(), Some(403));
+        assert_eq!(refresh.calls(), 0, "a 403 is not an expired token");
+        assert!(
+            !err.to_string().contains(crate::auth::AUTHORIZE_COMMAND),
+            "{err}"
+        );
     }
 
     /// The 401 path must not mask a broken grant as an API error: when the
@@ -630,6 +897,78 @@ mod tests {
             server.received_requests().await.expect("requests").len(),
             1,
             "a rate limit is reported, not retried into"
+        );
+    }
+
+    /// Nothing retries a 429 in this build, so the error is the only place
+    /// Fortnox's own backoff can survive. Dropping the header means no future
+    /// retry policy can honour it — it would have to guess.
+    #[tokio::test]
+    async fn a_429_carries_fortnoxs_retry_after_into_the_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "42")
+                    .set_body_raw("slow down", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        let err = client.get("accounts", &[]).await.expect_err("a 429");
+
+        assert_eq!(err.status(), Some(429));
+        assert!(
+            err.to_string().contains("Retry-After: 42"),
+            "the Retry-After Fortnox sent must reach the caller: {err}"
+        );
+    }
+
+    /// The header is server-supplied. A megabyte of it must not become a log
+    /// line, and a value we cannot read is dropped rather than half-quoted.
+    #[tokio::test]
+    async fn an_absurd_retry_after_is_dropped_rather_than_carried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "9".repeat(5_000).as_str())
+                    .set_body_raw("slow down", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        let err = client.get("accounts", &[]).await.expect_err("a 429");
+
+        assert_eq!(err.status(), Some(429));
+        assert!(!err.to_string().contains("Retry-After"), "{err}");
+        assert!(err.to_string().len() < 500, "{}", err.to_string().len());
+    }
+
+    /// A `Retry-After` on a 503 is just as real as one on a 429; carrying it
+    /// only for 429 would lose the one Fortnox sends during maintenance.
+    #[tokio::test]
+    async fn a_retry_after_on_a_503_is_carried_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "Wed, 24 Sep 2026 12:00:00 GMT")
+                    .set_body_raw("maintenance", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        let err = client.get("accounts", &[]).await.expect_err("a 503");
+
+        assert_eq!(err.status(), Some(503));
+        assert!(
+            err.to_string()
+                .contains("Retry-After: Wed, 24 Sep 2026 12:00:00 GMT"),
+            "{err}"
         );
     }
 
@@ -694,12 +1033,18 @@ mod tests {
 
     /// A 200 that is not JSON is the failure that hurts: a login or consent
     /// page deserialises into nothing and reads as "no rows".
+    /// A 200 that is not JSON must be an error — and must say so without
+    /// quoting the body. A 2xx from this API is a company's accounting data;
+    /// this message goes to a log. The content type and the length are what
+    /// distinguish a login page from a truncated reply, and neither can carry
+    /// a row of someone's ledger.
     #[tokio::test]
-    async fn an_html_200_errors_instead_of_deserialising_into_nonsense() {
+    async fn an_html_200_errors_without_quoting_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_raw("<html>sign in</html>", "text/html"),
+                ResponseTemplate::new(200)
+                    .set_body_raw("<html>Supplier AB owes 41 250 SEK</html>", "text/html"),
             )
             .mount(&server)
             .await;
@@ -707,9 +1052,44 @@ mod tests {
         let (client, _refresh, _store) = client_for(&server);
         let err = client.get("accounts", &[]).await.expect_err("not JSON");
 
+        assert_eq!(err.status(), Some(200));
         let rendered = err.to_string();
+        let debugged = format!("{err:?}");
         assert!(rendered.contains("text/html"), "{rendered}");
-        assert!(rendered.contains("sign in"), "{rendered}");
+        assert!(rendered.contains("40 bytes"), "{rendered}");
+        for leak in ["Supplier AB", "41 250", "<html>"] {
+            assert!(
+                !rendered.contains(leak) && !debugged.contains(leak),
+                "the success body must not be quoted, found {leak:?} in {rendered} / {debugged}"
+            );
+        }
+    }
+
+    /// The same rule for a 200 that *claims* to be JSON and is not: report the
+    /// classification, the position and the length, never the bytes.
+    #[tokio::test]
+    async fn an_unreadable_json_200_errors_without_quoting_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"Supplier":"Supplier AB","Debt":41250"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        let err = client.get("accounts", &[]).await.expect_err("bad JSON");
+
+        let rendered = err.to_string();
+        let debugged = format!("{err:?}");
+        assert!(rendered.contains("38 bytes"), "{rendered}");
+        for leak in ["Supplier AB", "41250"] {
+            assert!(
+                !rendered.contains(leak) && !debugged.contains(leak),
+                "found {leak:?} in {rendered} / {debugged}"
+            );
+        }
     }
 
     /// `reqwest`'s default policy strips `Authorization` across origins but
@@ -791,6 +1171,208 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&requests[0].body).expect("json body"),
             sent
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // post_form — the Fortnox `inbox` upload (upstream `client.postForm`,
+    // reached from `files.ts::uploadInboxFile`).
+    // -----------------------------------------------------------------------
+
+    /// The receipt bytes a test uploads. Recognisable in a request body and,
+    /// if it ever appeared in one, in an error message.
+    const RECEIPT: &[u8] = b"%PDF-1.4 receipt bytes";
+
+    fn receipt_parts() -> [FormPart<'static>; 1] {
+        [FormPart {
+            name: "file",
+            bytes: RECEIPT,
+            filename: Some("kvitto.pdf"),
+            mime: Some("application/pdf"),
+        }]
+    }
+
+    /// The boundary out of a request's `content-type`, which is what tells one
+    /// built form from another.
+    fn boundary_of(request: &wiremock::Request) -> String {
+        request
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| ct.split("boundary=").nth(1))
+            .expect("a multipart content-type carries a boundary")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn post_form_sends_a_multipart_body_with_the_file_and_returns_the_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_matcher("/inbox"))
+            .and(query_param("path", "Inbox_v"))
+            .respond_with(json(serde_json::json!({ "File": { "Id": "f-1" } }), 200))
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        let res = client
+            .post_form("inbox", &receipt_parts(), &[("path", "Inbox_v")])
+            .await
+            .expect("the upload");
+
+        assert_eq!(res, serde_json::json!({ "File": { "Id": "f-1" } }));
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let content_type = requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "{content_type}"
+        );
+        let body = requests[0].body.clone();
+        assert!(
+            body.windows(RECEIPT.len()).any(|w| w == RECEIPT),
+            "the file bytes must reach the wire"
+        );
+        let rendered = String::from_utf8_lossy(&body);
+        assert!(rendered.contains(r#"name="file""#), "{rendered}");
+        assert!(rendered.contains("kvitto.pdf"), "{rendered}");
+        assert!(rendered.contains("application/pdf"), "{rendered}");
+    }
+
+    /// **The 401 budget, on the multipart path.** A `reqwest` form is consumed
+    /// by the send and is neither `Clone` nor reusable, so the retry can only
+    /// work if the body is *rebuilt*. The evidence that it was: the second
+    /// request carries the whole file again, under a different boundary, with
+    /// the new token — and there are exactly two requests and one refresh.
+    #[tokio::test]
+    async fn a_401_on_a_form_post_retries_once_with_a_freshly_built_form_and_the_new_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header(
+                "authorization",
+                format!("Bearer {LIVE_TOKEN}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_raw("", "application/json"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header(
+                "authorization",
+                format!("Bearer {RENEWED_TOKEN}").as_str(),
+            ))
+            .respond_with(json(serde_json::json!({ "File": { "Id": "f-2" } }), 200))
+            .mount(&server)
+            .await;
+
+        let (client, refresh, store) = client_for(&server);
+        let res = client
+            .post_form("inbox", &receipt_parts(), &[("path", "Inbox_v")])
+            .await
+            .expect("the retry after the forced refresh uploads the file");
+
+        assert_eq!(res, serde_json::json!({ "File": { "Id": "f-2" } }));
+        assert_eq!(refresh.calls(), 1, "exactly one forced refresh");
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests.len(),
+            2,
+            "the original upload and exactly one retry"
+        );
+
+        // Both bodies are complete. A reused (already consumed) form would
+        // have sent an empty or truncated body the second time.
+        for (nth, request) in requests.iter().enumerate() {
+            assert!(
+                request.body.windows(RECEIPT.len()).any(|w| w == RECEIPT),
+                "request {nth} did not carry the file bytes — the form was not rebuilt"
+            );
+        }
+        // A fresh `Form` generates a fresh boundary, so two different
+        // boundaries mean two separately built bodies rather than one handle
+        // sent twice.
+        assert_ne!(
+            boundary_of(&requests[0]),
+            boundary_of(&requests[1]),
+            "the retry must build a new form, not resend the first one"
+        );
+        // And the rotation still had to be persisted on this path.
+        assert_eq!(
+            store.current().expect("stored").refresh_token,
+            "rotatedRefresh"
+        );
+    }
+
+    /// A second 401 on the upload path is terminal too — the bound is in
+    /// `request`, so it holds for every body shape, and this pins it.
+    #[tokio::test]
+    async fn a_second_401_on_a_form_post_is_terminal_and_makes_no_third_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_raw("", "application/json"))
+            .mount(&server)
+            .await;
+
+        let (client, refresh, _store) = client_for(&server);
+        let err = client
+            .post_form("inbox", &receipt_parts(), &[])
+            .await
+            .expect_err("a token refused twice is an error");
+
+        assert_eq!(err.status(), Some(401));
+        assert_eq!(refresh.calls(), 1, "exactly one forced refresh, not a loop");
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            2,
+            "exactly two requests: the original and one retry"
+        );
+        assert!(
+            err.to_string().contains(crate::auth::AUTHORIZE_COMMAND),
+            "{err}"
+        );
+    }
+
+    /// A form part's value is a customer's receipt. Only its field name may
+    /// appear in an error, and nothing but a length in a `Debug`.
+    #[tokio::test]
+    async fn a_form_parts_bytes_and_filename_stay_out_of_errors_and_debug() {
+        let server = MockServer::start().await;
+        let (client, _refresh, _store) = client_for(&server);
+
+        let part = FormPart {
+            name: "file",
+            bytes: RECEIPT,
+            filename: Some("kvitto-4711.pdf"),
+            mime: Some("not a media type"),
+        };
+        let err = client
+            .post_form("inbox", &[part], &[])
+            .await
+            .expect_err("an invented media type is refused");
+
+        let rendered = err.to_string();
+        let debugged = format!("{err:?}");
+        assert!(
+            rendered.contains("file"),
+            "the field name may be named: {rendered}"
+        );
+        for leak in ["kvitto-4711", "%PDF", "receipt bytes"] {
+            assert!(
+                !rendered.contains(leak) && !debugged.contains(leak),
+                "found {leak:?} in {rendered} / {debugged}"
+            );
+        }
+        // Nothing was sent: the body could not be built.
+        assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+
+        let part_debug = format!("{part:?}");
+        assert!(part_debug.contains("22 bytes"), "{part_debug}");
+        for leak in ["kvitto-4711", "%PDF", "receipt bytes"] {
+            assert!(!part_debug.contains(leak), "found {leak:?} in {part_debug}");
+        }
     }
 
     // -----------------------------------------------------------------------
