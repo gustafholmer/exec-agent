@@ -17,13 +17,16 @@
 //! [`domain::money`] holds the rounding rule everything else depends on;
 //! [`domain::bas`] holds the Swedish BAS chart of accounts.
 //!
-//! [`auth`] holds the OAuth flow and the rotating-refresh-token store, and
-//! [`errors`] the one error type it returns.
+//! [`auth`] holds the OAuth flow and the rotating-refresh-token store,
+//! [`client`] the hardened HTTP client, and [`errors`] the one error type
+//! both return.
 
 pub mod auth;
+pub mod client;
 pub mod domain;
 pub mod errors;
 pub mod reporting;
 
+pub use client::FortnoxClient;
 pub use domain::{bas, moms, money, posting, voucher};
 pub use errors::FortnoxError;
