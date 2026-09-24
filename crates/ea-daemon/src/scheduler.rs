@@ -287,8 +287,22 @@ impl Scheduler {
         }
 
         let threshold = self.breaker_threshold;
+        // Constructed here, on the calling thread, *before* `tokio::spawn` --
+        // not as the first statement inside the spawned future. An `async
+        // move` block captures its moved-in variables the instant the block
+        // expression is evaluated, not on first poll, so by the time this
+        // `guard` is moved into the block below it is already owned by the
+        // future that `tokio::spawn` receives. If that future is ever
+        // dropped without being polled (an `.abort()` or a runtime shutdown
+        // landing before the executor gets to it), the future's own `Drop`
+        // runs every captured value's destructor, `guard` included, and the
+        // marker still clears. There is no longer any window between
+        // "claimed" and "guarded": the compare_exchange above and this
+        // construction happen back to back on the same thread with nothing
+        // async in between.
+        let guard = RunningGuard(state.running.clone());
         Some(tokio::spawn(async move {
-            let _guard = RunningGuard(state.running.clone());
+            let _guard = guard;
             let fut = (state.job.run)();
             match AssertUnwindSafe(fut).catch_unwind().await {
                 Ok(Ok(())) => {
@@ -676,5 +690,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("running marker was never cleared after the job's task was aborted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_aborted_before_its_first_poll_clears_the_running_marker() {
+        // Regression test for the leak the reviewer found: `RunningGuard`
+        // used to be the first statement *inside* the spawned future, so it
+        // was only constructed on that future's first poll. Aborting (or
+        // dropping) a `JoinHandle` before the task was ever polled dropped
+        // the future without running any of its body -- `RunningGuard` was
+        // never constructed, and the marker stayed `true` forever. This is
+        // distinct from `a_dropped_job_future_clears_the_running_marker`
+        // above, which only proves the drop-*after*-first-poll case (it
+        // waits on `started.notify_one()`, which fires after the guard
+        // already exists).
+        //
+        // Determinism: this test runs on a *current-thread* runtime
+        // (`flavor = "current_thread"`, matching this crate's default, made
+        // explicit here since it's load-bearing for the test), and there is
+        // no `.await` anywhere between `sched.tick` (which calls
+        // `tokio::spawn`) and `h.abort()`. A current-thread runtime only
+        // polls a newly spawned task when the driving task yields control
+        // back to the executor -- at an await point, or by returning -- and
+        // this test does neither between spawning and aborting, so the
+        // spawned task cannot have been polled even once by the time
+        // `.abort()` runs. This is corroborated directly, not just argued:
+        // the job body's very first statement increments `probe.calls()`,
+        // so if the future had been polled at all -- even partially --
+        // `calls()` would already read 1 by the time we check it below. It
+        // reads 0, which is direct evidence the abort landed pre-poll, not
+        // just a timing assumption.
+        let probe = Probe::new();
+        let sched = Scheduler::new(3);
+        sched.add(probe.ok_job("job", Duration::from_millis(1)));
+
+        let t0 = Instant::now();
+        let handles = sched.tick(t0);
+        assert_eq!(handles.len(), 1, "first tick should start the job");
+        for h in handles {
+            h.abort();
+        }
+
+        assert_eq!(
+            probe.calls(),
+            0,
+            "the job's body must not have run yet -- this abort should land before first poll"
+        );
+
+        // With the leak, `RunningGuard` was never constructed for this
+        // invocation, so `running` would stay `true` forever and every
+        // subsequent tick would find nothing to spawn. With the fix, the
+        // guard was moved into the future before `tokio::spawn` ever saw it,
+        // so dropping the unpolled future still runs the guard's destructor
+        // and clears the marker -- but that drop is carried out by the
+        // runtime, not by `.abort()` returning, so it needs at least one
+        // yield back to the executor to actually happen. Poll for it with a
+        // bounded loop rather than a fixed sleep (the same pattern the
+        // post-poll drop test above uses), so this doesn't assume how many
+        // scheduler turns the cleanup takes -- only that it eventually does.
+        for _ in 0..200 {
+            let handles = sched.tick(t0 + Duration::from_secs(1));
+            if !handles.is_empty() {
+                await_all(handles).await;
+                assert_eq!(
+                    probe.calls(),
+                    1,
+                    "job must run again after being aborted pre-poll"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("job never became runnable again after being aborted before its first poll");
     }
 }
