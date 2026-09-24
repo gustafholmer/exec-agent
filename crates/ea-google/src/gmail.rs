@@ -73,6 +73,28 @@
 //! at the price of body text should poll less often or ask for fewer
 //! messages, not silently lose bodies.
 //!
+//! # Why the `get`s run [`GET_CONCURRENCY`] at a time
+//!
+//! Those 26 requests used to be 26 *round trips*, one after another. The
+//! daemon polls this connector every two minutes across two accounts, so the
+//! sequential shape spent the whole poll budget on latency: 54 round trips
+//! for a two-account poll, which on a slow link is a poll that cannot finish
+//! before the next one is due. The `get`s are independent — nothing in one
+//! affects another — so they run eight in flight, turning 25 round trips per
+//! account into four waves.
+//!
+//! Eight, not "all of them": a poll must not be able to open 500 sockets at
+//! once (`max` is clamped to [`MAX_MESSAGES`], not to 25), and Gmail bills
+//! per-user quota per second — `messages.get` costs 5 units against a 250
+//! unit/second/user ceiling, so 50 concurrent gets would be at the limit
+//! while 8 is comfortably inside it. The wall-clock saving is mostly won by
+//! the first few anyway: 25 requests at 8 wide is four waves, at 16 wide it
+//! is two, and the second halving buys far less than it risks.
+//!
+//! The results stay in `messages.list` order — `buffered`, not
+//! `buffer_unordered` — because that order is Gmail's recency order and the
+//! watch payloads are read in it.
+//!
 //! # HTTP hardening
 //!
 //! Identical to [`crate::calendar`]: redirects disabled
@@ -90,6 +112,7 @@ use anyhow::{bail, Context};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures::stream::{StreamExt, TryStreamExt};
 use reqwest::Url;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -104,6 +127,10 @@ pub const GOOGLE_GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/";
 /// clamped to this rather than trusted, so a caller cannot accidentally turn
 /// one poll into an unbounded number of `messages.get` calls.
 const MAX_MESSAGES: usize = 500;
+
+/// How many `messages.get` requests one [`GmailClient::list_recent`] keeps in
+/// flight at once. See the module docs for why eight.
+pub const GET_CONCURRENCY: usize = 8;
 
 /// Per-request deadline, same value and reasoning as Calendar and `auth.rs`.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -525,7 +552,8 @@ impl GmailClient {
     /// The `max` most recent messages matching `query` (Gmail search syntax,
     /// e.g. `"is:unread"`; pass `""` for no filter), normalised. See the
     /// module docs for the list-then-get cost this makes: one `list` request
-    /// plus one `get` per message returned.
+    /// plus one `get` per message returned, the `get`s running
+    /// [`GET_CONCURRENCY`] at a time and returned in list order.
     pub async fn list_recent(
         &self,
         auth: &Auth,
@@ -540,12 +568,19 @@ impl GmailClient {
             .list_message_ids(auth, account, &token, query, capped)
             .await?;
 
-        let mut mail = Vec::with_capacity(ids.len());
-        for id in ids {
-            let raw = self.get_message(auth, account, &token, &id).await?;
-            mail.push(normalize(&raw, account));
-        }
-        Ok(mail)
+        // `buffered`, so the output keeps `messages.list`'s recency order
+        // however the responses interleave, and so a slow message delays only
+        // the rows behind it rather than every one of them. The first error
+        // short-circuits the rest, exactly as the sequential loop did.
+        let token = &token;
+        futures::stream::iter(ids)
+            .map(|id| async move {
+                let raw = self.get_message(auth, account, token, &id).await?;
+                anyhow::Ok(normalize(&raw, account))
+            })
+            .buffered(GET_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// One message by id, normalised.
@@ -1280,6 +1315,91 @@ mod tests {
 
     fn json(body: serde_json::Value) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_raw(body.to_string(), "application/json; charset=utf-8")
+    }
+
+    /// The shape of the poll, not just its result. 25 sequential `get`s per
+    /// account meant 54 round trips for a two-account poll on a 120-second
+    /// budget — 555 ms per request, which a slow link does not have. Eight in
+    /// flight turns that into four waves per account.
+    ///
+    /// Timed, deliberately, because there is nothing else to observe: the
+    /// margins are wide (serial would be 6 s; the assertion is 3 s) and the
+    /// lower bound is what stops "concurrency" quietly becoming "unbounded",
+    /// which is its own way to get an integration rate limited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_message_gets_run_bounded_concurrently_and_stay_in_list_order() {
+        const COUNT: usize = 24;
+        const DELAY: Duration = Duration::from_millis(250);
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        let ids: Vec<String> = (0..COUNT).map(|n| format!("msg-{n:02}")).collect();
+        let refs: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "threadId": format!("t-{id}") }))
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/users/me/messages"))
+            .respond_with(json(serde_json::json!({ "messages": refs })))
+            .mount(&server)
+            .await;
+
+        for id in &ids {
+            Mock::given(method("GET"))
+                .and(path(format!("/users/me/messages/{id}")))
+                .respond_with(
+                    json(serde_json::json!({
+                        "id": id,
+                        "threadId": format!("t-{id}"),
+                        "labelIds": ["INBOX"],
+                        "snippet": "hi",
+                        "internalDate": "1700000000000",
+                        "payload": {
+                            "mimeType": "text/plain",
+                            "headers": [
+                                {"name": "From", "value": "a@example.com"},
+                                {"name": "Subject", "value": id},
+                            ],
+                            "body": { "data": encode("body text") },
+                        },
+                    }))
+                    .set_delay(DELAY),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let started = std::time::Instant::now();
+        let mail = GmailClient::new(&server.uri())
+            .unwrap()
+            .list_recent(&auth, "work", "is:unread", COUNT)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(mail.len(), COUNT);
+        let got: Vec<&str> = mail.iter().map(|m| m.id.as_str()).collect();
+        let want: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            got, want,
+            "the rows must stay in messages.list order — that order is Gmail's recency order"
+        );
+
+        assert!(
+            elapsed < DELAY * COUNT as u32 / 2,
+            "{COUNT} gets took {elapsed:?}; sequentially they would take {:?}, so these did \
+             not run concurrently",
+            DELAY * COUNT as u32
+        );
+        assert!(
+            elapsed >= DELAY * 2,
+            "{COUNT} gets took {elapsed:?}, which is under two waves at {} in flight: the \
+             concurrency is not bounded",
+            GET_CONCURRENCY
+        );
     }
 
     #[tokio::test]

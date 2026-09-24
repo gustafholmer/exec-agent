@@ -95,6 +95,11 @@ pub const UNREAD_QUERY: &str = "is:unread -category:promotions -category:social 
 /// this is the number that bounds a poll's request count: 1 + 25 per account.
 /// An inbox with more than 25 unread messages has a bigger problem than this
 /// connector can solve, and the oldest of them are not news.
+///
+/// The `get`s run [`crate::gmail::GET_CONCURRENCY`] at a time, so 25 requests
+/// cost four round trips rather than 25 — which is what lets a two-account
+/// poll fit inside the daemon's `watch_poll` deadline on a link that is not
+/// fast.
 pub const MAX_UNREAD: usize = 25;
 
 /// How much of a mail body reaches a payload. See the module docs.

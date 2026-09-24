@@ -415,6 +415,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ea-core",
+ "futures",
  "reqwest",
  "rmcp",
  "serde",

@@ -318,7 +318,10 @@ Assumptions worth re-checking against live accounts:
   that "not a conflict" is the right answer anyway.
 - Gmail reads `messages.list` then one `messages.get` per message at
   `format=full` — 1 + 25 requests per account per poll. `format=metadata` would
-  be cheaper but omits the body, which is the part triage scores.
+  be cheaper but omits the body, which is the part triage scores. The `get`s
+  run eight at a time, so those 25 requests are four round trips rather than
+  25; the daemon allows one poll 90 seconds against a 120-second interval, and
+  the sequential version could not reliably fit.
 - Bodies prefer `text/plain` and fall back to stripped `text/html`. Much of what
   a bank or a university sends has no plain-text part at all.
 - No redirects are followed on any request: a same-host https→http downgrade
