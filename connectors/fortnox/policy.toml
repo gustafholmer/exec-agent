@@ -1,0 +1,56 @@
+# What a session may do with the Fortnox connector.
+#
+# A tool with no rule here falls through to the gate's `approve` default, so
+# the list is checked against the server's registered tools in both
+# directions by ea-fortnox-mcp's policy-coverage tests
+# (`tools::tests::every_registered_tool_has_a_policy_rule` and
+# `every_policy_rule_names_a_registered_tool_or_a_deliberate_placeholder`).
+#
+# The section name must be this directory's basename: `Policy::load_dirs`
+# rejects a connector that declares a foreign section, because a policy file
+# that could name another connector would be a privilege-escalation path.
+#
+# # There is deliberately no amount threshold
+#
+# The obvious design — auto below N kronor, approve above it — is not used
+# here, and its absence is the decision this file exists to record. What makes
+# a voucher worth a human glance is not the size of the number on it. An
+# incorrect 200 kr expense booked to the wrong account is as tedious to unwind
+# as an incorrect 200 000 kr one, needs the same correcting voucher, and is
+# just as visible to the accountant who reads the books. A threshold would
+# also be a thing to tune, and every tuning downward is a quiet widening of
+# what happens without anyone looking. So: every write is a tap, full stop.
+[fortnox]
+
+# Reads. GET only, nothing posted, nothing changed.
+financial_overview = "auto"
+profit_and_loss = "auto"
+balance_sheet = "auto"
+vat_summary = "auto"
+unpaid_invoices = "auto"
+account_ledger = "auto"
+query_fortnox = "auto"
+
+# Reports. Derived from the reads above; still GET only.
+vat_report = "auto"
+period_report = "auto"
+result_summary = "auto"
+
+# Previews. These make no HTTP call at all — they render the voucher a write
+# *would* post. Auto is the point of them: the model must be able to show a
+# person what is about to be booked without that itself needing approval,
+# because a preview that needed a tap would just be the write with extra
+# steps.
+preview_voucher = "auto"
+preview_expense = "auto"
+preview_reconciliation = "auto"
+
+# The daemon's timer calls this one, with no session involved.
+watch_poll = "auto"
+
+# Writes: always a human tap, whatever the amount. An incorrect voucher is
+# tedious to unwind and visible to the accountant.
+record_voucher = { mode = "approve", note = "always, regardless of amount" }
+record_expense = { mode = "approve", note = "always, regardless of amount" }
+reconcile_payment = { mode = "approve", note = "always, regardless of amount" }
+attach_receipt = "approve"

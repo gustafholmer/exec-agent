@@ -3,7 +3,7 @@
 //!
 //! The unit tests pin the router, the schemas and the tool bodies. These pin
 //! what the daemon's connector registry actually meets: a process that
-//! completes the handshake, advertises seventeen tools, and — crucially — does
+//! completes the handshake, advertises eighteen tools, and — crucially — does
 //! all of that with **no credentials configured**, reporting the missing
 //! `app.json` as a tool error rather than dying at start-up. A connector that
 //! exits before the handshake tells the operator only "handshake failed".
@@ -42,6 +42,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "unpaid_invoices",
     "vat_report",
     "vat_summary",
+    "watch_poll",
 ];
 
 const WRITE_TOOLS: &[&str] = &[
@@ -71,7 +72,7 @@ fn text_of(result: &rmcp::model::CallToolResult) -> String {
 }
 
 #[tokio::test]
-async fn the_live_server_advertises_the_seventeen_planned_tools() {
+async fn the_live_server_advertises_the_eighteen_planned_tools() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = spawn(dir.path()).await;
 
@@ -89,7 +90,7 @@ async fn the_live_server_advertises_the_seventeen_planned_tools() {
             .iter()
             .map(|n| n.to_string())
             .collect::<Vec<_>>(),
-        "an eighteenth Fortnox tool must be deliberate, and must come with a policy rule"
+        "a nineteenth Fortnox tool must be deliberate, and must come with a policy rule"
     );
 
     client.cancel().await.unwrap();
@@ -178,6 +179,47 @@ async fn a_read_without_credentials_is_an_error_naming_the_file_and_the_server_s
     assert_ne!(text.trim(), "[]", "silence must not look like success");
 
     // Still serving.
+    let again = client.call_tool(params).await.expect("still serving");
+    assert_eq!(again.is_error, Some(true));
+    assert_eq!(
+        client.list_all_tools().await.unwrap().len(),
+        EXPECTED_TOOLS.len()
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The lapsed-grant failure, on the wire, where the daemon meets it.
+///
+/// This is the one that must never be `[]`. An empty array is what a quiet
+/// week looks like: the breaker would not trip, `ea status` would stay green,
+/// and a connector whose refresh token died in October would go silent until
+/// somebody happened to ask it a question. The tax deadlines inside
+/// `watch_poll` are pure and would have cost nothing to emit here — they are
+/// deliberately not emitted, because a poll that half works reads as a poll
+/// that works.
+#[tokio::test]
+async fn watch_poll_without_credentials_is_an_error_and_never_an_empty_array() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = spawn(dir.path()).await;
+
+    let params = CallToolRequestParams::new(Cow::Borrowed("watch_poll"));
+    let result = client
+        .call_tool(params.clone())
+        .await
+        .expect("missing credentials must not be a protocol error");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unconfigured connector must report an error, not an empty change list"
+    );
+    let text = text_of(&result);
+    assert!(text.contains("app.json"), "{text}");
+    assert!(text.contains("no usable credentials"), "{text}");
+    assert_ne!(text.trim(), "[]", "silence must not look like success");
+
+    // Still serving: a failed poll costs the daemon nothing.
     let again = client.call_tool(params).await.expect("still serving");
     assert_eq!(again.is_error, Some(true));
     assert_eq!(

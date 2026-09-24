@@ -1,5 +1,5 @@
-//! The MCP surface: seven read tools, three report tools, three previews and
-//! four writes.
+//! The MCP surface: seven read tools, three report tools, three previews,
+//! four writes and `watch_poll`.
 //!
 //! # The shape, and why it differs from upstream's
 //!
@@ -14,6 +14,16 @@
 //! * [`write`] and [`attach`] — POST, with no `confirm` parameter, because
 //!   reaching one means `propose_action` already ran and a human already
 //!   tapped approve. See the crate docs.
+//! * [`watch`] — the daemon's timer calls it, no session involved. GET only,
+//!   and it fails loudly rather than answering `[]`.
+//!
+//! # Every tool here has a policy rule, and every rule has a tool
+//!
+//! `connectors/fortnox/policy.toml` is checked against this router in both
+//! directions by the tests at the foot of this file. The second direction is
+//! the one that earns its place: a rule stranded by a rename still parses and
+//! still looks deliberate while governing nothing, and the tool it used to
+//! cover quietly falls through to the gate's `approve` default.
 //!
 //! # Where the numbers come from
 //!
@@ -36,6 +46,7 @@ pub mod attach;
 pub mod preview;
 pub mod read;
 pub mod report;
+pub mod watch;
 pub mod write;
 
 use std::sync::Arc;
@@ -54,6 +65,32 @@ use serde_json::Value;
 /// The name the daemon knows this connector by, and the `[section]` its
 /// `policy.toml` rules live under.
 pub use ea_fortnox::auth::CONNECTOR;
+
+/// Tools named in `policy.toml` that this server deliberately does **not**
+/// implement.
+///
+/// Canvas holds `submit_assignment` shut this way and Google holds `send_mail`
+/// shut; this connector has no such door, and the list is empty on purpose
+/// rather than by omission. The reason is that Fortnox's dangerous operations
+/// are not tools this connector declines to write — they are tools it *does*
+/// implement, because bookkeeping is the job, and they are governed by
+/// `approve` instead. A `deny` here would be a tool nobody can reach even with
+/// a human tap, and there is no operation in this connector's remit that
+/// deserves that.
+///
+/// If one ever does — deleting a voucher, say, or closing a financial year —
+/// adding the name here *and* as a `deny` rule puts the refusal in force
+/// before the tool exists, because the gate matches a rule by name.
+pub const DELIBERATE_PLACEHOLDERS: &[&str] = &[];
+
+/// The tools that change something in Fortnox. None of these may ever be
+/// `auto`; see `nothing_that_posts_is_auto`.
+pub const POSTING_TOOLS: &[&str] = &[
+    "record_voucher",
+    "record_expense",
+    "reconcile_payment",
+    "attach_receipt",
+];
 
 /// Either a working client, or the reason there isn't one.
 ///
@@ -105,6 +142,7 @@ impl FortnoxServer {
             + Self::preview_router()
             + Self::write_router()
             + Self::attach_router()
+            + Self::watch_router()
     }
 
     pub(crate) fn client(&self) -> Result<&FortnoxClient, String> {
@@ -310,18 +348,56 @@ pub(crate) mod test_support;
 mod tests {
     use super::*;
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    /// The catalogue, pinned. Upstream's `index.test.ts` asserts the same
-    /// thing over its fourteen tools; this adds the three previews and drops
-    /// nothing.
-    #[test]
-    fn the_server_registers_exactly_the_seventeen_planned_tools() {
-        let names: BTreeSet<String> = FortnoxServer::router()
+    fn registered_tools() -> BTreeSet<String> {
+        FortnoxServer::router()
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
-            .collect();
+            .collect()
+    }
+
+    fn policy_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../connectors/fortnox")
+            .canonicalize()
+            .expect("connectors/fortnox must exist")
+            .join("policy.toml")
+    }
+
+    /// Every rule in the `[fortnox]` section, as `tool -> mode`. Both rule
+    /// shapes `ea_core::policy` accepts are flattened here: `"approve"` and
+    /// `{ mode = "approve", note = "..." }`.
+    fn policy_rules() -> BTreeMap<String, String> {
+        let text = std::fs::read_to_string(policy_path()).expect("reading policy.toml");
+        let parsed: BTreeMap<String, BTreeMap<String, toml::Value>> =
+            toml::from_str(&text).expect("policy.toml must parse");
+        let section = parsed
+            .get(CONNECTOR)
+            .unwrap_or_else(|| panic!("policy.toml must have a [{CONNECTOR}] section"));
+        section
+            .iter()
+            .map(|(tool, value)| {
+                let mode = match value {
+                    toml::Value::String(mode) => mode.clone(),
+                    toml::Value::Table(table) => table
+                        .get("mode")
+                        .and_then(|mode| mode.as_str())
+                        .expect("a table rule must have a mode")
+                        .to_string(),
+                    other => panic!("unexpected rule shape for {tool}: {other:?}"),
+                };
+                (tool.clone(), mode)
+            })
+            .collect()
+    }
+
+    /// The catalogue, pinned. Upstream's `index.test.ts` asserts the same
+    /// thing over its fourteen tools; this adds the three previews and
+    /// `watch_poll`, and drops nothing.
+    #[test]
+    fn the_server_registers_exactly_the_eighteen_planned_tools() {
         let expected: BTreeSet<String> = [
             "account_ledger",
             "attach_receipt",
@@ -340,14 +416,194 @@ mod tests {
             "unpaid_invoices",
             "vat_report",
             "vat_summary",
+            "watch_poll",
         ]
         .into_iter()
         .map(String::from)
         .collect();
         assert_eq!(
-            names, expected,
-            "an eighteenth Fortnox tool must be a deliberate act, with a policy rule to match"
+            registered_tools(),
+            expected,
+            "a nineteenth Fortnox tool must be a deliberate act, with a policy rule to match"
         );
+    }
+
+    /// The section name is the connector's own, which is also this
+    /// directory's basename. `Policy::load_dirs` rejects anything else as a
+    /// privilege-escalation path, so a typo here is a startup failure rather
+    /// than a silently ignored file.
+    #[test]
+    fn the_policy_file_declares_only_this_connectors_own_section() {
+        let text = std::fs::read_to_string(policy_path()).expect("reading policy.toml");
+        let parsed: BTreeMap<String, toml::Value> =
+            toml::from_str(&text).expect("policy.toml must parse");
+        let sections: Vec<&str> = parsed.keys().map(String::as_str).collect();
+        assert_eq!(
+            sections,
+            [CONNECTOR],
+            "a connector may only police its own tools; Policy::load_dirs fails startup \
+             on a foreign section"
+        );
+        assert_eq!(
+            CONNECTOR, "fortnox",
+            "the section, the connector name and the directory basename are one name"
+        );
+    }
+
+    /// Direction one: nothing the server offers is unpoliced. A tool with no
+    /// rule falls through to the gate's `approve` default, which is not the
+    /// same as having been thought about.
+    #[test]
+    fn every_registered_tool_has_a_policy_rule() {
+        let rules = policy_rules();
+        for tool in registered_tools() {
+            assert!(
+                rules.contains_key(&tool),
+                "tool {tool:?} has no rule in {}; add one",
+                policy_path().display()
+            );
+        }
+    }
+
+    /// Direction two, and the one that catches the subtle failure: a rule left
+    /// behind by a rename still parses, still looks deliberate, and applies to
+    /// nothing at all — while the tool it used to govern now falls through to
+    /// `approve`, which looks fine from every angle except the one that
+    /// matters.
+    #[test]
+    fn every_policy_rule_names_a_registered_tool_or_a_deliberate_placeholder() {
+        let tools = registered_tools();
+        for (rule, mode) in policy_rules() {
+            if tools.contains(&rule) {
+                continue;
+            }
+            assert!(
+                DELIBERATE_PLACEHOLDERS.contains(&rule.as_str()),
+                "policy rule {rule:?} names no registered tool. If it is a rename \
+                 leftover, delete it — it governs nothing while the renamed tool falls \
+                 through to the approve default. If it is a door deliberately held shut, \
+                 add it to DELIBERATE_PLACEHOLDERS."
+            );
+            assert_eq!(
+                mode, "deny",
+                "placeholder rule {rule:?} exists to forbid a tool that does not exist \
+                 yet; anything but deny would pre-authorise it"
+            );
+        }
+    }
+
+    /// Nothing that changes the owner's books may run without a human tap.
+    ///
+    /// Deliberately no amount threshold: an incorrect voucher is tedious to
+    /// unwind and visible to the accountant whatever the number on it says,
+    /// and a threshold is a dial that only ever gets turned down. See the
+    /// header of `connectors/fortnox/policy.toml`.
+    #[test]
+    fn nothing_that_posts_is_auto() {
+        let rules = policy_rules();
+        for tool in POSTING_TOOLS {
+            let mode = rules
+                .get(*tool)
+                .unwrap_or_else(|| panic!("{tool} must have a policy rule"));
+            assert_eq!(
+                mode, "approve",
+                "{tool} posts to Fortnox; it must wait for a human tap"
+            );
+        }
+        // And the list is the truth about the router, not a stale copy of it:
+        // every posting tool named above is actually registered.
+        let registered = registered_tools();
+        for tool in POSTING_TOOLS {
+            assert!(registered.contains(*tool), "{tool} is not registered");
+        }
+    }
+
+    /// Three writes carry the note the gate shows a person; `attach_receipt`
+    /// is a plain `"approve"`. All four are `approve`, which is what the test
+    /// above pins — this one pins that the note says the thing that makes the
+    /// policy unusual.
+    #[test]
+    fn the_three_booking_writes_say_the_amount_does_not_matter() {
+        let text = std::fs::read_to_string(policy_path()).expect("reading policy.toml");
+        let parsed: BTreeMap<String, BTreeMap<String, toml::Value>> =
+            toml::from_str(&text).expect("policy.toml must parse");
+        let section = &parsed[CONNECTOR];
+        for tool in ["record_voucher", "record_expense", "reconcile_payment"] {
+            let note = section[tool]
+                .get("note")
+                .and_then(|note| note.as_str())
+                .unwrap_or_else(|| panic!("{tool} must carry a note"));
+            assert_eq!(note, "always, regardless of amount", "{tool}");
+        }
+    }
+
+    /// The previews post nothing and make no HTTP call at all. If one of them
+    /// needed approval it would be the write with extra steps, and the model
+    /// would stop showing people what is about to be booked.
+    #[test]
+    fn every_preview_tool_is_auto() {
+        let rules = policy_rules();
+        let previews: Vec<String> = registered_tools()
+            .into_iter()
+            .filter(|tool| tool.starts_with("preview_"))
+            .collect();
+        assert_eq!(previews.len(), 3, "{previews:?}");
+        for tool in previews {
+            assert_eq!(
+                rules.get(&tool).map(String::as_str),
+                Some("auto"),
+                "{tool} renders a voucher and posts nothing; approving it buys nothing"
+            );
+        }
+    }
+
+    /// The daemon polls on a timer with no session and nobody to ask. A
+    /// `watch_poll` that is not `auto` is a connector that never polls.
+    #[test]
+    fn watch_poll_is_auto_or_the_connector_never_polls() {
+        assert_eq!(
+            policy_rules().get("watch_poll").map(String::as_str),
+            Some("auto")
+        );
+    }
+
+    /// `ea_daemon::jobs` calls `watch_poll` with `{}`, so it must require
+    /// nothing at all.
+    #[test]
+    fn watch_poll_requires_no_arguments_because_the_daemon_calls_it_with_an_empty_object() {
+        let schema = FortnoxServer::router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "watch_poll")
+            .map(|tool| serde_json::Value::Object((*tool.input_schema).clone()))
+            .expect("watch_poll must be registered");
+        let required = schema
+            .get("required")
+            .and_then(|required| required.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(
+            required, 0,
+            "the daemon polls with {{}}; a required argument here breaks every poll: {schema:#}"
+        );
+    }
+
+    /// The manifest and the policy file are one connector, and the daemon
+    /// checks that at startup. Checking it here means the failure is a red
+    /// test rather than a daemon that will not boot.
+    #[test]
+    fn the_manifest_names_this_connector_and_its_binary() {
+        let dir = policy_path().parent().expect("a directory").to_path_buf();
+        let text = std::fs::read_to_string(dir.join("connector.toml")).expect("connector.toml");
+        let parsed: toml::Value = text.parse().expect("connector.toml must be TOML");
+        assert_eq!(parsed["name"].as_str(), Some(CONNECTOR));
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some(CONNECTOR),
+            "a connector's name must equal its directory's basename"
+        );
+        assert_eq!(parsed["command"].as_str(), Some("ea-fortnox-mcp"));
+        assert_eq!(parsed["watch_interval_secs"].as_integer(), Some(86_400));
     }
 
     /// Every tool must say what it does; the description is the only thing a

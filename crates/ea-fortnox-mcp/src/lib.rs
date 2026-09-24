@@ -35,4 +35,6 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod deadlines;
 pub mod tools;
+pub mod watch;
