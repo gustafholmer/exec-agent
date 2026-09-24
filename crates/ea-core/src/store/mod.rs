@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod conversations;
 pub mod events;
+pub mod facts;
 pub mod kv;
 pub mod retention;
 pub mod runs;
