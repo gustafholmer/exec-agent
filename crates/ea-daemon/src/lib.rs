@@ -23,6 +23,7 @@ pub mod ipc;
 pub mod jobs;
 pub mod lock;
 pub mod notify;
+pub mod prompt;
 pub mod recovery;
 pub mod retention;
 pub mod scheduler;

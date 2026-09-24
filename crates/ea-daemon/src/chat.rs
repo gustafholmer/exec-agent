@@ -401,35 +401,15 @@ pub fn system_prompt(surface: &str, now: chrono::DateTime<Tz>, facts: &[Fact]) -
     prompt
 }
 
-/// A fact's text, with the block's own markers taken out of it — including
-/// any that only appear once every occurrence of the other marker has
-/// already been stripped.
-///
-/// Without this a fact whose body contains the closing marker ends the block
-/// and everything after it reads as prompt again — the delimiting would be
-/// decoration. A single `str::replace` pass is not enough: it does not
-/// re-scan what it produced, so a marker with another copy of itself spliced
-/// into its own middle (`</remem</remembered-notes>bered-notes>`) has that
-/// inner copy removed and the two remaining halves fall back together into
-/// the real marker. Repeating the removal until the text stops changing
-/// closes that gap; nesting the marker inside itself again just costs one
-/// more pass, and a fact's length is capped by [`FactStore::remember`]
-/// (`MAX_TOPIC_CHARS` / `MAX_BODY_CHARS`), so the number of passes is bounded
-/// by that cap rather than by the input.
+/// A fact's text, with the block's own markers taken out of it — see
+/// [`crate::prompt::fenced`] for why that removal has to run to a fixpoint.
 ///
 /// Every fact reaching the store was written by a chat session (the only
 /// kind that may call `remember`; see [`crate::session::ToolScope`]), so this
 /// is the second line of defence rather than the first, and it is cheap
 /// enough to keep both.
 fn fenced(text: &str) -> String {
-    let mut text = text.to_string();
-    loop {
-        let stripped = text.replace(FACTS_CLOSE, "").replace(FACTS_OPEN, "");
-        if stripped == text {
-            return stripped;
-        }
-        text = stripped;
-    }
+    crate::prompt::fenced(text, FACTS_OPEN, FACTS_CLOSE)
 }
 
 #[cfg(test)]
