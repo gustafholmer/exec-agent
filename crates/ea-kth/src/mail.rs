@@ -43,36 +43,24 @@
 //! stripped HTML, fall back again to Graph's own `bodyPreview`.
 //!
 //! The stripper started as a copy of `ea_google::gmail`'s rather than a shared
-//! dependency. It is sixty lines with no state, the two connectors would not be
-//! free to evolve it independently if it were shared, and lifting it into
-//! `ea-core` would touch a crate whose tests are already merged. The right
-//! moment to share it is when a third connector needs it; this comment is the
-//! marker for that.
-//!
-//! It has since diverged in two ways, both because Exchange-generated mail is
-//! not Gmail-generated mail:
-//!
-//! * `<style>` and `<script>` **contents** are dropped along with their tags
-//!   (see [`OPAQUE_ELEMENTS`]). Outlook emits stylesheets running to hundreds
-//!   of rules, and with a 2000-character body cap those would push the real
-//!   message out of the triage prompt.
-//! * Numeric entities are decoded as well as named ones. Swedish mail is full
-//!   of `&#229; &#228; &#246;`, and leaving them raw would put literal
-//!   `f&#246;rfaller` in front of the owner. The decoder is a single
-//!   left-to-right pass rather than a chain of `replace` calls, so — unlike
-//!   the Gmail version — an already-escaped `&amp;lt;` does **not**
-//!   double-decode into markup.
-//!
-//! It is still not a real HTML parser and does not try to be. It converts
-//! `<br>` and closing block-level tags to newlines, drops every other tag, and
-//! collapses runs of blank lines. CDATA, comments and malformed tags get no
-//! special handling. None of that matters for the job the output does: making
-//! text scorable by a triage prompt, not reproducing the document.
+//! dependency, on the reasoning that sixty stateless lines are cheaper to
+//! duplicate than to lift into a crate whose tests were already merged, and
+//! that a shared copy would stop the two connectors evolving it
+//! independently. It is now [`ea_core::html::strip_html`], and the reasoning
+//! was wrong in a way worth recording: the copies did not evolve
+//! independently, they diverged *asymmetrically*. Four fixes made here for
+//! Exchange-generated mail — dropping `<style>`/`<script>` contents,
+//! decoding numeric entities, a one-pass decoder that cannot double-decode
+//! `&amp;lt;`, and `&nbsp;` — never reached the Gmail copy, which went on
+//! feeding the same triage prompt through the same 2000-character cap with the
+//! defects this copy had already fixed. See that module's docs for the list,
+//! and for the contract the stripper holds to.
 
 use std::future::Future;
 use std::pin::Pin;
 
 use chrono::{DateTime, Utc};
+use ea_core::html::strip_html;
 use serde::{Deserialize, Serialize};
 
 /// One message, normalised, tagged with the account it came from.
@@ -183,220 +171,6 @@ pub fn extract_body(body: Option<&ItemBody>, preview: &str) -> String {
     extracted
 }
 
-const NEWLINE_CLOSERS: [&str; 12] = [
-    "p",
-    "div",
-    "tr",
-    "li",
-    "table",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "blockquote",
-];
-
-/// Elements whose *contents* are code, not prose, and must be dropped along
-/// with their tags.
-///
-/// The one deliberate improvement over the Gmail stripper this is otherwise a
-/// copy of, and it is not cosmetic here. Outlook and Exchange generate mail
-/// with `<style>` blocks running to hundreds of CSS rules; dropping only the
-/// tags leaves every one of those rules in the text. The body reaching triage
-/// is truncated at 2000 characters, so a stylesheet at the top would push the
-/// actual message out of the prompt entirely — the same "the mail that
-/// mattered is the mail that vanishes" failure the HTML fallback exists to
-/// prevent, arriving by a different route.
-const OPAQUE_ELEMENTS: [&str; 2] = ["style", "script"];
-
-/// Strip HTML down to plain-enough text. See the module docs for the exact
-/// (deliberately limited) contract.
-pub fn strip_html(html: &str) -> String {
-    let mut text = String::with_capacity(html.len());
-    let mut chars = html.chars();
-    let mut tag = String::new();
-
-    while let Some(c) = chars.next() {
-        if c != '<' {
-            text.push(c);
-            continue;
-        }
-        tag.clear();
-        let mut closed = false;
-        for t in chars.by_ref() {
-            if t == '>' {
-                closed = true;
-                break;
-            }
-            tag.push(t);
-        }
-        if !closed {
-            // An unterminated `<` at end of input: drop it silently rather
-            // than emit a stray angle bracket.
-            break;
-        }
-
-        let (name, is_closing, self_closing) = parse_tag(&tag);
-
-        if !is_closing && !self_closing && OPAQUE_ELEMENTS.contains(&name.as_str()) {
-            skip_to_close(&mut chars, &name);
-            continue;
-        }
-
-        if name == "br" || (is_closing && NEWLINE_CLOSERS.contains(&name.as_str())) {
-            text.push('\n');
-        }
-    }
-
-    collapse_blank_lines(&decode_entities(&text))
-}
-
-/// `(lower-case name, is a closing tag, is self-closing)`.
-fn parse_tag(raw_tag: &str) -> (String, bool, bool) {
-    let trimmed = raw_tag.trim();
-    let is_closing = trimmed.starts_with('/');
-    let self_closing = trimmed.ends_with('/');
-    let name_part = trimmed.trim_start_matches('/').trim_end_matches('/').trim();
-    let name = name_part
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    (name, is_closing, self_closing)
-}
-
-/// Consume everything up to and including `</name>`, discarding it.
-///
-/// An element that is never closed consumes the rest of the input, which is
-/// the right answer: whatever followed an unterminated `<style>` was inside
-/// the stylesheet as far as any browser is concerned.
-fn skip_to_close(chars: &mut std::str::Chars<'_>, name: &str) {
-    let mut tag = String::new();
-    while let Some(c) = chars.next() {
-        if c != '<' {
-            continue;
-        }
-        tag.clear();
-        for t in chars.by_ref() {
-            if t == '>' {
-                break;
-            }
-            tag.push(t);
-        }
-        let (closed_name, is_closing, _) = parse_tag(&tag);
-        if is_closing && closed_name == name {
-            return;
-        }
-    }
-}
-
-/// The named entities common enough in real mail to bother with.
-const NAMED_ENTITIES: [(&str, char); 6] = [
-    ("amp", '&'),
-    ("lt", '<'),
-    ("gt", '>'),
-    ("quot", '"'),
-    ("apos", '\''),
-    ("nbsp", ' '),
-];
-
-/// The longest thing that can sit between `&` and `;` before this stops
-/// believing it is an entity. `&#x1F600;` is eight; ten leaves room without
-/// letting a stray `&` scan half a paragraph.
-const MAX_ENTITY_BODY: usize = 10;
-
-/// Decode HTML entities in one left-to-right pass.
-///
-/// Numeric entities are decoded as well as named ones, which the Gmail
-/// stripper does not do. That is not a refinement for its own sake: Swedish
-/// mail is full of `å ä ö`, and Exchange emits them as `&#229; &#228; &#246;`
-/// often enough that leaving them raw would put literal `f&#246;rfaller` in
-/// front of a triage prompt and in front of the owner.
-///
-/// One pass rather than a chain of `replace` calls, because a chain decodes
-/// its own output: source text containing a literal `&lt;` (written
-/// `&amp;lt;`) would become `<` and read as markup. Here `&amp;` yields `&`
-/// and scanning resumes *after* it, so `lt;` stays text.
-fn decode_entities(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-
-    while let Some(start) = rest.find('&') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-
-        // Bytes, not chars, and restricted to the ASCII set an entity name or
-        // numeric reference can contain — so `body` is always a char boundary
-        // and slicing cannot panic on the `&ä` that a Swedish mail will
-        // eventually contain.
-        let body = after
-            .bytes()
-            .take(MAX_ENTITY_BODY)
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'#')
-            .count();
-        let ends_in_semicolon = after.as_bytes().get(body) == Some(&b';');
-
-        match decode_entity(&after[..body]).filter(|_| ends_in_semicolon) {
-            Some(decoded) => {
-                out.push(decoded);
-                rest = &after[body + 1..];
-            }
-            None => {
-                // Not an entity — a bare `&` in prose. Emit it and carry on
-                // from the next character, so the `&` cannot be re-examined.
-                out.push('&');
-                rest = after;
-            }
-        }
-    }
-
-    out.push_str(rest);
-    out
-}
-
-/// The text between `&` and `;`, decoded, or `None` if it is not something
-/// this understands.
-fn decode_entity(body: &str) -> Option<char> {
-    if let Some(digits) = body.strip_prefix('#') {
-        let code = match digits.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => digits.parse::<u32>().ok()?,
-        };
-        return char::from_u32(code);
-    }
-    NAMED_ENTITIES
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(body))
-        .map(|(_, c)| *c)
-}
-
-/// Trims each line and collapses two or more consecutive blank lines into one,
-/// so stripped markup (which tends to leave a blank line per removed tag)
-/// reads as paragraphs rather than a wall of blank lines.
-fn collapse_blank_lines(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut previous_blank = false;
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if previous_blank || out.is_empty() {
-                continue;
-            }
-            previous_blank = true;
-            out.push('\n');
-        } else {
-            previous_blank = false;
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(trimmed);
-        }
-    }
-    out.trim_end().to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -447,25 +221,6 @@ mod tests {
         );
     }
 
-    /// Exchange-generated mail carries large stylesheets. See
-    /// [`OPAQUE_ELEMENTS`].
-    #[test]
-    fn a_stylesheet_does_not_reach_the_body() {
-        let text = strip_html(
-            "<style type=\"text/css\">\n.x { color: #fff; }\n.y { margin: 0 }\n</style>\
-             <script>alert('no')</script>\
-             <p>Faktura 12345 f&#246;rfaller imorgon.</p>",
-        );
-        assert_eq!(text, "Faktura 12345 förfaller imorgon.");
-    }
-
-    /// An unclosed `<style>` swallows the rest, which is what a browser does
-    /// too — better than emitting a stylesheet as prose.
-    #[test]
-    fn an_unclosed_opaque_element_consumes_the_remainder() {
-        assert_eq!(strip_html("<p>kept</p><style>.a{}"), "kept");
-    }
-
     #[test]
     fn a_plain_text_body_is_left_alone() {
         let body = ItemBody {
@@ -513,43 +268,5 @@ mod tests {
     #[test]
     fn a_body_with_neither_content_nor_preview_is_empty_not_a_panic() {
         assert_eq!(extract_body(None, ""), "");
-    }
-
-    #[test]
-    fn an_unterminated_tag_does_not_run_away() {
-        assert_eq!(strip_html("before <div never closed"), "before");
-    }
-
-    /// Swedish mail arrives with its vowels as numeric references often
-    /// enough that not decoding them would put `f&#246;rfaller` in front of
-    /// the owner.
-    #[test]
-    fn numeric_and_named_entities_both_decode_and_a_bare_ampersand_survives() {
-        assert_eq!(
-            strip_html("<p>Tenta i h&#246;st, sal D&amp;E, klockan 9 &lt; 10</p>"),
-            "Tenta i höst, sal D&E, klockan 9 < 10"
-        );
-        assert_eq!(strip_html("<p>&#xE5;&#xE4;&#xF6;</p>"), "åäö");
-        // Not entities: left exactly as written.
-        assert_eq!(
-            strip_html("<p>R&D, 10 & 20, &notanentity</p>"),
-            "R&D, 10 & 20, &notanentity"
-        );
-        // The double-decode the one-pass scanner exists to avoid: a literal
-        // `&lt;` in the source stays text rather than becoming markup.
-        assert_eq!(strip_html("<p>&amp;lt;b&amp;gt;</p>"), "&lt;b&gt;");
-        // A non-ASCII byte immediately after `&` must not panic the slicer.
-        assert_eq!(strip_html("<p>&ätbar</p>"), "&ätbar");
-    }
-
-    /// Several blank lines become one — enough to read as a paragraph break,
-    /// not enough to be a wall of whitespace in a triage prompt.
-    #[test]
-    fn runs_of_blank_lines_collapse_to_a_single_one() {
-        assert_eq!(
-            strip_html("<p>one</p><p></p><p></p><p></p><p>two</p>"),
-            "one\n\ntwo"
-        );
-        assert_eq!(strip_html("<div>one</div><div>two</div>"), "one\ntwo");
     }
 }
