@@ -7,8 +7,18 @@ CREATE TABLE IF NOT EXISTS events (
   salience    INTEGER,
   triaged_at  TEXT,
   created_at  TEXT NOT NULL,
+  -- How many tier-1 batches this event has been submitted to and come back
+  -- from unscored. An event a model keeps omitting used to sit at the head of
+  -- `untriaged` forever; after TRIAGE_MAX_ATTEMPTS it is given up on instead.
+  triage_attempts INTEGER NOT NULL DEFAULT 0,
+  -- Set when triage gave up. `triaged_at` is stamped with it and `salience`
+  -- stays NULL, which is how an abandoned event is told apart from a scored
+  -- one: it is out of the scan window but it did not silently become a zero.
+  triage_error TEXT,
   UNIQUE (source, external_id)
 );
+-- The index on these columns is created by db::migrate, after the columns
+-- themselves are guaranteed to exist on a database that predates them.
 
 CREATE TABLE IF NOT EXISTS actions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -39,7 +39,7 @@ use crate::notify::log::NotificationLog;
 use crate::notify::policy::NotificationPolicy;
 use crate::notify::telegram::{Notifier, Transport};
 use crate::scheduler::Job;
-use crate::triage::{tier0, tier1, SessionBoundary, Tier0Rules};
+use crate::triage::{tier0, tier1, tier1_batch, SessionBoundary, Tier0Rules};
 
 /// The tool every connector must expose, and the only one the scheduler calls.
 pub const WATCH_TOOL: &str = "watch_poll";
@@ -62,6 +62,23 @@ pub const TRIAGE_SCAN_LIMIT: i64 = 200;
 /// filling the 200-row scan window, and after a few weeks of newsletters a
 /// real deadline never gets looked at.
 pub const DROPPED_SALIENCE: i64 = 0;
+
+/// How many tier-1 batches an event may come back from unscored before triage
+/// gives up on it.
+///
+/// Three. A model that omitted an event once may well score it in a different
+/// batch — the batch composition changes, and one bad completion is not a
+/// verdict — so a single miss must not be fatal. But an event the model
+/// *cannot* score (a payload that trips a content filter, a row so malformed
+/// the prompt renders it unusably) will never be scored on the fourth try
+/// either, and every retry costs a slot in a 40-event batch. Three retries
+/// spread over three passes is fifteen minutes of grace at the default triage
+/// interval, and the give-up is recorded rather than silent.
+pub const TRIAGE_MAX_ATTEMPTS: i64 = 3;
+
+/// Recorded in `events.triage_error` when triage gives up.
+pub const UNSCORABLE_REASON: &str =
+    "tier 1 returned no score for this event in 3 consecutive batches";
 
 // --------------------------------------------------------------------------
 // watch_poll
@@ -208,6 +225,12 @@ pub struct TriageSummary {
     pub dropped: usize,
     /// Events tier 1 scored.
     pub scored: usize,
+    /// Events tier 1 was asked about and said nothing about. They are retried;
+    /// see `abandoned`.
+    pub unscored: usize,
+    /// Events given up on this pass, having gone unscored
+    /// [`TRIAGE_MAX_ATTEMPTS`] times.
+    pub abandoned: usize,
     /// Notifications actually sent.
     pub sent: usize,
     /// Scores held for the digest.
@@ -268,8 +291,56 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
     // first TIER1_BATCH and leaves the rest for the next cycle. It also pins
     // the model to claude-haiku-4-5 rather than inheriting whatever the human
     // last used interactively.
+    // `submitted` is what the model was actually shown: `tier1` takes only the
+    // first TIER1_BATCH and leaves the rest for the next pass, and an event
+    // that was never in the prompt must not be charged an attempt for not
+    // coming back in the answer.
+    let submitted: Vec<i64> = tier1_batch(&kept).iter().map(|event| event.id).collect();
     let scores = tier1(&kept, sessions.as_ref()).await?;
     summary.scored = scores.len();
+
+    // Anything submitted that came back without a score. Before this, such an
+    // event was never stamped `triaged_at` at all: it sat at the head of
+    // `untriaged` forever, and two hundred of them wedged triage permanently
+    // while still spending one session every five minutes. Now each miss is
+    // counted, and after TRIAGE_MAX_ATTEMPTS the event is given up on with a
+    // recorded reason.
+    let scored_ids: std::collections::BTreeSet<i64> =
+        scores.iter().map(|score| score.event_id).collect();
+    for id in submitted
+        .iter()
+        .copied()
+        .filter(|id| !scored_ids.contains(id))
+    {
+        summary.unscored += 1;
+        let attempts = deps
+            .events
+            .record_triage_attempt(id)
+            .with_context(|| format!("recording a failed triage attempt for event {id}"))?;
+        if attempts >= TRIAGE_MAX_ATTEMPTS {
+            deps.events
+                .abandon(id, UNSCORABLE_REASON)
+                .with_context(|| format!("giving up on event {id}"))?;
+            summary.abandoned += 1;
+            // Warned, not debugged: this is the daemon deciding not to look at
+            // something the owner might have cared about, and `ea status`
+            // reports the running total for the same reason.
+            tracing::warn!(
+                event = id,
+                attempts,
+                "triage gave up on this event; it will not be scored or notified about"
+            );
+            deps.log.push_digest(format!(
+                "[triage] gave up on event {id}: {UNSCORABLE_REASON}"
+            ))?;
+        } else {
+            tracing::debug!(
+                event = id,
+                attempts,
+                "tier 1 returned no score for this event"
+            );
+        }
+    }
 
     // Read once, then extended locally as sends happen: the rate limit has to
     // apply *within* one batch as well as across restarts, and re-reading the
@@ -954,5 +1025,228 @@ mod tests {
         let runs = RunStore::new(db(&dir));
         assert!(session_budget_spent(&runs, 0, daytime()).unwrap());
         assert!(!session_budget_spent(&runs, 1, daytime()).unwrap());
+    }
+
+    // -- the triage wedge ---------------------------------------------------
+    //
+    // The failure these cover: an event the model simply leaves out of
+    // `scores` was never stamped `triaged_at`, so with `ORDER BY id` it stayed
+    // at the head of `untriaged` forever. Two hundred of them and triage was
+    // wedged permanently while still spending one Haiku session every five
+    // minutes, for nothing, indefinitely.
+
+    /// A tier 1 that answers — successfully, with well-formed structured
+    /// output — but leaves events out of it. That is the real shape of this
+    /// failure: not an error, which the breaker would see, but a reply that
+    /// silently omits rows.
+    struct PartialTier1 {
+        /// Event ids this model is willing to score. `None` means none at all.
+        scores_ids: Option<Vec<i64>>,
+        /// The batch of event ids submitted on each call, in order.
+        batches: Arc<Mutex<Vec<Vec<i64>>>>,
+        runs: RunStore,
+    }
+
+    impl PartialTier1 {
+        fn new(scores_ids: Option<Vec<i64>>, runs: RunStore) -> Arc<Self> {
+            Arc::new(Self {
+                scores_ids,
+                batches: Arc::new(Mutex::new(Vec::new())),
+                runs,
+            })
+        }
+
+        fn batches(&self) -> Vec<Vec<i64>> {
+            self.batches.lock().unwrap().clone()
+        }
+
+        /// The event ids `tier1_prompt` wrote into the prompt.
+        fn ids_in(prompt: &str) -> Vec<i64> {
+            prompt
+                .lines()
+                .filter_map(|line| line.strip_prefix("event_id: "))
+                .filter_map(|id| id.trim().parse().ok())
+                .collect()
+        }
+    }
+
+    impl SessionBoundary for PartialTier1 {
+        fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
+            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let submitted = Self::ids_in(&req.prompt);
+            self.batches.lock().unwrap().push(submitted.clone());
+            let answered: Vec<Salience> = match &self.scores_ids {
+                None => Vec::new(),
+                Some(allowed) => submitted
+                    .iter()
+                    .filter(|id| allowed.contains(id))
+                    .map(|id| score(*id, 50))
+                    .collect(),
+            };
+            let structured = serde_json::json!({ "scores": answered });
+            let runs = self.runs.clone();
+            Box::pin(async move {
+                runs.finish(run_id, "ok", None, &[], Some(0.002))?;
+                Ok(SessionOutcome {
+                    text: String::new(),
+                    structured: Some(structured),
+                    session_id: None,
+                    cost_usd: Some(0.002),
+                })
+            })
+        }
+    }
+
+    /// Build a triage fixture whose tier 1 is a [`PartialTier1`].
+    fn build_partial_triage(scores_ids: Option<Vec<i64>>) -> (TriageFixture, Arc<PartialTier1>) {
+        let mut f = build_triage(Vec::new(), Tier0Rules::default(), 1000, true, false);
+        let model = PartialTier1::new(scores_ids, f.deps.runs.clone());
+        f.deps.sessions = Some(Arc::clone(&model) as Arc<dyn SessionBoundary>);
+        (f, model)
+    }
+
+    fn record_n(events: &EventStore, n: usize) -> Vec<i64> {
+        (0..n)
+            .map(|i| record(events, &format!("e{i}"), "canvas", "assignment", "Essay"))
+            .collect()
+    }
+
+    /// The finding, stated directly: a model that returns no scores at all
+    /// must not prevent later events from ever being triaged.
+    #[tokio::test]
+    async fn a_model_that_scores_nothing_does_not_wedge_triage_forever() {
+        let (f, model) = build_partial_triage(None);
+        // More than one batch holds, so there is a "behind the head of the
+        // queue" to be starved in the first place.
+        let ids = record_n(&f.events, 45);
+
+        // Four passes is enough to spend three attempts on all 45 (40 slots a
+        // pass, 135 attempts needed).
+        let mut abandoned = 0;
+        for _ in 0..4 {
+            let summary = run_triage(&f.deps, daytime()).await.unwrap();
+            assert_eq!(summary.scored, 0);
+            abandoned += summary.abandoned;
+        }
+        assert_eq!(abandoned, 45, "every unscorable event must be given up on");
+
+        assert!(
+            f.events.untriaged(500).unwrap().is_empty(),
+            "triage must not still be scanning the same doomed rows"
+        );
+        assert_eq!(f.events.abandoned_count().unwrap(), 45);
+
+        // Given up on, but not vanished: the reason is on the row, and the
+        // salience is left NULL so it cannot be mistaken for "scored, boring".
+        let event = f.events.get(ids[0]).unwrap().unwrap();
+        assert_eq!(event.triage_attempts, TRIAGE_MAX_ATTEMPTS);
+        assert!(event.triaged_at.is_some());
+        assert_eq!(event.salience, None);
+        assert_eq!(event.triage_error.as_deref(), Some(UNSCORABLE_REASON));
+
+        // And it is in the digest, where a human reading the backlog sees it.
+        let digest = f.log.digest().unwrap();
+        assert!(
+            digest.iter().any(|line| line.contains("gave up on event")),
+            "{digest:?}"
+        );
+
+        // A fifth pass spends no session at all: there is nothing left to ask
+        // about. Before the fix this would have been session number five of an
+        // unbounded series, every five minutes, forever.
+        let before = model.batches().len();
+        let summary = run_triage(&f.deps, daytime()).await.unwrap();
+        assert_eq!(summary.scanned, 0);
+        assert_eq!(
+            model.batches().len(),
+            before,
+            "no session for an empty scan"
+        );
+    }
+
+    /// The other half: events behind the doomed ones must get scored *while*
+    /// the doomed ones are still being retried, not only once they are gone.
+    #[tokio::test]
+    async fn events_behind_an_unscorable_batch_are_still_triaged() {
+        let (f, model) = build_partial_triage(Some((41..=45).collect()));
+        let ids = record_n(&f.events, 45);
+        let later: Vec<i64> = ids[40..].to_vec();
+
+        // Pass one submits the first forty by id and gets nothing back.
+        let first = run_triage(&f.deps, daytime()).await.unwrap();
+        assert_eq!(first.scored, 0);
+        assert_eq!(first.unscored, 40);
+        assert_eq!(model.batches()[0].len(), 40);
+        assert!(
+            !model.batches()[0].contains(&later[0]),
+            "the later events cannot have been in the first batch"
+        );
+
+        // Pass two: the forty that failed sort behind the five that have not
+        // been tried, so the later events reach the model and are scored.
+        let second = run_triage(&f.deps, daytime()).await.unwrap();
+        assert_eq!(second.scored, 5);
+        for id in &later {
+            let event = f.events.get(*id).unwrap().unwrap();
+            assert_eq!(
+                event.salience,
+                Some(50),
+                "event {id} must have been scored by the second pass"
+            );
+        }
+    }
+
+    /// One miss is not a verdict: a model that skips an event in one batch and
+    /// scores it in the next must leave no trace of having given up.
+    #[tokio::test]
+    async fn one_missed_batch_does_not_give_up_on_an_event() {
+        let (f, _model) = build_partial_triage(None);
+        let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
+
+        let summary = run_triage(&f.deps, daytime()).await.unwrap();
+        assert_eq!(summary.unscored, 1);
+        assert_eq!(summary.abandoned, 0);
+
+        let event = f.events.get(id).unwrap().unwrap();
+        assert_eq!(event.triage_attempts, 1);
+        assert!(
+            event.triaged_at.is_none(),
+            "one miss must leave it in the queue"
+        );
+
+        // The next pass scores it, and the attempt count stops mattering.
+        f.events.set_salience(id, 80).unwrap();
+        let event = f.events.get(id).unwrap().unwrap();
+        assert_eq!(event.salience, Some(80));
+        assert_eq!(event.triage_error, None);
+        assert_eq!(f.events.abandoned_count().unwrap(), 0);
+    }
+
+    /// A session that fails outright is not the event's fault. If failures
+    /// were counted here, a week of `claude` being unreachable would abandon
+    /// every event in the database.
+    #[tokio::test]
+    async fn a_failing_session_does_not_burn_an_event_s_attempts() {
+        struct Broken;
+        impl SessionBoundary for Broken {
+            fn run_session(&self, _req: SessionRequest) -> BoxedSession<'_> {
+                Box::pin(async { Err(anyhow::anyhow!("claude is not reachable")) })
+            }
+        }
+
+        let mut f = build_triage(Vec::new(), Tier0Rules::default(), 1000, true, false);
+        f.deps.sessions = Some(Arc::new(Broken) as Arc<dyn SessionBoundary>);
+        let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
+
+        for _ in 0..5 {
+            run_triage(&f.deps, daytime())
+                .await
+                .expect_err("a broken session must surface to the breaker");
+        }
+
+        let event = f.events.get(id).unwrap().unwrap();
+        assert_eq!(event.triage_attempts, 0);
+        assert!(event.triaged_at.is_none());
+        assert_eq!(f.events.abandoned_count().unwrap(), 0);
     }
 }

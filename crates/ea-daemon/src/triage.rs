@@ -342,11 +342,20 @@ fn clip(text: &str, budget: usize) -> String {
 ///
 /// A missing or unparseable `structured_output` is an error, not a panic: the
 /// scheduler retries the next cycle.
+/// The slice of `events` one call to [`tier1`] will actually submit.
+///
+/// Exposed because the caller has to know which events were *asked about* in
+/// order to tell "the model omitted this one" from "the model was never shown
+/// it" — the distinction the triage attempt count is built on.
+pub fn tier1_batch(events: &[Event]) -> &[Event] {
+    &events[..events.len().min(TIER1_BATCH)]
+}
+
 pub async fn tier1<S>(events: &[Event], sessions: &S) -> Result<Vec<Salience>>
 where
     S: SessionBoundary + ?Sized,
 {
-    let batch = &events[..events.len().min(TIER1_BATCH)];
+    let batch = tier1_batch(events);
     if batch.is_empty() {
         return Ok(Vec::new());
     }
@@ -404,6 +413,8 @@ mod tests {
             salience: None,
             triaged_at: None,
             created_at: "2026-09-24T09:00:00Z".to_string(),
+            triage_attempts: 0,
+            triage_error: None,
         }
     }
 

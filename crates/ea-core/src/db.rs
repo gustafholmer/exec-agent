@@ -27,7 +27,48 @@ pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u32) -> anyhow::Resu
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)
         .context("applying the database schema")?;
+    migrate(&conn).context("migrating the database schema")?;
     Ok(conn)
+}
+
+/// Columns added to a table that already exists in somebody's database.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already there,
+/// so a column added to `schema.sql` reaches a fresh database and no other. A
+/// daemon that has been running for weeks is exactly the case that matters, so
+/// every added column is also listed here. `ALTER TABLE ... ADD COLUMN` is the
+/// one schema change SQLite does cheaply and in place, and `pragma_table_info`
+/// says whether it is needed, so this is idempotent without a version table.
+///
+/// The table and column names come from this constant and never from data, so
+/// the `format!` below is not a string-built query in the dangerous sense.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("events", "triage_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("events", "triage_error", "TEXT"),
+];
+
+/// Indexes over columns from [`ADDED_COLUMNS`]. They cannot live in
+/// `schema.sql`, which is applied *before* the migration and would fail on a
+/// database that does not have the columns yet.
+const LATE_INDEXES: &[&str] = &["CREATE INDEX IF NOT EXISTS events_untriaged
+       ON events (triaged_at, triage_attempts, id)"];
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    for (table, column, decl) in ADDED_COLUMNS {
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![table, column],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            tracing::info!(table, column, "adding a column to an existing database");
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
+    }
+    for statement in LATE_INDEXES {
+        conn.execute_batch(statement)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -64,6 +105,47 @@ mod tests {
         ] {
             assert!(names.contains(&table.to_string()), "missing {table}");
         }
+    }
+
+    /// The case the migration exists for: a database created before a column
+    /// was added to `schema.sql`. `CREATE TABLE IF NOT EXISTS` would leave it
+    /// without the column and every query naming it would fail.
+    #[test]
+    fn a_database_predating_a_column_gains_it_on_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            // The events table as it was before triage attempts existed.
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE events (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   source TEXT NOT NULL, external_id TEXT NOT NULL,
+                   kind TEXT NOT NULL, payload TEXT NOT NULL,
+                   salience INTEGER, triaged_at TEXT, created_at TEXT NOT NULL,
+                   UNIQUE (source, external_id))",
+            )
+            .unwrap();
+            old.execute_batch(
+                "INSERT INTO events (source, external_id, kind, payload, created_at)
+                 VALUES ('canvas','e1','assignment','{}','2026-09-01T00:00:00Z')",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).expect("opening an older database must migrate it");
+        let attempts: i64 = conn
+            .query_row("SELECT triage_attempts FROM events WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("the added column must exist and default for existing rows");
+        assert_eq!(attempts, 0);
+        let error: Option<String> = conn
+            .query_row("SELECT triage_error FROM events WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(error, None);
     }
 
     #[test]

@@ -126,7 +126,7 @@ script, it refuses rather than installing a daemon that cannot think.
 
 | command | what it does |
 |---|---|
-| `ea status` | up? paused? how many proposals are waiting? which jobs have tripped, and why |
+| `ea status` | up? paused? how many proposals are waiting? which jobs have tripped, and why; how many events triage gave up on |
 | `ea queue` | the proposals waiting for a decision |
 | `ea approve <id>` | approve one and run it |
 | `ea reject <id> [--reason "..."]` | reject one; nothing is called |

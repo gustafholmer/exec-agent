@@ -1363,6 +1363,7 @@ mod tests {
             executor: Arc::new(executor),
             actions: ActionStore::new(Arc::clone(&conn)),
             conversations: ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
+            events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
             runs: RunStore::new(Arc::clone(&conn)),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
             sessions: None,

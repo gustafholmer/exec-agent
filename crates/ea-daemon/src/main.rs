@@ -172,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         executor,
         actions: ActionStore::new(Arc::clone(&conn)),
         conversations: ConversationStore::new(Arc::clone(&conn)),
+        events: EventStore::new(Arc::clone(&conn)),
         runs: RunStore::new(Arc::clone(&conn)),
         scheduler: Arc::clone(&scheduler),
         sessions,

@@ -34,6 +34,7 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
 use ea_core::store::actions::{ActionStore, ProposeInput};
 use ea_core::store::conversations::ConversationStore;
+use ea_core::store::events::EventStore;
 use ea_core::store::runs::RunStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -167,6 +168,7 @@ pub struct Deps<C: ToolCaller> {
     pub executor: Arc<Executor<C>>,
     pub actions: ActionStore,
     pub conversations: ConversationStore,
+    pub events: EventStore,
     pub runs: RunStore,
     pub scheduler: Arc<Scheduler>,
     pub sessions: Option<Arc<dyn SessionBoundary>>,
@@ -180,6 +182,7 @@ pub struct Daemon<C: ToolCaller> {
     executor: Arc<Executor<C>>,
     actions: ActionStore,
     conversations: ConversationStore,
+    events: EventStore,
     runs: RunStore,
     scheduler: Arc<Scheduler>,
     sessions: Option<Arc<dyn SessionBoundary>>,
@@ -195,6 +198,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             executor: deps.executor,
             actions: deps.actions,
             conversations: deps.conversations,
+            events: deps.events,
             runs: deps.runs,
             scheduler: deps.scheduler,
             sessions: deps.sessions,
@@ -273,6 +277,11 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "status": "ok",
             "paused": self.scheduler.is_paused(),
             "pending_actions": pending.len(),
+            // Events triage could not score and gave up on. Nonzero means the
+            // daemon has decided not to look at something; that must be
+            // visible here rather than only in the log, or it is exactly the
+            // silent failure the rest of this endpoint exists to prevent.
+            "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
             "jobs": jobs,
             "connectors": self.connectors,
             "sessions_available": self.sessions.is_some(),
@@ -707,6 +716,7 @@ record_voucher = "approve"
                 executor,
                 actions: ActionStore::new(Arc::clone(&conn)),
                 conversations: ConversationStore::new(Arc::clone(&conn)),
+                events: EventStore::new(Arc::clone(&conn)),
                 runs: RunStore::new(conn),
                 scheduler: Arc::clone(&scheduler),
                 sessions: sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
@@ -940,6 +950,7 @@ record_voucher = "approve"
             executor: Arc::clone(&f2.daemon.executor),
             actions: f2.daemon.actions.clone(),
             conversations: f2.daemon.conversations.clone(),
+            events: f2.daemon.events.clone(),
             runs: f2.daemon.runs.clone(),
             scheduler: Arc::clone(&failing),
             sessions: None,
@@ -959,6 +970,36 @@ record_voucher = "approve"
             canvas["retry_in_secs"].as_u64().is_some(),
             "a tripped breaker must say when it will retry itself: {canvas}"
         );
+    }
+
+    /// An event triage could not score must be countable from `ea status`.
+    /// The alternative is that the daemon quietly stops looking at something
+    /// and the only record is a log line nobody reads.
+    #[tokio::test]
+    async fn status_counts_the_events_triage_gave_up_on() {
+        let f = Fixture::new();
+        let before = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(before["unscorable_events"], 0);
+
+        let id = f
+            .daemon
+            .events
+            .record(ea_core::store::events::RecordInput {
+                source: "canvas".into(),
+                external_id: "e1".into(),
+                kind: "assignment".into(),
+                payload: json!({ "title": "essay" }),
+            })
+            .unwrap()
+            .0
+            .id;
+        f.daemon
+            .events
+            .abandon(id, "tier 1 never scored it")
+            .unwrap();
+
+        let after = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(after["unscorable_events"], 1);
     }
 
     // -- clearing a tripped breaker without a restart -----------------------
@@ -981,6 +1022,7 @@ record_voucher = "approve"
             executor: Arc::clone(&f.daemon.executor),
             actions: f.daemon.actions.clone(),
             conversations: f.daemon.conversations.clone(),
+            events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
             sessions: None,

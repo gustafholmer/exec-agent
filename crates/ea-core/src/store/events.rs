@@ -15,6 +15,12 @@ pub struct Event {
     pub salience: Option<i64>,
     pub triaged_at: Option<String>,
     pub created_at: String,
+    /// How many tier-1 batches this event has been submitted to without a
+    /// score coming back for it.
+    pub triage_attempts: i64,
+    /// Why triage gave up on this event, if it did. Set together with
+    /// `triaged_at` while `salience` stays `None`.
+    pub triage_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +47,8 @@ fn hydrate(row: &Row<'_>) -> rusqlite::Result<Event> {
         salience: row.get("salience")?,
         triaged_at: row.get("triaged_at")?,
         created_at: row.get("created_at")?,
+        triage_attempts: row.get("triage_attempts")?,
+        triage_error: row.get("triage_error")?,
     })
 }
 
@@ -70,8 +78,13 @@ impl EventStore {
 
         if let Some((id, old_payload)) = existing {
             if old_payload != payload {
+                // A changed payload is a new question, so the attempt count
+                // and the give-up reason go with the old answer: an event the
+                // model could not score as an empty stub deserves a fresh
+                // three tries once it has actually got content.
                 conn.execute(
-                    "UPDATE events SET payload = ?1, salience = NULL, triaged_at = NULL
+                    "UPDATE events SET payload = ?1, salience = NULL, triaged_at = NULL,
+                       triage_attempts = 0, triage_error = NULL
                      WHERE id = ?2",
                     params![payload, id],
                 )?;
@@ -115,18 +128,92 @@ impl EventStore {
         Self::get_locked(&conn, id)
     }
 
+    /// Events still waiting to be triaged, fewest failed attempts first and
+    /// then oldest first.
+    ///
+    /// The ordering is the fix for a real wedge. With a plain `ORDER BY id`, an
+    /// event the tier-1 model omits from its answer is never stamped and so
+    /// stays at the head of this list forever; enough of them and every pass
+    /// scans the same doomed rows, spending a session every five minutes and
+    /// never reaching anything new. Ordering by `triage_attempts` first means a
+    /// brand-new event always overtakes one that has already failed, so the
+    /// head of the queue can never be permanently occupied — and
+    /// [`EventStore::abandon`] eventually takes the failures out of it
+    /// altogether.
     pub fn untriaged(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT * FROM events WHERE triaged_at IS NULL ORDER BY id LIMIT ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM events WHERE triaged_at IS NULL
+             ORDER BY triage_attempts, id LIMIT ?1",
+        )?;
         let rows = stmt.query_map(params![limit], hydrate)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Record that `id` was submitted to a tier-1 batch that came back without
+    /// a score for it. Returns the new attempt count.
+    ///
+    /// Counted on *submission that produced an answer*, not on every pass: a
+    /// session that fails outright (the model is down, the budget is spent) is
+    /// not this event's fault and must not burn its attempts.
+    pub fn record_triage_attempt(&self, id: i64) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE events SET triage_attempts = triage_attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        let count: i64 = conn.query_row(
+            "SELECT triage_attempts FROM events WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Give up on an event: stamp `triaged_at` so it leaves the scan window,
+    /// and record `reason` so it is visible rather than vanished.
+    ///
+    /// `salience` is deliberately left `NULL`. Writing a zero would make an
+    /// event nobody could score indistinguishable from an event that was
+    /// scored and found unimportant, which is the difference a human looking
+    /// into "why did I not hear about this" actually needs.
+    pub fn abandon(&self, id: i64, reason: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE events SET triaged_at = ?1, triage_error = ?2 WHERE id = ?3",
+            params![Utc::now().to_rfc3339(), reason, id],
+        )?;
+        Ok(())
+    }
+
+    /// Events triage gave up on. `ea status` reports the count, which is what
+    /// keeps this from being a silent failure.
+    pub fn abandoned(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM events WHERE triage_error IS NOT NULL ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn abandoned_count(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE triage_error IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Record a score. Clears any `triage_error`: an event that was given up
+    /// on and then scored anyway (because its payload changed and it came back
+    /// round) is no longer a failure.
     pub fn set_salience(&self, id: i64, salience: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE events SET salience = ?1, triaged_at = ?2 WHERE id = ?3",
+            "UPDATE events SET salience = ?1, triaged_at = ?2, triage_error = NULL
+             WHERE id = ?3",
             params![salience, Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
@@ -311,6 +398,90 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// The ordering the triage wedge turned on: an event that has already
+    /// failed a tier-1 batch must not keep a brand-new event out of the next
+    /// one. With `ORDER BY id` it did, forever.
+    #[test]
+    fn untriaged_puts_fresh_events_ahead_of_ones_that_have_failed() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        let old_id = store
+            .record(input("canvas", "old", serde_json::json!({ "n": 1 })))
+            .unwrap()
+            .0
+            .id;
+        let new_id = store
+            .record(input("canvas", "new", serde_json::json!({ "n": 2 })))
+            .unwrap()
+            .0
+            .id;
+        assert!(old_id < new_id);
+
+        // Before any attempt, id order holds.
+        let order: Vec<i64> = store.untriaged(10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(order, vec![old_id, new_id]);
+
+        assert_eq!(store.record_triage_attempt(old_id).unwrap(), 1);
+        let order: Vec<i64> = store.untriaged(10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(
+            order,
+            vec![new_id, old_id],
+            "an event that already failed must sort behind one that has not"
+        );
+    }
+
+    #[test]
+    fn abandon_takes_an_event_out_of_the_scan_window_and_says_why() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        let id = store
+            .record(input("canvas", "a", serde_json::json!({ "n": 1 })))
+            .unwrap()
+            .0
+            .id;
+
+        store.abandon(id, "the model never scored it").unwrap();
+
+        assert!(store.untriaged(10).unwrap().is_empty());
+        let event = store.get(id).unwrap().unwrap();
+        assert!(event.triaged_at.is_some());
+        assert_eq!(
+            event.salience, None,
+            "an abandoned event must not look like a scored zero"
+        );
+        assert_eq!(
+            event.triage_error.as_deref(),
+            Some("the model never scored it")
+        );
+        assert_eq!(store.abandoned_count().unwrap(), 1);
+        assert_eq!(store.abandoned(10).unwrap()[0].id, id);
+    }
+
+    /// A changed payload is a new question. An event abandoned as an empty
+    /// stub deserves a fresh set of attempts once it has content.
+    #[test]
+    fn a_changed_payload_clears_the_attempt_count_and_the_give_up() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        let id = store
+            .record(input("canvas", "a", serde_json::json!({ "n": 1 })))
+            .unwrap()
+            .0
+            .id;
+        store.record_triage_attempt(id).unwrap();
+        store.record_triage_attempt(id).unwrap();
+        store.abandon(id, "gave up").unwrap();
+
+        let (event, is_new) = store
+            .record(input("canvas", "a", serde_json::json!({ "n": 2 })))
+            .unwrap();
+        assert!(!is_new);
+        assert_eq!(event.triage_attempts, 0);
+        assert_eq!(event.triage_error, None);
+        assert!(event.triaged_at.is_none());
+        assert_eq!(store.abandoned_count().unwrap(), 0);
     }
 
     #[test]
