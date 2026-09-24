@@ -175,6 +175,11 @@ async fn main() -> anyhow::Result<()> {
         config.breaker_cooldown,
         config.breaker_max_cooldown,
     ));
+    // A tripped breaker is the daemon reporting on itself, and this is the
+    // only channel that reaches the owner without them asking. See
+    // `scheduler::HEALTH_REPUSH_INTERVAL` for the once-per-trip rule and for
+    // why these ignore quiet hours.
+    scheduler.set_health_pusher(pusher.clone());
     for manifest in &manifests {
         scheduler.add(jobs::watch_job(
             manifest.name.clone(),
@@ -223,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler: Arc::clone(&scheduler),
         sessions,
         pusher,
+        notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
         connectors: connector_names,
         daily_session_budget: config.daily_session_budget,
         chat_model: config.chat_model.clone(),

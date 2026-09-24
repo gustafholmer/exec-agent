@@ -27,6 +27,15 @@ pub const DIGEST_KEY: &str = "notify.digest";
 /// How much history is kept. See the module docs.
 pub const RETENTION: Duration = Duration::hours(24);
 
+/// `kv` key holding the running count of digest lines dropped to the cap.
+///
+/// Durable and never reset by the daemon: the count is the whole point. A
+/// digest nobody delivers yet (delivery is the morning briefing, Phase 4) that
+/// also discards its overflow silently loses the owner's data twice over —
+/// once by not sending, once by forgetting. This makes the second one
+/// countable, and `ea status` shows it.
+pub const DIGEST_DROPPED_KEY: &str = "notify.digest_dropped";
+
 /// Cap on the digest backlog, so a connector that suddenly produces ten
 /// thousand low-salience events cannot grow one `kv` row without bound. The
 /// oldest lines are dropped first: a digest is a summary, and the newest
@@ -75,12 +84,27 @@ impl NotificationLog {
     }
 
     /// Hold a line for the next digest.
+    ///
+    /// Past [`MAX_DIGEST_LINES`] the oldest lines fall off — but never
+    /// silently. Each drop is counted durably ([`DIGEST_DROPPED_KEY`]) and
+    /// logged, because until the morning briefing exists to deliver this
+    /// backlog, the cap is the one place where something the owner might have
+    /// wanted to read is destroyed. A number they can see in `ea status` is
+    /// the difference between "the daemon is quiet" and "the daemon has been
+    /// throwing away your mail for a week".
     pub fn push_digest(&self, line: impl Into<String>) -> anyhow::Result<()> {
         let mut lines: Vec<String> = self.kv.get_json(DIGEST_KEY)?;
         lines.push(line.into());
         if lines.len() > MAX_DIGEST_LINES {
             let overflow = lines.len() - MAX_DIGEST_LINES;
-            lines.drain(..overflow);
+            let dropped: Vec<String> = lines.drain(..overflow).collect();
+            let total = self.record_drops(overflow)?;
+            tracing::warn!(
+                dropped = overflow,
+                dropped_total = total,
+                oldest = %dropped.first().map(String::as_str).unwrap_or(""),
+                "the digest backlog is full; discarding its oldest lines"
+            );
         }
         self.kv.set_json(DIGEST_KEY, &lines)
     }
@@ -88,6 +112,27 @@ impl NotificationLog {
     /// Everything held for the digest, without clearing it.
     pub fn digest(&self) -> anyhow::Result<Vec<String>> {
         self.kv.get_json(DIGEST_KEY)
+    }
+
+    /// How many lines are waiting for a digest nobody sends yet. Reported by
+    /// `ea status` so a backlog that is quietly growing is something the owner
+    /// can see rather than something they discover in Phase 4.
+    pub fn digest_len(&self) -> anyhow::Result<usize> {
+        Ok(self.digest()?.len())
+    }
+
+    /// How many digest lines have been discarded to the cap over this
+    /// database's whole life.
+    pub fn digest_dropped(&self) -> anyhow::Result<u64> {
+        self.kv.get_json(DIGEST_DROPPED_KEY)
+    }
+
+    fn record_drops(&self, count: usize) -> anyhow::Result<u64> {
+        let total = self
+            .digest_dropped()?
+            .saturating_add(count.try_into().unwrap_or(u64::MAX));
+        self.kv.set_json(DIGEST_DROPPED_KEY, &total)?;
+        Ok(total)
     }
 
     /// Everything held for the digest, clearing it.
@@ -216,5 +261,50 @@ mod tests {
             lines[MAX_DIGEST_LINES - 1],
             format!("line {}", MAX_DIGEST_LINES + 4)
         );
+    }
+
+    /// Nothing may leave this system without a trace. Until the morning
+    /// briefing drains the digest, the cap is the only place a held-back
+    /// score is destroyed, and the count is what makes that visible.
+    #[test]
+    fn every_dropped_digest_line_is_counted() {
+        let dir = TempDir::new().unwrap();
+        let log = store(&dir);
+        assert_eq!(log.digest_dropped().unwrap(), 0);
+
+        for i in 0..MAX_DIGEST_LINES {
+            log.push_digest(format!("line {i}")).unwrap();
+        }
+        assert_eq!(
+            log.digest_dropped().unwrap(),
+            0,
+            "nothing is dropped up to the cap"
+        );
+
+        for i in 0..7 {
+            log.push_digest(format!("overflow {i}")).unwrap();
+        }
+        assert_eq!(log.digest_dropped().unwrap(), 7);
+        assert_eq!(log.digest_len().unwrap(), MAX_DIGEST_LINES);
+    }
+
+    /// The count is the owner's evidence weeks later, so it has to outlive the
+    /// process — and draining the digest must not erase it.
+    #[test]
+    fn the_dropped_count_survives_a_restart_and_a_drain() {
+        let dir = TempDir::new().unwrap();
+        {
+            let log = store(&dir);
+            for i in 0..(MAX_DIGEST_LINES + 3) {
+                log.push_digest(format!("line {i}")).unwrap();
+            }
+            assert_eq!(log.digest_dropped().unwrap(), 3);
+            log.take_digest().unwrap();
+            assert_eq!(log.digest_dropped().unwrap(), 3);
+        }
+
+        let reopened = store(&dir);
+        assert_eq!(reopened.digest_dropped().unwrap(), 3);
+        assert_eq!(reopened.digest_len().unwrap(), 0);
     }
 }

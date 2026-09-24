@@ -1368,6 +1368,9 @@ mod tests {
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
             sessions: None,
             pusher: None,
+            notify_log: crate::notify::log::NotificationLog::new(ea_core::store::kv::KvStore::new(
+                Arc::clone(&conn),
+            )),
             connectors: Vec::new(),
             daily_session_budget: 60,
             chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),

@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use crate::executor::{Executor, ToolCaller};
 use crate::ipc;
 use crate::jobs::Pusher;
+use crate::notify::log::NotificationLog;
 use crate::scheduler::Scheduler;
 use crate::session::SessionRequest;
 use crate::triage::SessionBoundary;
@@ -173,6 +174,9 @@ pub struct Deps<C: ToolCaller> {
     pub scheduler: Arc<Scheduler>,
     pub sessions: Option<Arc<dyn SessionBoundary>>,
     pub pusher: Option<Arc<dyn Pusher>>,
+    /// Read-only here: `status` reports how much is waiting for a digest
+    /// nobody delivers yet, and how much the cap has thrown away.
+    pub notify_log: NotificationLog,
     pub connectors: Vec<String>,
     pub daily_session_budget: u32,
     /// The model `ea chat` runs on. Never empty: an unset model is inherited
@@ -191,6 +195,7 @@ pub struct Daemon<C: ToolCaller> {
     scheduler: Arc<Scheduler>,
     sessions: Option<Arc<dyn SessionBoundary>>,
     pusher: Option<Arc<dyn Pusher>>,
+    notify_log: NotificationLog,
     connectors: Vec<String>,
     daily_session_budget: u32,
     chat_model: String,
@@ -208,6 +213,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             scheduler: deps.scheduler,
             sessions: deps.sessions,
             pusher: deps.pusher,
+            notify_log: deps.notify_log,
             connectors: deps.connectors,
             daily_session_budget: deps.daily_session_budget,
             chat_model: deps.chat_model,
@@ -288,6 +294,13 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // visible here rather than only in the log, or it is exactly the
             // silent failure the rest of this endpoint exists to prevent.
             "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
+            // Scores held back by the threshold, by quiet hours or by the
+            // hourly rate limit. Nothing delivers them yet — the morning
+            // briefing is Phase 4 — so without these two numbers a backlog
+            // accumulating, and then silently falling off the 200-line cap,
+            // would be invisible to the one person it belongs to.
+            "digest_pending": self.notify_log.digest_len().unwrap_or_default(),
+            "digest_dropped": self.notify_log.digest_dropped().unwrap_or_default(),
             "jobs": jobs,
             "connectors": self.connectors,
             "sessions_available": self.sessions.is_some(),
@@ -564,6 +577,7 @@ mod tests {
     use std::sync::Mutex;
 
     use ea_core::policy::Policy;
+    use ea_core::store::kv::KvStore;
     use ea_core::store::runs::RunStore;
     use tempfile::TempDir;
 
@@ -683,6 +697,8 @@ record_voucher = "approve"
 
     struct Fixture {
         _dir: TempDir,
+        /// Kept so a test can build a second `Daemon` over the same database.
+        conn: Arc<Mutex<rusqlite::Connection>>,
         daemon: Arc<Daemon<SpyCaller>>,
         log: CallLog,
         scheduler: Arc<Scheduler>,
@@ -731,10 +747,11 @@ record_voucher = "approve"
                 actions: ActionStore::new(Arc::clone(&conn)),
                 conversations: ConversationStore::new(Arc::clone(&conn)),
                 events: EventStore::new(Arc::clone(&conn)),
-                runs: RunStore::new(conn),
+                runs: RunStore::new(Arc::clone(&conn)),
                 scheduler: Arc::clone(&scheduler),
                 sessions: sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
+                notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
                 connectors: vec!["canvas".to_string()],
                 daily_session_budget: budget,
                 chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
@@ -742,6 +759,7 @@ record_voucher = "approve"
 
             Self {
                 _dir: dir,
+                conn,
                 daemon,
                 log,
                 scheduler,
@@ -970,6 +988,7 @@ record_voucher = "approve"
             scheduler: Arc::clone(&failing),
             sessions: None,
             pusher: None,
+            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f2.conn))),
             connectors: vec!["canvas".to_string()],
             daily_session_budget: 60,
             chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
@@ -985,6 +1004,37 @@ record_voucher = "approve"
         assert!(
             canvas["retry_in_secs"].as_u64().is_some(),
             "a tripped breaker must say when it will retry itself: {canvas}"
+        );
+    }
+
+    /// The digest is written by triage and, until the morning briefing exists
+    /// to send it, read by nobody. A backlog quietly growing — and then just
+    /// as quietly falling off the 200-line cap — is data the owner cared about
+    /// disappearing with no trace at all, so `status` carries both numbers.
+    #[tokio::test]
+    async fn status_surfaces_the_digest_backlog_and_what_the_cap_discarded() {
+        let f = Fixture::new();
+        let before = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(before["digest_pending"], 0);
+        assert_eq!(before["digest_dropped"], 0);
+
+        let log = NotificationLog::new(KvStore::new(Arc::clone(&f.conn)));
+        log.push_digest("[canvas] a quiet-hours score").unwrap();
+        let held = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(held["digest_pending"], 1);
+        assert_eq!(held["digest_dropped"], 0);
+
+        for i in 0..(crate::notify::log::MAX_DIGEST_LINES + 2) {
+            log.push_digest(format!("[canvas] score {i}")).unwrap();
+        }
+        let overflowed = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(
+            overflowed["digest_pending"],
+            crate::notify::log::MAX_DIGEST_LINES
+        );
+        assert_eq!(
+            overflowed["digest_dropped"], 3,
+            "every discarded line must be counted where the owner can see it"
         );
     }
 
@@ -1043,6 +1093,7 @@ record_voucher = "approve"
             scheduler: Arc::clone(&scheduler),
             sessions: None,
             pusher: None,
+            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             connectors: vec!["canvas".to_string()],
             daily_session_budget: 60,
             chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
@@ -1493,6 +1544,7 @@ record_voucher = "approve"
             scheduler: Arc::clone(&f.scheduler),
             sessions: f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
             pusher: None,
+            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             connectors: Vec::new(),
             daily_session_budget: 60,
             chat_model: "claude-opus-4-5".to_string(),
