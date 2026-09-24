@@ -604,6 +604,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ea-notion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ea-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "ea-propose"
 version = "0.1.0"
 dependencies = [

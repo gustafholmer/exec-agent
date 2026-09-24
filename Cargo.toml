@@ -10,6 +10,7 @@ members = [
   "crates/ea-google",
   "crates/ea-fortnox",
   "crates/ea-fortnox-mcp",
+  "crates/ea-notion",
 ]
 
 [workspace.package]
