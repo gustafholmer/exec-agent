@@ -270,33 +270,64 @@ fn truncate(text: &str, limit: usize) -> String {
 // Gathering
 // --------------------------------------------------------------------------
 
+/// The payload keys a calendar row's start time can live under: `start` on an
+/// event, `overlap_start` on a conflict.
+const START_KEYS: [&str; 2] = ["start", "overlap_start"];
+
 /// Today's calendar, in the owner's zone.
 ///
 /// Filtered on the event's own `start`, not on when it was recorded: a meeting
 /// entered a fortnight ago is on today's calendar and a meeting recorded this
 /// morning for next week is not.
+///
+/// # Why this is a window query and not a limit with a filter after it
+///
+/// The obvious shape — read the newest `MATERIAL_LIMIT` calendar rows and keep
+/// the ones starting today — is wrong, and wrong *silently*, which is worse
+/// than wrong loudly. `by_kind` orders by id, i.e. by when a row was first
+/// recorded; a poll records events up to `LOOKAHEAD` (a week) ahead and the id
+/// is fixed at that first insert, while rows live for the whole retention
+/// window. So today's meeting, recorded last Tuesday, sits under every event
+/// entered since — and on a calendar with more than sixty of those it is cut
+/// before the date filter ever sees it. No error, no empty-looking section: a
+/// calendar that reads plausibly and is missing the one meeting that mattered.
+///
+/// [`EventStore::in_payload_range`] selects on the start value itself, so a
+/// row's place here cannot depend on any other row. The window handed to SQL
+/// is widened by a day at each end and the exact day test is then done in Rust
+/// by [`starts_on`]: string comparison over a start value is only chronological
+/// if every writer uses the same RFC 3339 shape, and a day of slack at each end
+/// absorbs any offset (the largest in use anywhere is 14 hours) without
+/// trusting that. `MATERIAL_LIMIT` still caps the result, but now it caps
+/// *today's* events, after the date is known.
 pub fn todays_calendar(
     events: &EventStore,
     time_zone: Tz,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Event>> {
     let today = now.with_timezone(&time_zone).date_naive();
-    let mut found: Vec<Event> = Vec::new();
-    for kind in [kinds::CALENDAR_EVENT, kinds::CALENDAR_CONFLICT] {
-        for event in events.by_kind(kind, MATERIAL_LIMIT)? {
-            if starts_on(&event, today, time_zone) {
-                found.push(event);
-            }
-        }
-    }
+    let from = (today - chrono::Duration::days(1)).to_string();
+    let to = (today + chrono::Duration::days(2)).to_string();
+
+    let mut found: Vec<Event> = events
+        .in_payload_range(
+            &[kinds::CALENDAR_EVENT, kinds::CALENDAR_CONFLICT],
+            &START_KEYS,
+            &from,
+            &to,
+        )?
+        .into_iter()
+        .filter(|event| starts_on(event, today, time_zone))
+        .collect();
     found.sort_by(|a, b| start_of(a).cmp(&start_of(b)));
+    found.truncate(MATERIAL_LIMIT as usize);
     Ok(found)
 }
 
 /// `payload.start` (a calendar event) or `payload.overlap_start` (a conflict),
 /// as written.
 fn start_of(event: &Event) -> Option<&str> {
-    ["start", "overlap_start"]
+    START_KEYS
         .iter()
         .find_map(|key| event.payload.get(*key).and_then(Value::as_str))
 }
@@ -426,6 +457,15 @@ pub async fn vat_material<C: ToolCaller>(
     // The deadline list is the Fortnox connector's own `tax_deadline` rows,
     // which `watch_poll` records from `upcoming_deadlines` — the daemon's only
     // source for them, and already in the database.
+    //
+    // This one stays a plain `by_kind`, unlike `todays_calendar`, and it is not
+    // the same shape: nothing is filtered *after* the limit, so no row can be
+    // cut by another row's id and then silently fail a test it never reached.
+    // The list is small by construction — `deadlines::HORIZON_DAYS` is 45, over
+    // which at most a handful of declarations fall due, and the external id is
+    // one row per kind per period — so sixty is a bound that the world does not
+    // get near rather than one it quietly exceeds. If a deadline window ever
+    // does, this wants the same treatment `todays_calendar` got.
     material.push(
         "Upcoming declaration deadlines",
         lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT)?),
@@ -841,6 +881,73 @@ record_voucher = "approve"
             vec!["late", "today"],
             "the 22:30Z event is on the owner's 25th; the 30th is not"
         );
+    }
+
+    /// **The regression this test exists for.** `todays_calendar` used to read
+    /// the newest `MATERIAL_LIMIT` calendar rows by id and only then filter on
+    /// the start date. Calendar rows are recorded up to `LOOKAHEAD` (7 days)
+    /// ahead and keep the id of their first insert, and they live 90 days — so
+    /// on any calendar busier than 60 events a week, today's meeting sits
+    /// *below* the id cut and vanished from the briefing with no error.
+    ///
+    /// The row that matters is recorded first and then buried under more than
+    /// `MATERIAL_LIMIT` later rows, so a limit-then-filter implementation
+    /// cannot pass.
+    #[tokio::test]
+    async fn todays_meeting_survives_a_hundred_later_calendar_rows() {
+        let f = fixture();
+        // Recorded a week ago, as a poll's LOOKAHEAD window does: lowest id.
+        record(
+            &f.events,
+            "google",
+            "the-one-that-matters",
+            kinds::CALENDAR_EVENT,
+            json!({ "title": "board meeting", "start": "2026-09-25T08:00:00Z" }),
+        );
+        // A hundred rows recorded since, none of them today's.
+        for i in 0..100 {
+            record(
+                &f.events,
+                "google",
+                &format!("later-{i}"),
+                kinds::CALENDAR_EVENT,
+                json!({ "title": format!("standup {i}"), "start": "2026-10-02T08:00:00Z" }),
+            );
+        }
+
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["the-one-that-matters"],
+            "an event's place in the briefing must not depend on other rows' ids"
+        );
+    }
+
+    /// The same hazard on the conflict side, and the same window: a clash
+    /// recorded days ago is still today's clash.
+    #[tokio::test]
+    async fn a_buried_conflict_is_still_on_todays_briefing() {
+        let f = fixture();
+        record(
+            &f.events,
+            "google",
+            "the-clash",
+            kinds::CALENDAR_CONFLICT,
+            json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
+        );
+        for i in 0..100 {
+            record(
+                &f.events,
+                "google",
+                &format!("later-{i}"),
+                kinds::CALENDAR_CONFLICT,
+                json!({ "overlap_start": "2026-10-02T09:00:00Z" }),
+            );
+        }
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["the-clash"]);
     }
 
     #[tokio::test]

@@ -192,18 +192,100 @@ impl EventStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// The most recent events of one `kind`, newest first.
+    /// The most recent events of one `kind`, newest first — newest as
+    /// *recorded*, because the order is by id.
     ///
-    /// Filtering the *payload* — a calendar event that starts today, a
-    /// deadline that falls this month — is the caller's job and is done in
-    /// Rust: `payload` is opaque JSON here, and a store that grew a
-    /// `json_extract` per question would end up encoding one connector's
-    /// payload shape into the other's schema.
+    /// **Do not filter the result on a date.** The limit is applied before any
+    /// filter a caller writes in Rust, so a row that matches the filter can be
+    /// cut by rows that do not, and the caller gets a short answer rather than
+    /// an error. That is not hypothetical: it is how the morning briefing lost
+    /// today's meetings. Selecting on a payload timestamp is
+    /// [`EventStore::in_payload_range`]'s job. This method is for "the last n
+    /// of these, whatever they are".
     pub fn by_kind(&self, kind: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT * FROM events WHERE kind = ?1 ORDER BY id DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![kind, limit], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Events of any of `kinds` whose payload carries a timestamp — under the
+    /// first of `keys` that is present — sorting into `[from, to)`.
+    ///
+    /// **Why this exists, and why it is not [`by_kind`] with a filter after
+    /// it.** `by_kind` is `ORDER BY id DESC LIMIT n`, which is newest *as
+    /// recorded*. A calendar row is first recorded up to a week before the
+    /// meeting happens and keeps that id when later polls re-upsert it, and
+    /// rows live for the whole retention window. So "take the newest 60 rows,
+    /// then keep the ones starting today" silently loses today's meeting on
+    /// any calendar that records more than 60 events in a week — the row is
+    /// there, it is correct, and it is below the cut because of other rows'
+    /// ids. Selecting on the start value instead means no row can be pushed
+    /// out of the answer by a row that does not belong in it.
+    ///
+    /// **No `LIMIT`.** The window *is* the bound: a caller asks for a day or a
+    /// month, not for "the most recent n". A limit here would reintroduce
+    /// exactly the failure above, one window smaller.
+    ///
+    /// **Comparison is lexicographic over the stored text**, which is what
+    /// makes this safe without teaching the store a date format: RFC 3339
+    /// timestamps in a fixed shape sort chronologically as strings, and a
+    /// caller that cannot promise one shape (an offset instead of `Z`, say)
+    /// widens the window by a day at each end and does the exact test in Rust
+    /// — which is what [`ea-daemon`'s `todays_calendar`] does. Rows whose
+    /// payload has none of `keys`, or holds a non-string there, are simply not
+    /// in the answer.
+    ///
+    /// The payload keys are the *caller's*, passed in rather than hardcoded,
+    /// so one connector's payload shape still does not end up written into the
+    /// schema.
+    pub fn in_payload_range(
+        &self,
+        kinds: &[&str],
+        keys: &[&str],
+        from: &str,
+        to: &str,
+    ) -> anyhow::Result<Vec<Event>> {
+        if kinds.is_empty() || keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Both lists are `&str` slots bound as parameters — including the JSON
+        // paths, which `json_extract` takes as a bound value — so nothing a
+        // caller passes is interpolated into the SQL text.
+        let extracts = keys
+            .iter()
+            .map(|_| "json_extract(payload, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let kind_slots = vec!["?"; kinds.len()].join(", ");
+        // The trailing `NULL` is not decoration: SQLite's `COALESCE` requires
+        // at least two arguments, and a caller passing a single key is the
+        // ordinary case. It changes no result — coalescing to NULL is what a
+        // row with none of the keys does anyway.
+        let sql = format!(
+            "SELECT * FROM (
+               SELECT *, COALESCE({extracts}, NULL) AS at_value
+               FROM events WHERE kind IN ({kind_slots})
+             )
+             WHERE at_value >= ? AND at_value < ?
+             ORDER BY at_value, id"
+        );
+
+        let paths: Vec<String> = keys.iter().map(|key| format!("$.{key}")).collect();
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for path in &paths {
+            args.push(path);
+        }
+        for kind in kinds {
+            args.push(kind);
+        }
+        args.push(&from);
+        args.push(&to);
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(args.as_slice(), hydrate)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -341,6 +423,131 @@ mod tests {
         assert_eq!(store.by_kind(kinds::CALENDAR_EVENT, 1).unwrap().len(), 1);
         assert!(store
             .by_kind("nothing_records_this", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn at(source: &str, external_id: &str, kind: &str, payload: serde_json::Value) -> RecordInput {
+        RecordInput {
+            source: source.into(),
+            external_id: external_id.into(),
+            kind: kind.into(),
+            payload,
+        }
+    }
+
+    /// The regression `in_payload_range` exists for. With `by_kind`'s
+    /// `ORDER BY id DESC LIMIT n`, a row recorded before `n` others is gone
+    /// before any date filter sees it — and a calendar row is recorded up to a
+    /// week before it happens, so that is the ordinary case, not a corner one.
+    #[test]
+    fn a_row_in_the_window_is_found_however_many_rows_were_recorded_after_it() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        store
+            .record(at(
+                "google",
+                "wanted",
+                kinds::CALENDAR_EVENT,
+                serde_json::json!({ "start": "2026-09-25T08:00:00Z" }),
+            ))
+            .unwrap();
+        for i in 0..200 {
+            store
+                .record(at(
+                    "google",
+                    &format!("later-{i}"),
+                    kinds::CALENDAR_EVENT,
+                    serde_json::json!({ "start": "2026-10-02T08:00:00Z" }),
+                ))
+                .unwrap();
+        }
+
+        let found = store
+            .in_payload_range(
+                &[kinds::CALENDAR_EVENT],
+                &["start"],
+                "2026-09-25",
+                "2026-09-26",
+            )
+            .unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["wanted"]);
+
+        // The control: `by_kind` with the same generous limit does lose it.
+        assert!(
+            !store
+                .by_kind(kinds::CALENDAR_EVENT, 60)
+                .unwrap()
+                .iter()
+                .any(|e| e.external_id == "wanted"),
+            "the id-ordered read is the thing this method replaces"
+        );
+    }
+
+    /// The window is half-open, several kinds can be asked for at once, the
+    /// keys are tried in order, and a row with none of them is simply absent
+    /// rather than an error.
+    #[test]
+    fn in_payload_range_is_half_open_over_several_kinds_and_keys() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        for (id, kind, payload) in [
+            (
+                "before",
+                kinds::CALENDAR_EVENT,
+                serde_json::json!({ "start": "2026-09-24T23:59:59Z" }),
+            ),
+            (
+                "first",
+                kinds::CALENDAR_EVENT,
+                serde_json::json!({ "start": "2026-09-25T00:00:00Z" }),
+            ),
+            (
+                "clash",
+                kinds::CALENDAR_CONFLICT,
+                serde_json::json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
+            ),
+            (
+                "at-the-upper-bound",
+                kinds::CALENDAR_EVENT,
+                serde_json::json!({ "start": "2026-09-26T00:00:00Z" }),
+            ),
+            (
+                "no-start-at-all",
+                kinds::CALENDAR_EVENT,
+                serde_json::json!({ "title": "undated" }),
+            ),
+            (
+                "other-kind",
+                kinds::MAIL,
+                serde_json::json!({ "start": "2026-09-25T10:00:00Z" }),
+            ),
+        ] {
+            store.record(at("google", id, kind, payload)).unwrap();
+        }
+
+        let found = store
+            .in_payload_range(
+                &[kinds::CALENDAR_EVENT, kinds::CALENDAR_CONFLICT],
+                &["start", "overlap_start"],
+                "2026-09-25",
+                "2026-09-26",
+            )
+            .unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["first", "clash"],
+            "inclusive lower bound, exclusive upper, ordered by the start value"
+        );
+
+        assert!(store
+            .in_payload_range(&[], &["start"], "2026-09-25", "2026-09-26")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .in_payload_range(&[kinds::CALENDAR_EVENT], &[], "2026-09-25", "2026-09-26")
             .unwrap()
             .is_empty());
     }
