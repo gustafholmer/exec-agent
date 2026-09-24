@@ -68,13 +68,47 @@
 //! now + HORIZON]`.
 //!
 //! The forward half is the horizon proper: two weeks is far enough ahead to
-//! act on and near enough to mean something. The backward half exists for the
-//! reason Canvas's `STALE_DEADLINE_WINDOW` does — a Notion
-//! workspace that has been in use for two years is full of rows dated 2024,
-//! every one of which is genuinely new to dedup on the connector's first
-//! poll. Without a floor, that first poll dumps two years of finished tasks
-//! into triage and spends the system's whole premise at once. With it, a
-//! deadline missed over a long weekend still surfaces.
+//! act on and near enough to mean something.
+//!
+//! The backward half is **not** a staleness rule, even though an earlier
+//! revision of this module argued it as one by direct analogy with Canvas's
+//! `STALE_DEADLINE_WINDOW`. That analogy does not hold: Canvas's floor works
+//! because finished coursework *closes* — a 2024 assignment is dead. A Notion
+//! task does not close by the passage of time, and this poll reads **no
+//! completion signal at all** — [`due_date`] looks only at property *type*
+//! `"date"`, and [`poll_workspace`] filters only trashed rows (`in_trash` /
+//! `archived`). A narrow floor is therefore a proxy for "done" that does not
+//! track done, and it fails in the one direction that matters most: a
+//! genuinely open task that is, say, three weeks overdue is dropped
+//! *permanently*, because it only moves further into the past on every later
+//! poll and no floor ever lets it back in. An assistant that silently drops
+//! what its owner is most behind on is the opposite of the product this
+//! connector exists to build.
+//!
+//! [`OVERDUE_GRACE`] is therefore wide — 365 days — and is scoped down to what
+//! it can honestly claim to be: a **flood guard**, not a staleness or
+//! completion rule. A workspace in use for years is full of rows dated long
+//! ago, every one of which is genuinely new to dedup on the connector's first
+//! poll, and with no floor at all that first poll would dump the workspace's
+//! entire history into triage in one run. A year bounds that flood while
+//! discarding nothing a human would still call "overdue".
+//!
+//! # Known limitation: no completion signal
+//!
+//! The right long-term fix is not tuning the floor — it is reading whether a
+//! row is actually done, and reporting it if not regardless of age. That
+//! means discovering a `status`- or `checkbox`-typed property **by type**,
+//! exactly as [`due_date`] discovers a date property by type rather than by
+//! guessing a column name, and once that exists, demoting `OVERDUE_GRACE`
+//! from a permanent filter to a first-poll guard (skip stale-and-undated-as-
+//! done only the first time a workspace is seen).
+//!
+//! This is deliberately not attempted now: guessing which property spells
+//! "done" — a `status`? a `checkbox`? a `select` called `Done`? — and
+//! guessing wrong would silently hide real, open tasks, which is worse than
+//! the wide window it would replace. A wrong guess about a date's *type* only
+//! degrades which column is picked; a wrong guess about a *done* property
+//! would suppress the very rows this connector exists to surface.
 //!
 //! # Why the payload carries no timestamp of its own
 //!
@@ -101,7 +135,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::client::{page_title, NotionClient, UNTITLED};
+use crate::client::{page_title, NotionClient, MAX_DATA_SOURCES, UNTITLED};
 
 /// The `kind` every row carries. Triage mutes and keyword rules match on it,
 /// so it is one stable name rather than something derived per database.
@@ -115,9 +149,15 @@ pub const OBJECT_DATA_SOURCE: &str = "data_source";
 /// How far ahead a poll looks. See the module docs.
 pub const HORIZON: chrono::Duration = chrono::Duration::days(14);
 
-/// How far *behind* a poll looks. See the module docs: without a floor, the
-/// first poll of a two-year-old workspace is two years of finished tasks.
-pub const OVERDUE_GRACE: chrono::Duration = chrono::Duration::days(14);
+/// How far *behind* a poll looks.
+///
+/// See the module docs: this is a flood guard against a multi-year
+/// workspace's history, not a staleness or completion rule — the poll reads
+/// no completion signal, so narrowing this would silently and permanently
+/// drop genuinely open, overdue tasks rather than filter out finished ones.
+/// 365 days bounds a history flood while not discarding anything a human
+/// would still call overdue.
+pub const OVERDUE_GRACE: chrono::Duration = chrono::Duration::days(365);
 
 /// Substrings (matched case-insensitively against a property's name) that
 /// mark a date property as the row's deadline rather than one of its other
@@ -345,6 +385,26 @@ pub async fn poll_workspace(
             workspace = %workspace,
             count = split.other.len(),
             "search returned objects of an unrecognised type; ignoring them"
+        );
+    }
+
+    // The same hazard `MAX_DATA_SOURCES` already fences off inside
+    // `NotionClient::query_database` (commit 45ceabe), but on the path that
+    // runs every hour unattended: `search` can return arbitrarily many data
+    // sources, and querying every one with no cap turns one poll into an
+    // unbounded number of requests. Refused loudly, before any of them is
+    // queried, rather than silently truncated to the first `MAX_DATA_SOURCES`
+    // — a silent truncation here would be indistinguishable from "the rest of
+    // the workspace has nothing due", which is exactly the failure this
+    // connector's "fail loudly" rule exists to prevent.
+    if split.data_sources.len() > MAX_DATA_SOURCES {
+        let count = split.data_sources.len();
+        bail!(
+            "Notion workspace {workspace:?} shared {count} data sources with the integration, \
+             more than the {MAX_DATA_SOURCES} this poll will query per workspace. Querying all \
+             of them would mean one query_data_source request per source with no ceiling. \
+             Share fewer databases with this integration, or split the workspace's watch across \
+             more of them."
         );
     }
 
@@ -623,6 +683,31 @@ mod tests {
         );
     }
 
+    /// The finding this pins: `OVERDUE_GRACE` is a flood guard against a
+    /// multi-year history, not a staleness filter, because this poll reads no
+    /// completion signal. A task a month overdue is still open for all this
+    /// connector knows, so it must still be reported — dropping it would be
+    /// permanent, since the row only moves further into the past on every
+    /// later poll.
+    #[tokio::test]
+    async fn an_item_a_month_overdue_is_still_reported() {
+        let mock = workspace_with(
+            vec![data_source(SOURCE_ID, "Tasks")],
+            vec![row(PAGE_ID, "Overdue for weeks", Some("2026-08-20"))],
+        )
+        .await;
+
+        let entries = poll(&[client_for(&mock, "work")], now()).await.unwrap();
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "a month-overdue task is not 'stale', it is the thing the owner is most \
+             behind on: {entries:#?}"
+        );
+        assert_eq!(entries[0].payload["title"], "Overdue for weeks");
+    }
+
     #[tokio::test]
     async fn a_trashed_row_is_not_news() {
         let mut trashed = row(PAGE_ID, "Cancelled", Some("2026-09-26"));
@@ -832,6 +917,52 @@ mod tests {
                 format!("/v1/data_sources/{SOURCE_ID}/query"),
             ],
             "the page in the search reply must not have been queried as a table"
+        );
+    }
+
+    /// The unbounded fan-out `MAX_DATA_SOURCES` closes: `search` returning
+    /// more data sources than the cap must be refused loudly, before any of
+    /// them is queried, rather than truncated to the first `MAX_DATA_SOURCES`
+    /// — a silent truncation here would look exactly like "the rest of the
+    /// workspace has nothing due".
+    #[tokio::test]
+    async fn a_workspace_offering_more_than_max_data_sources_is_refused_before_any_query() {
+        let mock = MockServer::start().await;
+        let sources: Vec<Value> = (0..=MAX_DATA_SOURCES)
+            .map(|i| data_source(&format!("source-{i}"), &format!("Table {i}")))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(json_body(json!({
+                "object": "list",
+                "results": sources,
+                "has_more": false,
+                "next_cursor": null,
+            })))
+            .mount(&mock)
+            .await;
+
+        let err = poll(&[client_for(&mock, "work")], now())
+            .await
+            .expect_err("an unbounded fan-out must be refused, not attempted");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&MAX_DATA_SOURCES.to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("work"), "{rendered}");
+
+        let queried: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|req| req.url.path().to_string())
+            .collect();
+        assert_eq!(
+            queried,
+            ["/v1/search".to_string()],
+            "no data source may be queried once the fan-out is refused: {queried:?}"
         );
     }
 

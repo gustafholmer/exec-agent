@@ -13,21 +13,25 @@
 # # The line this file exists to argue
 #
 # `create_page` is the first write in this project that runs without a human
-# tap. Every other connector's writes are `approve`, and the difference is not
-# carelessness — it is that creating a page is the one write here that cannot
-# damage anything that already exists.
+# tap. Every other connector's writes are `approve`, and the difference is
+# NOT "additive vs. edits existing" — `append_to_page` is append-only too, so
+# that framing does not actually separate the two calls. The real asymmetry
+# is reversal cost and ownership.
 #
-# A new page is *additive*. It touches no existing content, it appears in the
-# owner's sidebar where they will see it, and undoing it is one click. Against
-# that, an assistant that must ask permission before filing a note is an
-# assistant that never files notes — and filing notes is the point of putting
-# Notion in front of it at all. The tap would be paid dozens of times to
-# prevent a harm that is "there is an extra page I did not want".
+# A stray page is one object: it lands in the owner's sidebar where they will
+# see it, and undoing a mistake is one click — trash the page. A stray
+# paragraph appended to a page the owner already maintains — their meeting
+# notes, their project doc, the thing they trust and will read next week —
+# has to be found block-by-block inside a document someone else reads and
+# writes, and may simply never be noticed. That is what the gate is
+# protecting: whose work is at stake and how cheaply a mistake is undone, not
+# how much either call touches.
 #
-# `append_to_page` is `approve` for the mirror reason. It edits a page the
-# owner already maintains: their meeting notes, their project doc, the thing
-# they will read next week and trust. The API call is no more dangerous, but
-# whose work is at stake is different, and that is what the gate is for.
+# Also worth being honest about: creating a page does not "cost nothing". In
+# a shared business workspace it can notify collaborators and trigger Notion
+# automations (a database's own automations, a linked webhook) — real side
+# effects, just cheap and reversible ones. The `auto` grade rests on that
+# reversal-cost gap, not on the write being free.
 [notion]
 
 # Reads. Nothing posted, nothing changed.
@@ -40,7 +44,7 @@ watch_poll = "auto"
 
 # The deliberate departure. See the argument above; a bare "auto" here would
 # read as an oversight.
-create_page = { mode = "auto", note = "a new page is reversible and costs nothing; the assistant filing notes is the point" }
+create_page = { mode = "auto", note = "a stray page is reversible in one click -- the owner deletes it wholesale -- while a stray paragraph from append_to_page must be found block-by-block inside a trusted document and might never be noticed; that reversal-cost gap, not 'costs nothing', is why this one is auto (it can still notify collaborators or fire automations in a shared workspace)" }
 
 # Additive too, but to someone else's page. See above.
 append_to_page = "approve"
