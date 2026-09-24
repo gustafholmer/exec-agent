@@ -70,18 +70,22 @@ pub struct QueryFortnoxArgs {
 const UNPAID: (&str, &str) = ("filter", "unpaid");
 
 /// Every account in the financial year covering `date`, paginated.
+///
+/// The year is resolved first and is always sent. [`financial_year_id`] errors
+/// rather than answering [`None`], so there is no path here that asks Fortnox
+/// for "the accounts" and lets it pick the year.
 async fn accounts_for(
     client: &FortnoxClient,
     date: Option<&str>,
-) -> Result<(Option<i64>, Vec<Value>), String> {
+) -> Result<(i64, Vec<Value>), String> {
     let year = financial_year_id(client, date).await?;
-    let year_param = year.map(|y| y.to_string());
-    let query: Vec<(&str, &str)> = match &year_param {
-        Some(value) => vec![("financialyear", value.as_str())],
-        None => Vec::new(),
-    };
+    let year_param = year.to_string();
     let rows = client
-        .get_all("accounts", "Accounts", &query)
+        .get_all(
+            "accounts",
+            "Accounts",
+            &[("financialyear", year_param.as_str())],
+        )
         .await
         .map_err(render)?;
     Ok((year, rows))
@@ -224,11 +228,8 @@ impl FortnoxServer {
     ) -> Result<String, String> {
         let client = self.client()?;
         let year = financial_year_id(client, date.as_deref()).await?;
-        let year_param = year.map(|y| y.to_string());
-        let mut query: Vec<(&str, &str)> = Vec::new();
-        if let Some(value) = &year_param {
-            query.push(("financialyear", value.as_str()));
-        }
+        let year_param = year.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("financialyear", year_param.as_str())];
         if let Some(series) = &series {
             query.push(("sieseries", series.as_str()));
         }
@@ -306,8 +307,8 @@ fn query_pairs(query: Option<&Map<String, Value>>) -> Result<Vec<(String, String
 mod tests {
     use super::*;
 
-    use wiremock::matchers::{method, path as path_matcher, query_param};
-    use wiremock::{Mock, MockServer};
+    use wiremock::matchers::{method, path as path_matcher, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::tools::test_support::{json_body, server_for, unconfigured};
 
@@ -342,6 +343,119 @@ mod tests {
             .mount(&mock)
             .await;
         mock
+    }
+
+    /// A mock that knows two financial years and covers neither 2019 nor any
+    /// other date outside them. The `date` lookup answers empty; the bare list
+    /// — the one the error message is built from — answers both years.
+    async fn mock_with_no_year_for_2019() -> MockServer {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param("date", "2019-01-01"))
+            .respond_with(json_body(serde_json::json!({ "FinancialYears": [] })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param_is_missing("date"))
+            .respond_with(json_body(serde_json::json!({
+                "FinancialYears": [
+                    { "Id": 3, "FromDate": "2025-01-01", "ToDate": "2025-12-31" },
+                    { "Id": 4, "FromDate": "2026-01-01", "ToDate": "2026-12-31" },
+                ],
+                "MetaInformation": { "@TotalPages": 1 },
+            })))
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    /// The bug this replaces: with no covering year the `financialyear`
+    /// parameter was simply omitted, Fortnox answered for its own *current*
+    /// year, and `profit_and_loss(date: "2019-01-01")` returned today's
+    /// figures labelled only by `"financial_year": null`. A model summarising
+    /// that reply states this year's revenue as 2019's.
+    ///
+    /// Without the fix this test fails by SUCCEEDING — and by fetching a chart
+    /// of accounts it had no business fetching.
+    #[tokio::test]
+    async fn a_date_no_financial_year_covers_is_an_error_naming_the_date_and_the_years_that_exist()
+    {
+        let mock = mock_with_no_year_for_2019().await;
+        // Nothing may ask Fortnox for figures once the year is unresolved.
+        Mock::given(method("GET"))
+            .and(path_matcher("/accounts"))
+            .respond_with(json_body(chart()))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let err = server_for(&mock)
+            .profit_and_loss(Parameters(DateArgs {
+                date: Some("2019-01-01".to_string()),
+            }))
+            .await
+            .expect_err("2019 is not one of this company's financial years");
+
+        assert!(err.contains("2019-01-01"), "the date asked for: {err}");
+        assert!(err.contains("2025-01-01..2025-12-31 (id 3)"), "{err}");
+        assert!(err.contains("2026-01-01..2026-12-31 (id 4)"), "{err}");
+    }
+
+    /// Same refusal from `account_ledger`, which builds its query by hand
+    /// rather than through `accounts_for` — the seam where a second omission
+    /// would most easily reappear.
+    #[tokio::test]
+    async fn account_ledger_refuses_a_date_outside_every_financial_year() {
+        let mock = mock_with_no_year_for_2019().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/vouchers"))
+            .respond_with(json_body(serde_json::json!({ "Vouchers": [] })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let err = server_for(&mock)
+            .account_ledger(Parameters(AccountLedgerArgs {
+                date: Some("2019-01-01".to_string()),
+                series: Some("A".to_string()),
+            }))
+            .await
+            .expect_err("no year, no ledger");
+
+        assert!(err.contains("2019-01-01"), "{err}");
+        assert!(err.contains("id 3"), "{err}");
+    }
+
+    /// The listing call is best-effort: if it fails too, the date — the one
+    /// fact the caller needs — is still in the message, and the missing list
+    /// is explained rather than swallowed.
+    #[tokio::test]
+    async fn an_unreadable_year_list_still_names_the_date_that_has_no_year() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param("date", "2019-01-01"))
+            .respond_with(json_body(serde_json::json!({ "FinancialYears": [] })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param_is_missing("date"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let err = server_for(&mock)
+            .balance_sheet(Parameters(DateArgs {
+                date: Some("2019-01-01".to_string()),
+            }))
+            .await
+            .expect_err("no year");
+
+        assert!(err.contains("2019-01-01"), "{err}");
+        assert!(err.contains("could not be read either"), "{err}");
     }
 
     fn accounts_of(text: &str) -> Vec<String> {

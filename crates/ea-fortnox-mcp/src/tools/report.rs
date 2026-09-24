@@ -31,18 +31,19 @@ const RESULT_NOTE: &str = "Figures are period-to-date and interpreted from BAS s
                            on them.";
 
 /// The chart of accounts for the financial year covering `date`.
-async fn chart(
-    client: &FortnoxClient,
-    date: Option<&str>,
-) -> Result<(Option<i64>, Vec<Value>), String> {
+///
+/// The year is always sent: [`financial_year_id`] errors when none covers the
+/// date, so a VAT return can never be computed from whichever year Fortnox
+/// happened to default to.
+async fn chart(client: &FortnoxClient, date: Option<&str>) -> Result<(i64, Vec<Value>), String> {
     let year = financial_year_id(client, date).await?;
-    let year_param = year.map(|y| y.to_string());
-    let query: Vec<(&str, &str)> = match &year_param {
-        Some(value) => vec![("financialyear", value.as_str())],
-        None => Vec::new(),
-    };
+    let year_param = year.to_string();
     let rows = client
-        .get_all("accounts", "Accounts", &query)
+        .get_all(
+            "accounts",
+            "Accounts",
+            &[("financialyear", year_param.as_str())],
+        )
         .await
         .map_err(render)?;
     Ok((year, rows))
@@ -133,7 +134,7 @@ impl FortnoxServer {
 mod tests {
     use super::*;
 
-    use wiremock::matchers::{method, path as path_matcher};
+    use wiremock::matchers::{method, path as path_matcher, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer};
 
     use crate::tools::test_support::{json_body, server_for};
@@ -153,6 +154,54 @@ mod tests {
             .mount(&mock)
             .await;
         mock
+    }
+
+    /// A VAT report for a date in no financial year must refuse.
+    ///
+    /// This is the worst instance of the omitted-parameter bug: a
+    /// momsdeklaration prepared from the wrong year's accounts, filed for a
+    /// real company. Without the fix the call succeeds and reports whichever
+    /// year Fortnox defaulted to, with `"financial_year": null` as the only
+    /// clue.
+    #[tokio::test]
+    async fn vat_report_refuses_a_date_no_financial_year_covers() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param("date", "2019-06-30"))
+            .respond_with(json_body(serde_json::json!({ "FinancialYears": [] })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/financialyears"))
+            .and(query_param_is_missing("date"))
+            .respond_with(json_body(serde_json::json!({
+                "FinancialYears": [
+                    { "Id": 7, "FromDate": "2026-01-01", "ToDate": "2026-12-31" },
+                ],
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/accounts"))
+            .respond_with(json_body(serde_json::json!({ "Accounts": [] })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let err = server_for(&mock)
+            .vat_report(Parameters(DateArgs {
+                date: Some("2019-06-30".to_string()),
+            }))
+            .await
+            .expect_err("no year covers 2019-06-30");
+
+        assert!(err.contains("2019-06-30"), "{err}");
+        assert!(err.contains("2026-01-01..2026-12-31 (id 7)"), "{err}");
+        assert!(
+            err.contains("CURRENT year"),
+            "the trap must be named: {err}"
+        );
     }
 
     fn today() -> Parameters<DateArgs> {

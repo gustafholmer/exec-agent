@@ -40,7 +40,9 @@
 //! from page one is wrong without looking wrong, so every account, voucher and
 //! invoice list here uses [`FortnoxClient::get_all`], never a plain `get`.
 //! `financialyears` is the one exception, matching upstream: it is looked up
-//! by date and answers with the one year that covers it.
+//! by date and answers with the one year that covers it. The exception has one
+//! exception of its own — when no year covers the date, the full list *is*
+//! fetched through `get_all`, to name the years that do exist in the error.
 
 pub mod attach;
 pub mod preview;
@@ -211,14 +213,23 @@ pub(crate) fn today_utc() -> String {
 
 /// The id of the financial year covering `date` (default: today).
 ///
-/// [`None`] when Fortnox knows no year for that date — upstream's
-/// `years[0]?.Id` being `undefined`, which it then spreads into a query as an
-/// absent parameter. Reproduced: an absent `financialyear` makes Fortnox
-/// answer for its own default year, which is what upstream has been doing.
+/// # Errors
+///
+/// When Fortnox knows no year covering that date — and this is a **deliberate
+/// divergence from upstream**, which is the whole point of the function.
+///
+/// Upstream took `years[0]?.Id` and spread `undefined` into the query, so the
+/// `financialyear` parameter simply vanished and Fortnox answered for its own
+/// *current* year. `profit_and_loss(date: "2019-01-01")` therefore returned
+/// today's figures with nothing but a `"financial_year": null` to say so — and
+/// the consumer here is a language model writing prose for the owner, which
+/// will happily narrate this year's revenue as 2019's. A wrong number with a
+/// confident label is worse than no number, so the missing year is an error
+/// that names the date asked for and the years that actually exist.
 pub(crate) async fn financial_year_id(
     client: &FortnoxClient,
     date: Option<&str>,
-) -> Result<Option<i64>, String> {
+) -> Result<i64, String> {
     let owned;
     let date = match date {
         Some(date) => date,
@@ -231,12 +242,62 @@ pub(crate) async fn financial_year_id(
         .get("financialyears", &[("date", date)])
         .await
         .map_err(render)?;
-    Ok(response
+    match response
         .get("FinancialYears")
         .and_then(Value::as_array)
         .and_then(|years| years.first())
         .and_then(|year| year.get("Id"))
-        .and_then(coerce_i64))
+        .and_then(coerce_i64)
+    {
+        Some(id) => Ok(id),
+        None => Err(no_year_covering(client, date).await),
+    }
+}
+
+/// The error for a date no financial year covers, with the years that do
+/// exist listed so the caller can pick one instead of guessing again.
+///
+/// The extra request only ever happens on the failure path. If it fails too,
+/// the message still names the date — the primary fact — and says why the list
+/// is absent rather than swallowing the second failure.
+async fn no_year_covering(client: &FortnoxClient, date: &str) -> String {
+    let known = match client
+        .get_all("financialyears", "FinancialYears", &[])
+        .await
+    {
+        Ok(rows) if rows.is_empty() => {
+            "Fortnox lists no financial years at all for this company.".to_string()
+        }
+        Ok(rows) => format!("Fortnox has these: {}.", year_spans(&rows).join(", ")),
+        Err(err) => format!(
+            "The list of existing years could not be read either ({}).",
+            render(err)
+        ),
+    };
+    format!(
+        "fortnox: no financial year covers {date}, so no figures can be reported for it.          {known} Ask again with a date inside one of them — answering without a year would          silently return the CURRENT year's figures under the date you asked for."
+    )
+}
+
+/// Each year as `FromDate..ToDate (id N)`, skipping nothing: a year with an
+/// unreadable field still appears, because a short list is easier to act on
+/// than a list with a hole in it.
+fn year_spans(rows: &[Value]) -> Vec<String> {
+    rows.iter()
+        .map(|year| {
+            let span = match (
+                year.get("FromDate").and_then(Value::as_str),
+                year.get("ToDate").and_then(Value::as_str),
+            ) {
+                (Some(from), Some(to)) => format!("{from}..{to}"),
+                _ => "dates unknown".to_string(),
+            };
+            match year.get("Id").and_then(coerce_i64) {
+                Some(id) => format!("{span} (id {id})"),
+                None => span,
+            }
+        })
+        .collect()
 }
 
 /// Fortnox is inconsistent about whether an id is a JSON number or a string.
