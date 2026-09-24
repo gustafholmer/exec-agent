@@ -1764,20 +1764,38 @@ record_voucher = "approve"
         );
     }
 
-    /// The same, for a transport error rather than an HTTP status: the server
-    /// is gone, so `reqwest` fails at the connection, which is the variant
-    /// whose `Display` carries the URL.
+    /// The same, for a transport error rather than an HTTP status: the request
+    /// dies on the connection, which is the variant whose `Display` carries the
+    /// URL — and the URL is `.../bot<TOKEN>/sendMessage`.
+    ///
+    /// The failure is *manufactured*, not hoped for. This test used to start a
+    /// `wiremock::MockServer`, take its URI and drop it, assuming nothing would
+    /// rebind the port before the request went out. A concurrent test's server
+    /// can, and did: a reviewer hit `unwrap_err()` on an `Ok` on a full-suite
+    /// run, and it passed in isolation and on the re-run — the worst shape a
+    /// failure can have, because it teaches everyone to re-run rather than
+    /// look. Here the listener is *held* for the whole test, so the port cannot
+    /// be taken by anybody else, and it answers every connection by dropping it
+    /// unanswered. The transport error is then produced by this test, every
+    /// time, on every machine.
     #[tokio::test]
     async fn a_connection_failure_errors_without_leaking_the_token() {
-        use wiremock::MockServer;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hanging_up = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Closed without a byte of response: reqwest fails the send,
+                // which is the error path under test.
+                drop(stream);
+            }
+        });
 
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
-
-        let transport = TelegramTransport::with_base_url(uri, "123456:SeCrEtValue", 1).unwrap();
+        let transport =
+            TelegramTransport::with_base_url(format!("http://{addr}"), "123456:SeCrEtValue", 1)
+                .unwrap();
         let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
 
+        hanging_up.abort();
         assert!(
             !err.contains("SeCrEtValue"),
             "the error leaked the token: {err}"
