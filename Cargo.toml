@@ -8,6 +8,7 @@ members = [
   "crates/ea-propose",
   "crates/ea-canvas",
   "crates/ea-google",
+  "crates/ea-fortnox",
 ]
 
 [workspace.package]

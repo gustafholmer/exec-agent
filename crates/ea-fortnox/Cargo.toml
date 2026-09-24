@@ -1,0 +1,13 @@
+[package]
+name = "ea-fortnox"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ea_fortnox"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+rust_decimal.workspace = true
