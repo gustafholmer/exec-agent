@@ -11,32 +11,30 @@
 //!
 //! * **Arbetsgivardeklaration (AGI)** and **debiterad preliminärskatt** are
 //!   monthly. The ordinary due date is the **12th of the month following the
-//!   period**: wages paid in March are declared by 12 April.
-//! * **Moms** is quarterly here, filed in the month after the quarter ends:
-//!   the January–March period falls due in April.
+//!   period**: wages paid in March are declared by 12 April. In **January and
+//!   August** the ordinary day is the **17th**, not the 12th — see
+//!   [`due_day`].
+//! * **Moms** is quarterly here, filed on the ordinary due day of the
+//!   **second** month after the quarter ends: Q1 (January–March) falls due
+//!   12 May, Q2 on 17 August, Q3 on 12 November, Q4 on 12 February of the
+//!   following year.
 //!
 //! A due date that lands on a Saturday, a Sunday or a Swedish public holiday
 //! moves **forward** to the next ordinary working day, which is Skatteverket's
 //! own rule (lag 1930:173 om beräkning av lagstadgad tid).
 //!
-//! # Two deliberate simplifications, both erring early
+//! # Why the dates have to be the real ones
 //!
 //! These are reminders, not authority, and every payload says so — see
-//! [`REMINDER_NOTE`]. Where the real rule is more intricate than the one
-//! implemented, this module is the *earlier* of the two, which is the safe
-//! direction for a reminder:
-//!
-//! 1. **January and August.** Skatteverket moves the ordinary 12th to the
-//!    17th in those two months. Not implemented: the brief specifies the 12th,
-//!    and a reminder five days early costs nothing while a reminder five days
-//!    late costs a förseningsavgift.
-//! 2. **Kvartalsmoms.** For most companies the real deadline is the 12th of
-//!    the *second* month after the quarter (Q1 → 12 May), not the first. The
-//!    month-after rule specified here fires a month early.
-//!
-//! Both are safe in the same direction and both are covered by the note. If
-//! this ever needs to be exact rather than early, it needs a real Skatteverket
-//! calendar, not a patch to these constants.
+//! [`REMINDER_NOTE`]. That note is not a licence to be approximate. The
+//! payload carries `due_on` as a concrete date, and the external id is
+//! `tax-deadline:<kind>:<period>` over a payload with no clock in it, so the
+//! daemon raises each deadline **once**: it is triaged once and never
+//! re-opened. A date that is merely close is therefore not an early reminder,
+//! it is a reminder for a day that does not exist, followed by silence through
+//! the real one. An earlier version of this module filed kvartalsmoms in the
+//! first month after the quarter and used the 12th in every month; both were
+//! wrong in exactly that way, and both are fixed here.
 //!
 //! # Why no Easter
 //!
@@ -54,8 +52,13 @@
 //!   2058 and 2069; annandag påsk on 12 April in 2066; Kristi himmelsfärd on
 //!   12 May in 2067. **The first collision of any kind is 12 April 2047.**
 //!   `the_omission_of_easter_is_safe_until_2047` pins that window with its own
-//!   computus, in test code, so the claim is measured and has a visible expiry
-//!   date instead of being an assumption nobody rechecks.
+//!   computus, in test code, and drives its range from `Utc::now().year()`, so
+//!   the claim is measured and the test genuinely **fails** once the clock
+//!   reaches 2047 rather than passing forever on a hardcoded range.
+//!   (The January and August 17ths are outside the Easter cluster entirely —
+//!   Easter Sunday ranges 22 March to 25 April, and the latest derived feast,
+//!   pingstdagen, is at most 13 June — so the per-month due day does not widen
+//!   this exposure.)
 //! * **Påskdagen and pingstdagen on a 12th (2093, 2095) are Sundays**, so the
 //!   weekend rule already moves them; they were never at risk.
 //!
@@ -80,15 +83,43 @@ use serde_json::{json, Value};
 /// arrives unannounced — not so that anybody stops checking.
 pub const REMINDER_NOTE: &str = "Reminder only — verify against Skatteverket before filing.";
 
-/// The ordinary day of the month a declaration falls due.
-pub const DUE_DAY: u32 = 12;
+/// The ordinary day of the month a declaration falls due, given the month it
+/// is *filed* in.
+///
+/// The 12th in ten months of the year and the **17th in January and August**.
+/// That is Skatteverket's own exception, not a rounding: those two months
+/// follow a long holiday period, and the deklarationsdag moves with it. It
+/// cannot be waved away as "erring early", because a deadline is raised once
+/// and never re-opened — printing 12 January as the date means the 17th is
+/// never announced at all.
+pub fn due_day(month: u32) -> u32 {
+    match month {
+        1 | 8 => 17,
+        _ => 12,
+    }
+}
+
+/// The months a kvartalsmoms declaration is filed in: the **second** month
+/// after the quarter ends.
+///
+/// Q1 → May, Q2 → August, Q3 → November, Q4 → February of the next year. The
+/// quarter being declared is therefore the three months ending two months
+/// before the filing month.
+const MOMS_FILING_MONTHS: &[u32] = &[2, 5, 8, 11];
+
+/// How many months back from a moms filing month the declared quarter ends.
+const MOMS_PERIOD_OFFSET: i32 = -2;
 
 /// How far ahead [`crate::watch`] asks for deadlines.
 ///
-/// Forty-five days, against a daily poll: long enough that every 12th is seen
-/// at least a month before it falls due (the gap between two consecutive 12ths
-/// is at most 31 days), so no deadline is ever first reported on the day it is
-/// due — even if the daemon was down for a week.
+/// Forty-five days, against a daily poll: long enough that every due date is
+/// seen well before it falls due, so no deadline is ever first reported on the
+/// day it is due — even if the daemon was down for a week. The widest gap
+/// between two consecutive due dates is 12 December → 17 January, 36 days,
+/// and the weekend-and-holiday rule can push the later of the two forward by
+/// at most two days (a 17th that is a Saturday becomes the Monday), giving 38.
+/// `the_horizon_always_contains_the_next_due_date` measures that bound rather
+/// than trusting this paragraph.
 pub const HORIZON_DAYS: i64 = 45;
 
 /// Swedish public holidays that fall on a fixed calendar date, as
@@ -97,9 +128,9 @@ pub const HORIZON_DAYS: i64 = 45;
 /// Julafton (24 December) and nyårsafton (31 December) are not *helgdagar* in
 /// law, but Skatteverket, the banks and the Riksbank's payment system treat
 /// them as non-banking days, so a declaration due on one is in practice due
-/// the next working day. Including them keeps this on the early-and-safe side
-/// of the line, the same direction as the two simplifications in the module
-/// docs.
+/// the next working day. Including them keeps a declaration off a day the
+/// owner could not act on anyway, and the move is always forward, so it can
+/// never push a reminder past its real deadline.
 ///
 /// Movable feasts are deliberately absent. See the module docs.
 pub const FIXED_HOLIDAYS: &[(u32, u32)] = &[
@@ -251,16 +282,18 @@ pub fn upcoming_deadlines(from: NaiveDate, horizon_days: i64) -> Vec<Deadline> {
     let mut found = Vec::new();
 
     // The adjustment can only push a date forward, and never by more than a
-    // handful of days, so a 12th always stays inside its own month (12 → at
-    // most 18). Walking the months the window touches is therefore enough.
+    // handful of days, so a due day always stays inside its own month (17 → at
+    // most 23). Walking the months the window touches is therefore enough.
     let Some(mut month) = first_of((from.year(), from.month())) else {
         return Vec::new();
     };
     while month <= until {
-        if let Some(due) = NaiveDate::from_ymd_opt(month.year(), month.month(), DUE_DAY) {
+        if let Some(due) =
+            NaiveDate::from_ymd_opt(month.year(), month.month(), due_day(month.month()))
+        {
             let due = adjust_for_weekend_and_holidays(due);
             if due >= from && due <= until {
-                // The period declared on the 12th of month M is month M-1.
+                // The period declared on the due day of month M is month M-1.
                 if let Some(period) = period_label(add_months(month, -1)) {
                     found.push(Deadline {
                         kind: DeadlineKind::Agi,
@@ -269,13 +302,16 @@ pub fn upcoming_deadlines(from: NaiveDate, horizon_days: i64) -> Vec<Deadline> {
                     });
                     found.push(Deadline {
                         kind: DeadlineKind::Preliminarskatt,
-                        period: period.clone(),
+                        period,
                         due_on: due,
                     });
-                    // Moms is quarterly, filed in the month after the quarter
-                    // ends — so in January, April, July and October, for the
-                    // quarter whose last month is the one just gone.
-                    if matches!(month.month(), 1 | 4 | 7 | 10) {
+                }
+                // Moms is quarterly, filed on the due day of the *second*
+                // month after the quarter ends — February, May, August and
+                // November — for the quarter whose last month is two months
+                // before that.
+                if MOMS_FILING_MONTHS.contains(&month.month()) {
+                    if let Some(period) = period_label(add_months(month, MOMS_PERIOD_OFFSET)) {
                         found.push(Deadline {
                             kind: DeadlineKind::Moms,
                             period,
@@ -331,6 +367,7 @@ fn parse_period(period: &str) -> Option<(i32, u32)> {
 mod tests {
     use super::*;
 
+    use chrono::Utc;
     use std::collections::BTreeSet;
 
     fn date(text: &str) -> NaiveDate {
@@ -356,6 +393,13 @@ mod tests {
             ("2027-01-07", Weekday::Thu),
             ("2026-12-25", Weekday::Fri),
             ("2026-12-28", Weekday::Mon),
+            // The four kvartalsmoms dates pinned below, so that
+            // `the_four_quarters_file_two_months_after_they_end` is asserting
+            // the rule and not accidentally asserting a weekend adjustment.
+            ("2026-05-12", Weekday::Tue),
+            ("2026-08-17", Weekday::Mon),
+            ("2026-11-12", Weekday::Thu),
+            ("2027-02-12", Weekday::Fri),
         ] {
             assert_eq!(date(text).weekday(), weekday, "{text}");
         }
@@ -462,10 +506,10 @@ mod tests {
     /// and not about the horizon arithmetic quietly excluding both ends.
     #[test]
     fn a_zero_day_horizon_on_a_due_day_reports_it() {
-        // 12 October 2026 is a Monday, and October files the July–September
-        // quarter as well as September's monthly pair.
-        let due = date("2026-10-12");
-        assert_eq!(due.weekday(), Weekday::Mon);
+        // 12 November 2026 is a Thursday, and November files the July–September
+        // quarter as well as October's monthly pair.
+        let due = date("2026-11-12");
+        assert_eq!(due.weekday(), Weekday::Thu);
         let found = upcoming_deadlines(due, 0);
         assert_eq!(
             found.iter().map(|d| d.kind).collect::<Vec<_>>(),
@@ -479,8 +523,115 @@ mod tests {
         assert!(found.iter().all(|d| d.due_on == due));
 
         // A month that is not a moms filing month gives the monthly pair only.
-        let november = upcoming_deadlines(date("2026-11-12"), 0);
-        assert_eq!(november.len(), 2, "{november:?}");
+        let october = upcoming_deadlines(date("2026-10-12"), 0);
+        assert_eq!(october.len(), 2, "{october:?}");
+    }
+
+    /// **Finding 1.** Kvartalsmoms is filed on the ordinary due day of the
+    /// *second* month after the quarter ends, and these are the four real
+    /// dates. Under the old first-month-after rule every one of these would
+    /// be a month early — and because the payload has no clock in it and the
+    /// id is `tax-deadline:moms:<period>`, the row is raised once and never
+    /// re-opened, so an early date is not an early reminder: it is a reminder
+    /// for a day that does not exist, then silence through the real one.
+    #[test]
+    fn the_four_quarters_file_two_months_after_they_end() {
+        // None of these four needs a weekend or holiday adjustment — pinned by
+        // `the_premises_hold_a_weekday_at_a_time` — so the date asserted here
+        // is the rule's own answer.
+        for (period, due) in [
+            ("2026-03", "2026-05-12"), // Q1 → 12 May
+            ("2026-06", "2026-08-17"), // Q2 → 17 August (August is a 17th)
+            ("2026-09", "2026-11-12"), // Q3 → 12 November
+            ("2026-12", "2027-02-12"), // Q4 → 12 February of the next year
+        ] {
+            let due = date(due);
+            let moms: Vec<Deadline> = upcoming_deadlines(due, 0)
+                .into_iter()
+                .filter(|d| d.kind == DeadlineKind::Moms)
+                .collect();
+            assert_eq!(
+                moms.len(),
+                1,
+                "exactly one moms filing falls due on {due}: {moms:?}"
+            );
+            assert_eq!(moms[0].period, period, "{moms:?}");
+            assert_eq!(moms[0].due_on, due);
+        }
+    }
+
+    /// The other half of the same rule: the months that are *not* moms filing
+    /// months. If the filing month were still the first after the quarter,
+    /// January, April, July and October would carry a moms row.
+    #[test]
+    fn no_moms_falls_due_in_the_month_after_a_quarter_ends() {
+        for due in ["2026-04-13", "2026-07-13", "2026-10-12", "2027-01-18"] {
+            let found = upcoming_deadlines(date(due), 0);
+            assert!(!found.is_empty(), "{due} is a due day");
+            assert!(
+                found.iter().all(|d| d.kind != DeadlineKind::Moms),
+                "{due} is the month straight after a quarter, not a filing month: {found:?}"
+            );
+        }
+    }
+
+    /// **Finding 2.** January and August fall due on the 17th, every other
+    /// month on the 12th.
+    #[test]
+    fn january_and_august_fall_due_on_the_seventeenth() {
+        for month in 1..=12 {
+            let expected = if matches!(month, 1 | 8) { 17 } else { 12 };
+            assert_eq!(due_day(month), expected, "month {month}");
+        }
+
+        // And it reaches the emitted dates, not just the helper. 17 August
+        // 2026 is a Monday and 12 August 2026 is a Wednesday, so the 17th here
+        // cannot be a weekend adjustment of the 12th.
+        assert_eq!(date("2026-08-12").weekday(), Weekday::Wed);
+        let august = upcoming_deadlines(date("2026-08-01"), 20);
+        assert!(!august.is_empty());
+        for deadline in &august {
+            assert_eq!(deadline.due_on, date("2026-08-17"), "{deadline:?}");
+        }
+
+        // January 2026: the 17th is a Saturday, so the answer is the Monday —
+        // the 19th, which is still unreachable from a 12th.
+        assert_eq!(date("2026-01-17").weekday(), Weekday::Sat);
+        let january = upcoming_deadlines(date("2026-01-01"), 25);
+        assert!(!january.is_empty());
+        for deadline in &january {
+            assert_eq!(deadline.due_on, date("2026-01-19"), "{deadline:?}");
+        }
+    }
+
+    /// The horizon has to be wide enough that a daily poll can never step over
+    /// a due date. Reasoned in [`HORIZON_DAYS`]'s doc comment; measured here.
+    #[test]
+    fn the_horizon_always_contains_the_next_due_date() {
+        let mut dates: Vec<NaiveDate> = Vec::new();
+        for offset in 0..(366 * 6) {
+            let from = date("2026-01-01") + Duration::days(offset);
+            if let Some(next) = upcoming_deadlines(from, HORIZON_DAYS).first() {
+                dates.push(next.due_on);
+            } else {
+                panic!("no deadline within {HORIZON_DAYS} days of {from}");
+            }
+        }
+        dates.dedup();
+        let widest = dates
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).num_days())
+            .max()
+            .expect("at least two due dates in six years");
+        assert!(
+            widest <= HORIZON_DAYS,
+            "consecutive due dates are up to {widest} days apart, \
+             which a {HORIZON_DAYS}-day horizon cannot always span"
+        );
+        assert_eq!(
+            widest, 38,
+            "the widest is 12 July 2030 to 17 August 2030 pushed to the Monday 19th"
+        );
     }
 
     #[test]
@@ -675,23 +826,32 @@ mod tests {
         NaiveDate::from_ymd_opt(year, month, day).expect("a real Easter")
     }
 
-    /// The omission of the movable feasts, measured rather than asserted.
+    /// The year the decision to omit the movable feasts runs out: långfredagen
+    /// falls on 12 April 2047, which this module will treat as an ordinary
+    /// Friday.
+    const EASTER_OMISSION_EXPIRES: i32 = 2047;
+
+    /// The verdict on the omission **as of a given year**, so that the test
+    /// below can be driven by the real clock and a second test can drive it
+    /// past the threshold without waiting twenty-one years.
     ///
-    /// The usual justification — "they never land on the 12th" — is false, and
-    /// this test says exactly when it stops being true: the first movable
-    /// Swedish feast to fall on a 12th is långfredagen on 12 April 2047. Until
-    /// then the production path's fixed-date-only holiday set cannot be wrong
-    /// about a due date for that reason. The upper assertion is the one that
-    /// will fail one day, and failing is the point: it is how the decision
-    /// recorded in the module docs gets revisited instead of forgotten.
-    #[test]
-    fn the_omission_of_easter_is_safe_until_2047() {
+    /// `Err` means the decision recorded in the module docs no longer holds:
+    /// either the window has closed, or a feast has turned up inside it.
+    fn easter_omission_verdict(today_year: i32) -> Result<(), String> {
+        if today_year >= EASTER_OMISSION_EXPIRES {
+            return Err(format!(
+                "it is {today_year}: the decision to omit the movable feasts expired in \
+                 {EASTER_OMISSION_EXPIRES}, when långfredagen falls on 12 April. Read the \
+                 module docs and choose again — implement the computus, or re-date this."
+            ));
+        }
+
         let mut collisions = Vec::new();
-        for year in 2026..2047 {
+        for year in today_year..EASTER_OMISSION_EXPIRES {
             let easter = easter_sunday(year);
             for offset in [-2, 0, 1, 39, 49] {
                 let feast = easter + Duration::days(offset);
-                if feast.day() == DUE_DAY {
+                if feast.day() == due_day(feast.month()) {
                     collisions.push((year, offset, feast));
                 }
             }
@@ -699,22 +859,64 @@ mod tests {
             for day in 19..=25 {
                 let candidate = NaiveDate::from_ymd_opt(year, 6, day).expect("a June day");
                 if candidate.weekday() == Weekday::Fri {
-                    assert_ne!(candidate.day(), DUE_DAY);
-                    assert_ne!((candidate + Duration::days(1)).day(), DUE_DAY);
+                    let midsommardagen = candidate + Duration::days(1);
+                    if candidate.day() == due_day(candidate.month()) {
+                        collisions.push((year, 100, candidate));
+                    }
+                    if midsommardagen.day() == due_day(midsommardagen.month()) {
+                        collisions.push((year, 101, midsommardagen));
+                    }
                 }
             }
         }
+        if !collisions.is_empty() {
+            return Err(format!(
+                "a movable feast falls on a due day before {EASTER_OMISSION_EXPIRES}: \
+                 {collisions:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The omission of the movable feasts, measured rather than asserted — and
+    /// **against the real clock**, so that the claim in the module docs that
+    /// this "fails the day the window closes" is true rather than decorative.
+    ///
+    /// The usual justification — "they never land on a due day" — is false,
+    /// and this test says exactly when it stops being true: the first movable
+    /// Swedish feast to fall on one is långfredagen on 12 April 2047. An
+    /// earlier version of this test swept a hardcoded `2026..2047` and never
+    /// read a clock, so it would have passed unchanged in 2047 and in 2100.
+    #[test]
+    fn the_omission_of_easter_is_safe_until_2047() {
+        let this_year = Utc::now().year();
+        if let Err(why) = easter_omission_verdict(this_year) {
+            panic!("{why}");
+        }
+    }
+
+    /// And the proof that the test above can actually fail: the same verdict,
+    /// asked with the clock moved past the threshold. Without this, "it will
+    /// fail one day" is an untested claim about a test.
+    #[test]
+    fn the_easter_expiry_really_expires() {
         assert!(
-            collisions.is_empty(),
-            "a movable feast now falls on the 12th before 2047: {collisions:?}. \
-             The module docs' decision to omit Easter has expired — read them and choose \
-             again."
+            easter_omission_verdict(EASTER_OMISSION_EXPIRES - 1).is_ok(),
+            "the last year inside the window must still pass"
+        );
+        let expired = easter_omission_verdict(EASTER_OMISSION_EXPIRES)
+            .expect_err("the threshold year must fail, or the expiry is decoration");
+        assert!(expired.contains("12 April"), "{expired}");
+        assert!(
+            easter_omission_verdict(2100).is_err(),
+            "and it must stay failed, not lapse back into passing"
         );
 
-        // And the first one that does, so the expiry date is not a guess.
-        let langfredagen_2047 = easter_sunday(2047) - Duration::days(2);
+        // The date the expiry is about, so it is not a guess.
+        let langfredagen_2047 = easter_sunday(EASTER_OMISSION_EXPIRES) - Duration::days(2);
         assert_eq!(langfredagen_2047, date("2047-04-12"));
         assert_eq!(langfredagen_2047.weekday(), Weekday::Fri);
+        assert_eq!(langfredagen_2047.day(), due_day(langfredagen_2047.month()));
         assert!(
             is_working_day(langfredagen_2047),
             "this connector will treat 12 April 2047 as an ordinary Friday, and that is \
@@ -732,8 +934,8 @@ mod tests {
             assert!((1..=12).contains(&month));
             assert!(NaiveDate::from_ymd_opt(2026, month, day).is_some());
             assert!(
-                day != DUE_DAY,
-                "a fixed holiday on the 12th would move every monthly deadline"
+                day != due_day(month),
+                "a fixed holiday on that month's due day would move every deadline in it"
             );
         }
     }

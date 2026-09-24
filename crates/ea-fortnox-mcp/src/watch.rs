@@ -132,8 +132,16 @@ pub fn invoice_entry(row: &Value, today: NaiveDate) -> Option<WatchEntry> {
 }
 
 /// Every declaration falling due within [`deadlines::HORIZON_DAYS`] of
-/// `today`, as watch entries. Pure: no Fortnox call, so these keep arriving
-/// even on a connector whose grant has lapsed.
+/// `today`, as watch entries. Pure: this function itself makes no Fortnox
+/// call and cannot fail.
+///
+/// That is true of the function and **not** of the system. A poll is
+/// all-or-nothing by design — see "Why an error is never an empty array"
+/// above and [`crate::tools`]' `poll_at` — so a poll whose Fortnox call fails
+/// emits nothing at all, these rows included. Deadlines resume with the first
+/// poll that succeeds; they do not keep arriving on a connector whose grant
+/// has lapsed, because a half-working poll reads to the daemon as a working
+/// one.
 pub fn deadline_entries(today: NaiveDate) -> Vec<WatchEntry> {
     deadlines::upcoming_deadlines(today, deadlines::HORIZON_DAYS)
         .into_iter()
