@@ -187,6 +187,11 @@ So a Canvas outage, an expired token that gets refreshed, or a night without
 network heals with nobody watching. `ea resume <job>` is for when you have just
 fixed the cause yourself and do not want to wait out the cooldown.
 
+The bounds are `breaker_threshold`, `breaker_cooldown_secs` (default 300) and
+`breaker_max_cooldown_secs` (default 3600) in `config.toml`. The cooldown is a
+floor on the retry rate, not a new schedule: a connector that polls every 30
+minutes is never polled more often while broken than while healthy.
+
 ## Where things live
 
 | what | where |

@@ -31,6 +31,7 @@ use ea_core::store::retention::RetentionPolicy;
 use crate::notify::policy::NotifyConfig;
 use crate::notify::telegram::TelegramConfig;
 use crate::retention::{DEFAULT_LOG_MAX_BYTES, DEFAULT_RETENTION_INTERVAL_SECS};
+use crate::scheduler::{DEFAULT_BREAKER_COOLDOWN, MAX_BREAKER_COOLDOWN};
 use crate::triage::Tier0Rules;
 
 /// Name of the file under the config directory.
@@ -70,6 +71,10 @@ pub struct DaemonConfig {
     pub tier0: Tier0Rules,
     pub daily_session_budget: u32,
     pub breaker_threshold: u32,
+    /// How long a tripped job waits before its first half-open retry.
+    pub breaker_cooldown: Duration,
+    /// The ceiling that cooldown doubles up to on each failed retry.
+    pub breaker_max_cooldown: Duration,
     pub triage_interval: Duration,
     /// The model `ea chat` runs on. See [`DEFAULT_CHAT_MODEL`].
     pub chat_model: String,
@@ -156,6 +161,10 @@ struct RawConfig {
     daily_session_budget: Option<u32>,
     #[serde(default)]
     breaker_threshold: Option<u32>,
+    #[serde(default)]
+    breaker_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    breaker_max_cooldown_secs: Option<u64>,
     #[serde(default)]
     triage_interval_secs: Option<u64>,
     #[serde(default)]
@@ -273,6 +282,8 @@ impl Default for DaemonConfig {
             tier0: Tier0Rules::default(),
             daily_session_budget: DEFAULT_DAILY_SESSION_BUDGET,
             breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
+            breaker_cooldown: DEFAULT_BREAKER_COOLDOWN,
+            breaker_max_cooldown: MAX_BREAKER_COOLDOWN,
             triage_interval: Duration::from_secs(DEFAULT_TRIAGE_INTERVAL_SECS),
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             retention: RetentionSettings::default(),
@@ -360,6 +371,14 @@ impl DaemonConfig {
                 .breaker_threshold
                 .unwrap_or(DEFAULT_BREAKER_THRESHOLD)
                 .max(1),
+            breaker_cooldown: raw
+                .breaker_cooldown_secs
+                .map(|secs| Duration::from_secs(secs.max(1)))
+                .unwrap_or(DEFAULT_BREAKER_COOLDOWN),
+            breaker_max_cooldown: raw
+                .breaker_max_cooldown_secs
+                .map(|secs| Duration::from_secs(secs.max(1)))
+                .unwrap_or(MAX_BREAKER_COOLDOWN),
             triage_interval: Duration::from_secs(
                 raw.triage_interval_secs
                     .unwrap_or(DEFAULT_TRIAGE_INTERVAL_SECS)
@@ -430,6 +449,22 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("chat_model is empty"), "{text}");
         assert!(text.contains("claude-sonnet-4-5"), "{text}");
+    }
+
+    #[test]
+    fn the_breaker_cooldown_bounds_are_configurable_and_default_sanely() {
+        let dir = TempDir::new().unwrap();
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.breaker_cooldown, DEFAULT_BREAKER_COOLDOWN);
+        assert_eq!(config.breaker_max_cooldown, MAX_BREAKER_COOLDOWN);
+
+        write(
+            &dir,
+            "breaker_cooldown_secs = 30\nbreaker_max_cooldown_secs = 300\n",
+        );
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.breaker_cooldown, Duration::from_secs(30));
+        assert_eq!(config.breaker_max_cooldown, Duration::from_secs(300));
     }
 
     #[test]

@@ -143,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- scheduler ---------------------------------------------------------
-    let scheduler = Arc::new(Scheduler::new(config.breaker_threshold));
+    let scheduler = Arc::new(Scheduler::with_cooldown(
+        config.breaker_threshold,
+        config.breaker_cooldown,
+        config.breaker_max_cooldown,
+    ));
     for manifest in &manifests {
         scheduler.add(jobs::watch_job(
             manifest.name.clone(),
