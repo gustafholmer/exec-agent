@@ -22,6 +22,7 @@
 //! both return.
 
 pub mod auth;
+pub mod bank_import;
 pub mod client;
 pub mod domain;
 pub mod errors;

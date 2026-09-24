@@ -37,3 +37,6 @@ tempfile = "3"
 wiremock = "0.6"
 libc = "0.2"
 base64 = "0.22"
+calamine = { version = "0.36", features = ["dates"] }
+rust_xlsxwriter = "0.99"
+sha1 = "0.11"

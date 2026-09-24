@@ -11,11 +11,14 @@ path = "src/lib.rs"
 [dependencies]
 ea-core = { path = "../ea-core" }
 anyhow.workspace = true
+calamine.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
+rust_xlsxwriter.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
