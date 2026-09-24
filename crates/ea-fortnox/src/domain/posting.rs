@@ -57,11 +57,20 @@ pub struct ExpenseInput {
 ///   Upstream performs no such check and will happily book to `"abc"`; this is
 ///   a deliberate strengthening in the style of Task 3's line-level checks,
 ///   not a behaviour observed in the TypeScript.
+/// * an invalid `payment_account`, checked the same way and for the same
+///   reason. The two fields play symmetric roles — one is debited, the other
+///   credited, but both are BAS account numbers a caller could equally
+///   mistype — so validating one and not the other was an asymmetry with no
+///   justification, not a deliberate choice. In practice `payment_account` is
+///   always `"1930"` (bank) or `"2440"` (supplier debt), both class 1–2 and
+///   comfortably inside what [`class_of`] accepts.
 /// * an unsupported `vat_rate`, via [`split_gross`].
 /// * a negative `gross`, via [`split_gross`].
 pub fn build_expense_voucher(input: &ExpenseInput) -> Result<BuildVoucherInput> {
     class_of(&input.expense_account)
         .with_context(|| format!("invalid expense account {:?}", input.expense_account))?;
+    class_of(&input.payment_account)
+        .with_context(|| format!("invalid payment account {:?}", input.payment_account))?;
 
     let split = split_gross(input.gross, input.vat_rate)?;
 
@@ -218,6 +227,19 @@ mod tests {
             let err = build_expense_voucher(&input)
                 .expect_err(&format!("account {bad:?} should be rejected"));
             assert!(err.to_string().contains("invalid expense account"), "{err}");
+        }
+    }
+
+    /// A malformed payment account is an error, and names the account —
+    /// symmetric with the expense-account check above.
+    #[test]
+    fn an_invalid_payment_account_is_an_error() {
+        for bad in ["", "abcd", "19", "0000", "9000"] {
+            let mut input = expense("1250", 25);
+            input.payment_account = bad.to_string();
+            let err = build_expense_voucher(&input)
+                .expect_err(&format!("payment account {bad:?} should be rejected"));
+            assert!(err.to_string().contains("invalid payment account"), "{err}");
         }
     }
 
