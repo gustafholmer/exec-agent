@@ -442,7 +442,9 @@ name = "ea-fortnox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rust_decimal",
+ "serde_json",
 ]
 
 [[package]]

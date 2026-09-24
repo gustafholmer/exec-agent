@@ -19,4 +19,4 @@
 
 pub mod domain;
 
-pub use domain::{bas, moms, money};
+pub use domain::{bas, moms, money, voucher};
