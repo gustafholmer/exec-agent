@@ -19,6 +19,7 @@ path = "src/bin/authorize.rs"
 [dependencies]
 ea-core = { path = "../ea-core" }
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
