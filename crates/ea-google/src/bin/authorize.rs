@@ -52,8 +52,9 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const USAGE: &str = "usage: ea-google-authorize <account>\n\
     \n\
     <account> is a label of your choosing for one Google identity — typically\n\
-    \"work\" or \"private\". It must match ^[A-Za-z0-9][A-Za-z0-9_-]*$, because it\n\
-    becomes a filename under ~/.config/exec-agent/google/.";
+    \"work\" or \"private\". It must match ^[a-z0-9][a-z0-9_-]*$ — lower-case only,\n\
+    because it becomes a filename under ~/.config/exec-agent/google/, on a disk\n\
+    where \"work\" and \"Work\" would be the same file.";
 
 #[tokio::main]
 async fn main() -> ExitCode {

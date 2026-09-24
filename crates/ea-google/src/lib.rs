@@ -16,7 +16,9 @@
 //!   labels arrive from configuration *and* from tool arguments a language
 //!   model supplies, so `../../id_rsa` is a realistic input, not a thought
 //!   experiment. [`auth::TokenStore`] rejects anything outside
-//!   `^[A-Za-z0-9][A-Za-z0-9_-]*$` before it constructs a path.
+//!   `^[a-z0-9][a-z0-9_-]*$` before it constructs a path. Lower-case only:
+//!   the token files live on a case-insensitive volume, where `work` and
+//!   `Work` would be two labels sharing one file.
 //! * **A refresh is persisted and serialised.** A refresh that lives only in
 //!   memory means the next daemon restart re-authorises; two tasks refreshing
 //!   at once means two grants and a wasted one. [`auth::Auth`] writes through

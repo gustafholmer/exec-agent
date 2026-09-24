@@ -187,10 +187,15 @@ not stop you authorising the same mailbox twice under two names.
 Accounts are re-read on every poll, so authorising a second account while the
 daemon is running needs no restart.
 
-The account label is validated against `^[A-Za-z0-9][A-Za-z0-9_-]*$` before it
+The account label is validated against `^[a-z0-9][a-z0-9_-]*$` before it
 is ever turned into a path: the label reaches the token store from tool
 arguments a language model writes, so `../../id_rsa` is a realistic input rather
 than a thought experiment.
+
+Lower-case only. The label becomes `<label>.json`, and macOS' APFS is
+case-insensitive by default, so `work` and `Work` would be two accounts sharing
+one token file: authorising the second would overwrite the first's grant.
+`ea-google-authorize Work` is refused, and the error tells you to type `work`.
 
 ## Tools
 

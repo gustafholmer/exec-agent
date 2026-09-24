@@ -332,7 +332,7 @@ async fn a_traversing_account_label_is_refused_before_anything_is_bound() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("^[A-Za-z0-9][A-Za-z0-9_-]*$"),
+        stderr.contains("^[a-z0-9][a-z0-9_-]*$"),
         "stderr:\n{stderr}"
     );
 }

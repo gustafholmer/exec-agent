@@ -118,7 +118,7 @@ const BODY_SNIPPET: usize = 300;
 // Account names
 // ---------------------------------------------------------------------------
 
-/// Reject anything that is not `^[A-Za-z0-9][A-Za-z0-9_-]*$`, **before** a path
+/// Reject anything that is not `^[a-z0-9][a-z0-9_-]*$`, **before** a path
 /// is constructed from it.
 ///
 /// Account labels reach this crate from `connector.toml` and from tool
@@ -128,19 +128,40 @@ const BODY_SNIPPET: usize = 300;
 /// primitive and `write` an overwrite primitive. Checking the characters is
 /// stricter and simpler than trying to canonicalise a path that does not exist
 /// yet.
+///
+/// # Why lower-case only
+///
+/// A label becomes `~/.config/exec-agent/google/<label>.json`, and the
+/// owner's disk is APFS, which is case-*insensitive* by default. `work` and
+/// `Work` would therefore be two labels — two accounts as far as every other
+/// part of this crate is concerned — sharing one file: authorising `Work`
+/// would silently overwrite `work`'s grant, and a poll over both would fetch
+/// the same mailbox twice and report every message as two rows. Refusing the
+/// upper-case label outright is the only version of this that cannot surprise
+/// anyone, and it costs the owner one keystroke at authorisation time.
 pub fn validate_account(account: &str) -> anyhow::Result<()> {
+    let lower = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     let mut chars = account.chars();
     let ok = match chars.next() {
-        Some(first) if first.is_ascii_alphanumeric() => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        }
+        Some(first) if lower(first) => chars.all(|c| lower(c) || c == '_' || c == '-'),
         _ => false,
     };
     if !ok {
+        let hint = if account.chars().any(|c| c.is_ascii_uppercase()) {
+            format!(
+                " Labels are lower-case only, because they become filenames on a \
+                 case-insensitive disk where {:?} and {account:?} would be one file \
+                 holding two accounts' tokens; use {:?}.",
+                account.to_ascii_lowercase(),
+                account.to_ascii_lowercase()
+            )
+        } else {
+            String::new()
+        };
         bail!(
             "{account:?} is not a usable Google account label. A label must match \
-             ^[A-Za-z0-9][A-Za-z0-9_-]*$ (for example \"work\" or \"private\"); it \
-             becomes a filename, so \"/\" and \"..\" are refused."
+             ^[a-z0-9][a-z0-9_-]*$ (for example \"work\" or \"private\"); it \
+             becomes a filename, so \"/\" and \"..\" are refused.{hint}"
         );
     }
     Ok(())
@@ -1096,7 +1117,7 @@ mod tests {
 
             let err = store.read(bad).unwrap_err().to_string();
             assert!(
-                err.contains("^[A-Za-z0-9][A-Za-z0-9_-]*$"),
+                err.contains("^[a-z0-9][a-z0-9_-]*$"),
                 "read({bad:?}) must fail validation, not the filesystem: {err}"
             );
             assert!(
@@ -1117,8 +1138,28 @@ mod tests {
 
     #[test]
     fn ordinary_account_labels_are_accepted() {
-        for good in ["work", "private", "work-2", "work_2", "a", "A1"] {
+        for good in ["work", "private", "work-2", "work_2", "a", "a1"] {
             validate_account(good).unwrap_or_else(|e| panic!("{good:?} should be valid: {e}"));
+        }
+    }
+
+    /// The owner's volume is case-insensitive: `work` and `Work` would be two
+    /// labels sharing `work.json`, so authorising the second would overwrite
+    /// the first account's grant and a poll over both would report every
+    /// message twice. The refusal has to name the lower-case label, because
+    /// the person reading it is halfway through authorising.
+    #[test]
+    fn an_upper_case_account_label_is_refused_and_the_error_says_what_to_type() {
+        for bad in ["Work", "WORK", "wOrk", "Private"] {
+            let err = validate_account(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("lower-case only"),
+                "{bad:?} must be refused for its case, not obscurely: {err}"
+            );
+            assert!(
+                err.contains(&format!("{:?}", bad.to_ascii_lowercase())),
+                "the error must name the label to type instead: {err}"
+            );
         }
     }
 
@@ -1695,7 +1736,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("^[A-Za-z0-9][A-Za-z0-9_-]*$"), "{err}");
+        assert!(err.contains("^[a-z0-9][a-z0-9_-]*$"), "{err}");
         assert_eq!(backend.calls(), 0);
     }
 
