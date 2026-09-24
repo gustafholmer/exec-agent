@@ -18,5 +18,6 @@
 //! [`domain::bas`] holds the Swedish BAS chart of accounts.
 
 pub mod domain;
+pub mod reporting;
 
 pub use domain::{bas, moms, money, posting, voucher};
