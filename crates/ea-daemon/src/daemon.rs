@@ -510,7 +510,9 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// messages can never run two sessions against one conversation.
     ///
     /// A chat session gets no connectors and two write tools — `propose_action`
-    /// and `remember`, via `session::ALLOWED_TOOLS`. The first re-enters this
+    /// and `remember`, via `session::ToolScope::ProposeAndRemember` -- the only
+    /// scope that includes the second, and chat is the only kind that uses it,
+    /// because a chat prompt is the owner's own words. The first re-enters this
     /// daemon at `propose` and goes through the gate like anything else; the
     /// second writes a row to `facts`. Nothing a session can do reaches a
     /// connector directly.
@@ -1626,7 +1628,7 @@ record_voucher = "approve"
         let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
         assert!(seen[0].connectors.is_empty());
         assert_eq!(
-            crate::session::ALLOWED_TOOLS,
+            seen[0].tools.allowed_tools(),
             "mcp__ea-propose__propose_action,mcp__ea-propose__remember"
         );
     }

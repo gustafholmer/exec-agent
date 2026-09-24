@@ -45,7 +45,7 @@ use ea_core::store::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::session::{SessionOutcome, SessionRequest, SessionRunner};
+use crate::session::{SessionOutcome, SessionRequest, SessionRunner, ToolScope};
 
 /// How many events one tier-1 session scores. See the module docs for why this
 /// is a batch at all.
@@ -363,6 +363,15 @@ where
     let request = SessionRequest::new(TIER1_RUN_KIND, tier1_prompt(batch), TIER1_SYSTEM_PROMPT)
         // Empty, and explicit. Tier 1 scores what is already in the database.
         .with_connectors(Vec::<String>::new())
+        // No tools at all, and this is the security-relevant line in this
+        // file. The prompt above is built from event payloads -- an email
+        // body, a calendar title, a Notion page -- which are written by
+        // whoever sent them, not by the owner. A tier-1 session that could
+        // call `remember` would let that text write a durable fact, which the
+        // chat prompt reads back later: untrusted input arriving in a trusted
+        // position one session removed. Tier 1 answers in `structured_output`
+        // and needs no tool to do it, so it is given none.
+        .with_tools(ToolScope::Nothing)
         .with_json_schema(salience_schema())
         .with_model(TIER1_MODEL);
 
@@ -686,6 +695,42 @@ mod tests {
 
     fn scores(entries: Value) -> Option<Value> {
         Some(serde_json::json!({ "scores": entries }))
+    }
+
+    /// A tier-1 prompt is full of other people's words, so a tier-1 session
+    /// gets no tools.
+    ///
+    /// The review's finding: the allowlist was one global constant, so the
+    /// session that renders raw event payloads — email bodies, calendar
+    /// titles, Notion pages — into its prompt could call `remember`, and a
+    /// fact written there is spliced into the *chat* system prompt later.
+    /// That is untrusted input reaching a trusted position one session
+    /// removed. Tier 1 answers in `structured_output` and needs no tool to do
+    /// it.
+    ///
+    /// Do not widen this scope. If tier 1 ever needs a tool, the question to
+    /// answer first is who wrote the text in its prompt.
+    #[tokio::test]
+    async fn a_triage_session_cannot_write_durable_memory() {
+        use crate::session::{build_argv, McpConfig, ToolScope};
+
+        let sessions = FakeSessions::returning(scores(serde_json::json!([])));
+        tier1(&[plain(11)], &sessions).await.unwrap();
+
+        let request = sessions.last_request();
+        assert_eq!(request.tools, ToolScope::Nothing);
+
+        let mcp = McpConfig::for_session(std::path::Path::new("/opt/ea/ea-propose"), &[], &[])
+            .expect("the propose server is always present");
+        let argv = build_argv(&request, &mcp);
+        assert!(
+            !argv.iter().any(|arg| arg.contains("remember")),
+            "connector-authored text could write a durable fact: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.contains("mcp__")),
+            "a scoring session was handed a tool: {argv:?}"
+        );
     }
 
     #[tokio::test]

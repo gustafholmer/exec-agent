@@ -32,9 +32,11 @@ async fn spawn(state_dir: &std::path::Path) -> RunningService<RoleClient, ()> {
 /// pinned by name, not by length, so a rename or a swap fails too.
 ///
 /// These are also exactly the two entries in
-/// `ea_daemon::session::ALLOWED_TOOLS`. A tool advertised here and missing
-/// there is silently denied by the CLI, which looks like a model that never
-/// uses it rather than like a bug.
+/// `ea_daemon::session::ToolScope::ProposeAndRemember`, the widest scope any
+/// session gets — narrower scopes take tools away, never add them. A tool
+/// advertised here and missing from the scope that should reach it is silently
+/// denied by the CLI, which looks like a model that never uses it rather than
+/// like a bug.
 #[tokio::test]
 async fn the_live_server_advertises_exactly_the_two_tools() {
     let dir = tempfile::TempDir::new().unwrap();

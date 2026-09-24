@@ -546,7 +546,8 @@ mod tests {
     /// rename or a swap that keeps the count at two.
     ///
     /// Anything added here must also be added to
-    /// `ea_daemon::session::ALLOWED_TOOLS`, or the CLI denies it silently and
+    /// the scope in `ea_daemon::session::ToolScope` that should reach it, or
+    /// the CLI denies it silently and
     /// the tool looks like one the model simply never chooses.
     #[test]
     fn the_server_exposes_exactly_the_two_tools() {

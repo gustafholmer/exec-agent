@@ -13,9 +13,11 @@
 //! anything reaches the world is [`propose_action`](crate::session::PROPOSE_TOOL)
 //! through `ea_core::policy`. Nothing here weakens it:
 //!
-//! * `session::ALLOWED_TOOLS` is untouched. A briefing session, like every
-//!   other, may call exactly the two `ea-propose` tools and nothing
-//!   else. It is given no connector servers at all
+//! * A briefing session's tool scope is [`ToolScope::Propose`]: exactly
+//!   `propose_action`, and **not** `remember`. The material below is
+//!   connector-derived text written by whoever sent it, and a durable fact
+//!   written from here would be read back into the chat system prompt later;
+//!   see [`ToolScope`]. It is given no connector servers at all
 //!   ([`SessionRequest::with_connectors`] with an empty list), so there is not
 //!   even a server for a tool call to land on.
 //! * The connector reads a briefing needs are made by the **daemon**, before
@@ -54,7 +56,7 @@ use serde_json::{json, Value};
 use crate::executor::ToolCaller;
 use crate::jobs::Pusher;
 use crate::notify::log::NotificationLog;
-use crate::session::SessionRequest;
+use crate::session::{SessionRequest, ToolScope};
 use crate::triage::SessionBoundary;
 
 /// The model every briefing session runs on.
@@ -542,9 +544,18 @@ async fn deliver<C: ToolCaller>(
     let request = SessionRequest::new(kind, material.render(), system_prompt)
         // Empty, and explicit. A briefing is written from material the daemon
         // already gathered; handing it connector servers would give the model
-        // tools it cannot call anyway (see `session::ALLOWED_TOOLS`) and spawn
+        // tools it cannot call anyway (see `session::ToolScope`) and spawn
         // a child process per connector to do it.
         .with_connectors(Vec::<String>::new())
+        // `propose_action` and nothing else. A briefing reads material the
+        // daemon already gathered and reports on it; if it wants something
+        // changed it proposes, and the proposal goes through `Policy::decide`
+        // and waits for a human tap. It must **not** reach `remember`: the
+        // material rendered into this prompt is connector-derived text — an
+        // email body, a calendar title, a Notion page — written by whoever
+        // sent it. A briefing that could write a durable fact would let that
+        // text put words into the chat system prompt, one session later.
+        .with_tools(ToolScope::Propose)
         // Never left unset. See BRIEFING_MODEL.
         .with_model(BRIEFING_MODEL);
 
@@ -965,6 +976,47 @@ record_voucher = "approve"
     }
 
     // -- the morning briefing ----------------------------------------------
+
+    /// A briefing reports; it does not remember.
+    ///
+    /// The review's finding: the allowlist was one global constant, so a
+    /// briefing could call `remember` — and a briefing prompt is built from
+    /// connector-derived text (an email subject, a calendar title, a Notion
+    /// page) written by whoever sent it. A fact written from here is spliced
+    /// into the *chat* system prompt later, so that text would be reaching a
+    /// trusted position one session removed. A briefing keeps
+    /// `propose_action`, which goes through `Policy::decide` and waits for a
+    /// human tap; it gets nothing else.
+    ///
+    /// Do not widen this scope without answering who wrote the prompt.
+    #[tokio::test]
+    async fn a_briefing_session_cannot_write_durable_memory() {
+        use crate::session::{build_argv, McpConfig};
+
+        let f = fixture();
+        run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:00:00Z"),
+            utc("2026-09-24T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let request = f.sessions.requests().remove(0);
+        assert_eq!(request.tools, ToolScope::Propose);
+
+        let mcp = McpConfig::for_session(std::path::Path::new("/opt/ea/ea-propose"), &[], &[])
+            .expect("the propose server is always present");
+        let argv = build_argv(&request, &mcp);
+        assert!(
+            !argv.iter().any(|arg| arg.contains("remember")),
+            "connector-authored text could write a durable fact: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"mcp__ea-propose__propose_action".to_string()),
+            "a briefing still proposes, and the gate is what makes that safe: {argv:?}"
+        );
+    }
 
     #[tokio::test]
     async fn the_morning_briefing_carries_the_calendar_the_backlog_and_the_digest() {
