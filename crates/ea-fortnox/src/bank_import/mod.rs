@@ -2,6 +2,7 @@
 
 pub mod code;
 pub mod match_rules;
+pub mod post;
 pub mod types;
 pub mod voucher;
 pub mod workbook;
