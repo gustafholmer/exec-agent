@@ -21,6 +21,15 @@
 //!   workbook::read_forslag  ──→ post::run_post ──→ voucher::forslag_to_payload
 //! ```
 //!
+//! # None of this is wired up yet
+//!
+//! The pipeline above is complete and tested, and **nothing outside these
+//! modules' own tests calls any of it**. No MCP tool, binary, daemon job or
+//! CLI command reaches [`post::run_post`]. Before that changes, read the
+//! warning on [`post::run_post`] itself: it carries its own posting client,
+//! so a caller that is not routed through `propose_action` bypasses the
+//! approval gate that every other write in this system goes through.
+//!
 //! Two properties hold the whole thing together, and each has a module that
 //! exists for it:
 //!

@@ -290,6 +290,30 @@ fn is_iso_date(s: &str) -> bool {
 
 /// Post the approved rows, skipping the ones already booked.
 ///
+/// # UNREACHABLE AS SHIPPED — and the most likely place to break the gate
+///
+/// **Nothing calls this function outside its own tests.** It is not an MCP
+/// tool, not a binary, not reached by the daemon or the CLI; the whole
+/// `bank_import` module is translated, tested and dormant, waiting for the
+/// task that wires an import flow up. That is deliberate: it is kept so the
+/// translation does not have to be redone, and it is left disconnected
+/// because nobody has designed the human half of a bank import yet.
+///
+/// **If you are the one wiring it up, read this first.** `run_post` holds its
+/// own [`PostClient`] and POSTs vouchers through it directly. Every other
+/// write in this system reaches Fortnox only after `propose_action` has
+/// queued the action and a human has approved it — that is what
+/// `Policy::decide` governs, and it governs *tools*, not functions. A caller
+/// that hands `run_post` a live client bypasses the gate completely: real
+/// vouchers land in a real company's books with no proposal, no approval and
+/// no queue entry, and the only trace is in Fortnox.
+///
+/// So the future caller must be a *proposal*: turn the rows into an action
+/// that goes through `propose_action`, let the approved action drive the
+/// posting, and do not give this function a posting client from inside a
+/// session. This project has already shipped one gate bypass and had to fix
+/// it. This is where the next one would enter.
+///
 /// # Errors
 ///
 /// [`FiscalYearMissing`] when no financial year covers the target span,

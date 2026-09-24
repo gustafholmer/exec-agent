@@ -114,13 +114,29 @@ Where each value comes from:
 | `clientSecret` | The integration's **Client Secret**, shown in the portal. Half of what a code exchange needs; treat it like a password. |
 | `redirectUri` | Optional. Defaults to `http://localhost:8910/callback`; set it only if the portal entry says something else. |
 
-**Yours already exist.** The old TypeScript project holds the same registered
-integration's credentials in
-`~/dev/tryffle/dev0/apps/fortnox-mcp/.env`, as `FORTNOX_CLIENT_ID` and
-`FORTNOX_CLIENT_SECRET`. Those are the two values to paste above. Moving live
-financial credentials between projects is your call, not a build step's, so
-nothing in this repo copies them for you — and once `app.json` is in place, the
-old `.env` copy is a second place a secret lives, which is worth a thought.
+**Get both from the Developer Portal — not from the old project.** An earlier
+draft of this README said the two values were waiting in the old TypeScript
+project's `.env` and could simply be pasted across. They are not:
+`~/dev/tryffle/dev0/apps/fortnox-mcp/.env` declares `FORTNOX_CLIENT_ID` and
+`FORTNOX_CLIENT_SECRET` but leaves **both of them empty** — the lines are the
+key, an `=`, and nothing. That project was evidently fed its credentials some
+other way. So:
+
+1. Open <https://developer.fortnox.se/> and sign in.
+2. Open the integration this connector uses (the same one the old project
+   used — do not register a second one, or the consent screen will offer a
+   different set of scopes and the old grant's history will not apply).
+3. Copy its **Client ID** and **Client Secret** into `app.json` above. If the
+   secret is not displayed — portals usually show a secret once — regenerate
+   it. Regenerating invalidates the old secret, which is harmless here because
+   nothing is currently using it, but it does mean any other integration
+   holding that secret stops working.
+
+What the old `.env` *is* still good for is cross-checking the two values this
+repo hard-codes, and those two lines do carry values: `FORTNOX_REDIRECT_URI`
+must read `http://localhost:8910/callback`, and `FORTNOX_SCOPES` records the
+scope set the previous grant was actually given, which is what the comparison
+higher up this page is based on. Nothing in this repo reads that file.
 
 `app.json` must be mode `0600`; the connector refuses to load it otherwise,
 naming the path and the `chmod`. A connector with no `app.json` still starts and
@@ -166,7 +182,9 @@ has already cost this project a working integration once.
   the access token that came back works for an hour, nothing fails today, and
   the next refresh presents a token Fortnox retired an hour ago. `TokenManager`
   therefore persists *before* it returns, and a failure to persist is a loud,
-  specific error rather than a warning.
+  specific error rather than a warning. An *empty* rotation is refused outright:
+  a blank refresh token would deserialise fine and overwrite a working grant
+  with nothing, so the refresh errors and the stored token is left alone.
 - **A refresh token unused for 45 days lapses.** Nothing in this code can
   prevent that. The daemon polls daily, which keeps the grant warm — but a
   laptop that is off, a daemon that is stopped, or a connector left unconfigured
