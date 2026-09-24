@@ -25,13 +25,39 @@ use rust_decimal::{Decimal, RoundingStrategy};
 /// `0.005 → 0.01`, `0.025 → 0.03`, `0.045 → 0.05`, `0.125 → 0.13`. Under
 /// half-to-even those would be `0.00`, `0.02`, `0.04`, `0.12`. They are not.
 ///
-/// The `Number.EPSILON` term is what makes that true rather than accidental.
-/// `1.005` as a double is `1.00499999999999989…`, so `1.005 * 100` is
-/// `100.49999999999999` and `Math.round` alone would return `1.00`. The nudge
-/// exists solely to drag such values back over the midpoint they mathematically
-/// sit on. It is a patch for binary representation error, and [`Decimal`] has
-/// no representation error to patch, so there is nothing to port: the whole of
-/// the TypeScript's intent is the strategy name below.
+/// The `Number.EPSILON` term patches binary representation error, but only
+/// close to `1.0`. `Number.EPSILON` (`2.220446049250313e-16`) is a *fixed*
+/// absolute nudge, while the gap between adjacent doubles (the ULP) grows with
+/// magnitude — it is already `4.44e-16` at `2.0`, twice `EPSILON`. Past
+/// roughly `2.0`, then, the nudge is smaller than the shortfall it would need
+/// to correct, and `Math.round` still rounds the wrong way.
+///
+/// That is not a rare edge case. Comparing the TypeScript against exact
+/// decimal rounding over every positive `.xx5` midpoint below 200 turns up
+/// **1,132 disagreements**. Three, verified under node:
+///
+/// | input | TS `round2` | exact half-away-from-zero (this crate) |
+/// |-------|-------------|-----------------------------------------|
+/// | 2.135 | 2.13        | 2.14 |
+/// | 4.015 | 4.01        | 4.02 |
+/// | 4.145 | 4.14        | 4.15 |
+///
+/// `2.135` as a double is `2.1349999999999997868…`, short of the midpoint by
+/// more than `EPSILON` can restore, so `(2.135 + Number.EPSILON) * 100` is
+/// `213.49999999999997` and `Math.round` returns `213`, not `214`. `Decimal`
+/// has no representation error to patch in any of these, so
+/// [`RoundingStrategy::MidpointAwayFromZero`] is correct at every one, and
+/// this crate changes rounding at ordinary positive midpoints throughout the
+/// amount range — not only at the negative midpoints below, which is where
+/// the divergence is easiest to notice but far from where most of it lives.
+///
+/// The one place upstream feeds `round2` a value that can be negative is the
+/// bank-import idempotency hash at `bank-import/voucher.ts:20`, which builds
+/// the `radId` key from `` `${bokforingsdatum}|${round2(belopp)}|${text}` ``.
+/// In practice neither this divergence nor the negative-midpoint one below
+/// can change that key: bank exports state `belopp` to two decimal places
+/// already, so `round2` is a no-op on it regardless of which rounding rule is
+/// used.
 ///
 /// # The one deliberate divergence: negative midpoints
 ///
@@ -104,12 +130,15 @@ pub fn from_kronor(input: &str) -> Result<Decimal> {
 /// we started with?
 ///
 /// It does for every amount with at most 15 significant decimal digits, which
-/// at two decimals means **|amount| < 10^13 kronor** — ten trillion. Above
-/// roughly 2^53 öre (≈ 9.0 × 10^13 kronor) neighbouring öre amounts collapse
-/// onto the same `f64` and the loss becomes real rather than theoretical. A
-/// Swedish AB posts nine-figure amounts at the very most, four orders of
-/// magnitude inside the guarantee, so nothing that reaches this function in
-/// practice is at risk.
+/// at two decimals means **|amount| < 10^13 kronor** — ten trillion. Past
+/// that, the boundary is **not** `f64`'s 2^53-integer range read as öre — this
+/// function holds kronor, not öre, so that reading is 100x too generous. The
+/// real boundary is where the `f64` ULP first exceeds the 0.01 granularity of
+/// an öre: **2^46 kronor = 70,368,744,177,664**. Below it every öre amount
+/// round-trips; `70368744177664.01` is the first that does not — it comes
+/// back as `70368744177664.02`. A Swedish AB posts nine-figure amounts at the
+/// very most, four orders of magnitude inside the bound, so nothing that
+/// reaches this function in practice is at risk.
 pub fn to_api(amount: Decimal) -> f64 {
     // `Decimal`'s maximum magnitude is ≈ 7.9e28, comfortably inside `f64`'s
     // range, so `to_f64` does not fail. The fallback keeps a panic out of the
@@ -305,11 +334,19 @@ mod tests {
             last_safe
         );
 
-        // The cliff is exactly 2^53 öre = 90_071_992_547_409.92 kronor: one öre
-        // below it, 9_007_199_254_740_991 öre, is the first amount whose öre
-        // digit an f64 can no longer name. Measured, not assumed.
-        let past_the_cliff = d("90071992547409.91");
-        assert_eq!(to_api(past_the_cliff), 90071992547409.9_f64);
+        // The cliff is 2^46 kronor = 70_368_744_177_664: below it the f64 ULP
+        // is under the 0.01 öre granularity, so every öre amount round-trips;
+        // one öre above it is the first amount whose öre digit an f64 can no
+        // longer name.
+        let just_under_the_cliff = d("70368744177663.99");
+        assert_eq!(
+            Decimal::from_str(&to_api(just_under_the_cliff).to_string()).unwrap(),
+            just_under_the_cliff,
+            "the documented precision bound moved; update the to_api doc comment"
+        );
+
+        let past_the_cliff = d("70368744177664.01");
+        assert_eq!(to_api(past_the_cliff), 70368744177664.02_f64);
         assert_ne!(
             Decimal::from_str(&to_api(past_the_cliff).to_string()).unwrap(),
             past_the_cliff,

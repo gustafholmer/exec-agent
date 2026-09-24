@@ -55,8 +55,15 @@ pub fn class_label(class: u8) -> Option<&'static str> {
 /// * The class must be **1–8**. A leading `0` would otherwise come back as the
 ///   "silent zero" that no label, no report and no predicate can do anything
 ///   with. Class 9 is reserved for internal/statistical accounts, which this
-///   crate does not handle; the whole corpus this was ported from uses nothing
-///   outside 1220–8410.
+///   crate does not handle; every four-digit account number written literally
+///   in the TypeScript source falls in 1220–8410. That is weaker evidence
+///   than it looks: it covers literals grepped out of the TypeScript, not the
+///   live Fortnox chart the predicates actually run over at a real company,
+///   which can contain class-9 accounts the source never had reason to name.
+///   `reporting.ts:41` already carries a `` `Klass ${c}` `` fallback label for
+///   an unrecognised class, i.e. upstream itself does not assume the corpus
+///   is exhaustive — if a later task needs class 9, this is the function to
+///   widen.
 pub fn class_of(account: &str) -> Result<u8> {
     let trimmed = account.trim();
     if trimmed.is_empty() {
