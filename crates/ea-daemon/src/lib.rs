@@ -12,10 +12,12 @@
 //! executor. Wiring a tool-invocation method into the IPC server would hand
 //! every client of the socket arbitrary tool calls with the gate bypassed.
 
+pub mod config;
 pub mod connectors;
 pub mod daemon;
 pub mod executor;
 pub mod ipc;
+pub mod jobs;
 pub mod notify;
 pub mod scheduler;
 pub mod session;

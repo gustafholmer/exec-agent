@@ -96,6 +96,7 @@ use anyhow::{anyhow, bail, Context};
 use ea_core::store::actions::{ActionStatus, ActionStore};
 
 use crate::executor::{Executor, ToolCaller};
+use crate::notify::updates::{Update, UpdateSource};
 
 /// Callback-data verb for the approve button.
 pub const APPROVE: &str = "approve";
@@ -133,7 +134,7 @@ pub const OWNER_ID_FILE: &str = "telegram.owner_id";
 /// found the bot could walk the action ids by diffing responses and learn
 /// which vouchers are pending. One constant, so the two texts cannot drift
 /// apart in a later edit.
-const UNRECOGNISED_REPLY: &str = "That button is not one I recognise. Nothing was done.";
+pub const UNRECOGNISED_REPLY: &str = "That button is not one I recognise. Nothing was done.";
 
 /// How long one Bot API call may take before it is abandoned.
 ///
@@ -450,13 +451,14 @@ impl fmt::Debug for TelegramConfig {
     }
 }
 
-/// Read a secret file, insisting it is not readable by anyone else.
+/// Refuse `path` unless it is readable by its owner alone.
 ///
 /// The mode check is not decoration. A bot token in a world-readable file in a
 /// shared home directory is a credential handed to every process on the box,
-/// and the failure is silent. Note what the error messages contain: the path,
-/// never the contents.
-fn read_secret(path: &Path) -> anyhow::Result<String> {
+/// and the failure is silent. Note what the error message contains: the path,
+/// never the contents. Public because `config.toml` is held to the same
+/// standard once it carries a token.
+pub fn require_owner_only(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
@@ -469,6 +471,17 @@ fn read_secret(path: &Path) -> anyhow::Result<String> {
             path.display()
         );
     }
+    Ok(())
+}
+
+/// Read a secret file, insisting it is not readable by anyone else.
+///
+/// The mode check is not decoration. A bot token in a world-readable file in a
+/// shared home directory is a credential handed to every process on the box,
+/// and the failure is silent. Note what the error messages contain: the path,
+/// never the contents.
+pub fn read_secret(path: &Path) -> anyhow::Result<String> {
+    require_owner_only(path)?;
 
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -479,10 +492,40 @@ fn read_secret(path: &Path) -> anyhow::Result<String> {
     Ok(value)
 }
 
+/// The token goes into the Bot API *URL path*. A stray `/` or `?` in it would
+/// not be a bad credential, it would be a request to a different endpoint, so
+/// the charset is checked rather than trusted. The error says where the token
+/// came from, and never quotes it.
+fn check_token_charset(token: &str, source: &str) -> anyhow::Result<()> {
+    if token.is_empty() {
+        bail!("{source} holds an empty Telegram bot token");
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+    {
+        bail!("{source} does not look like a Telegram bot token (unexpected characters)");
+    }
+    Ok(())
+}
+
 impl TelegramConfig {
     /// Load from `~/.config/exec-agent` (or `$EA_CONFIG_DIR`).
     pub fn load() -> anyhow::Result<Self> {
         Self::load_from(&ea_core::paths::config_dir())
+    }
+
+    /// Build from values that came from somewhere other than the three files —
+    /// today, the `[telegram]` block of `config.toml`. The token still goes
+    /// through the same charset check.
+    pub fn from_parts(token: String, chat_id: i64, owner_id: i64) -> anyhow::Result<Self> {
+        let token = token.trim().to_string();
+        check_token_charset(&token, "the configured Telegram bot token")?;
+        Ok(Self {
+            token,
+            chat_id,
+            owner_id: TelegramUserId(owner_id),
+        })
     }
 
     /// Load from an explicit directory. Used by tests, and by anyone running
@@ -491,19 +534,7 @@ impl TelegramConfig {
         let token_path: PathBuf = dir.join(TOKEN_FILE);
         let token = read_secret(&token_path)?;
 
-        // The token goes into the Bot API *URL path*. A stray `/` or `?` in it
-        // would not be a bad credential, it would be a request to a different
-        // endpoint, so the charset is checked rather than trusted. The error
-        // says which file, and does not quote what was in it.
-        if !token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
-        {
-            bail!(
-                "{} does not look like a Telegram bot token (unexpected characters)",
-                token_path.display()
-            );
-        }
+        check_token_charset(&token, &token_path.display().to_string())?;
 
         let chat_path = dir.join(CHAT_ID_FILE);
         let chat_raw = std::fs::read_to_string(&chat_path)
@@ -675,6 +706,124 @@ impl Transport for TelegramTransport {
             }
         }
     }
+}
+
+/// The long-poll end of the Bot API, for [`crate::notify::updates::UpdateLoop`].
+///
+/// Lives here rather than in `updates` because the token is a private field of
+/// this struct and must stay one: the update loop never sees it, and cannot
+/// accidentally log it.
+impl UpdateSource for TelegramTransport {
+    fn get_updates(
+        &self,
+        offset: Option<i64>,
+        timeout_secs: u64,
+    ) -> impl Future<Output = anyhow::Result<Vec<Update>>> + Send {
+        let url = format!("{}/bot{}/getUpdates", self.base, self.token);
+        let mut body = serde_json::json!({
+            "timeout": timeout_secs,
+            // Nothing else is acted on, and asking for less means Telegram's
+            // reply cannot carry the text of the owner's private messages.
+            "allowed_updates": ["callback_query"],
+        });
+        if let Some(offset) = offset {
+            body["offset"] = serde_json::json!(offset);
+        }
+
+        // The client's own 30-second timeout is for a `sendMessage`; a long
+        // poll is *designed* to hang for `timeout_secs`, so it gets its own
+        // deadline with room for the round trip on top. Without this override
+        // every idle poll would be reported as a network failure.
+        let request = self
+            .http
+            .post(url)
+            .json(&body)
+            .timeout(Duration::from_secs(timeout_secs + 15));
+
+        async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|err| err.without_url())
+                .context("polling Telegram for updates")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| err.without_url())
+                .context("reading Telegram's update batch")?;
+
+            let envelope: UpdatesReply = match serde_json::from_str(&body) {
+                Ok(envelope) => envelope,
+                Err(err) => bail!(
+                    "Telegram's getUpdates reply was not the documented envelope \
+                     (HTTP {status}): {err}: {}",
+                    truncate(&body, 300)
+                ),
+            };
+            if !envelope.ok {
+                bail!(
+                    "Telegram refused getUpdates (HTTP {status}): {}",
+                    truncate(
+                        envelope.description.as_deref().unwrap_or("no reason given"),
+                        300
+                    )
+                );
+            }
+            Ok(envelope.result)
+        }
+    }
+
+    fn answer_callback(
+        &self,
+        callback_id: &str,
+        text: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        let url = format!("{}/bot{}/answerCallbackQuery", self.base, self.token);
+        let request = self.http.post(url).json(&serde_json::json!({
+            "callback_query_id": callback_id,
+            "text": text,
+        }));
+
+        async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|err| err.without_url())
+                .context("answering a Telegram callback query")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| err.without_url())
+                .context("reading Telegram's reply")?;
+            let envelope: Option<ApiReply> = serde_json::from_str(&body).ok();
+            match envelope {
+                Some(reply) if reply.ok => Ok(()),
+                other => bail!(
+                    "Telegram rejected answerCallbackQuery (HTTP {status}): {}",
+                    truncate(
+                        other
+                            .as_ref()
+                            .and_then(|r| r.description.as_deref())
+                            .unwrap_or(&body),
+                        300
+                    )
+                ),
+            }
+        }
+    }
+}
+
+/// `getUpdates`' envelope. Separate from [`ApiReply`] only because it carries
+/// a `result` this daemon actually reads.
+#[derive(serde::Deserialize)]
+struct UpdatesReply {
+    ok: bool,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    result: Vec<Update>,
 }
 
 #[cfg(test)]
@@ -1510,5 +1659,177 @@ record_voucher = "approve"
             HTTP_TIMEOUT > Duration::ZERO,
             "a timeout of zero is no timeout"
         );
+    }
+    // -- the long-poll half of the wire (Task 13, Addition 1) ---------------
+    //
+    // Same reasoning as the `sendMessage` stub above: the request shape is the
+    // part that cannot be checked by the type system, and a `getUpdates` with
+    // the offset spelled wrong would silently replay every tap forever.
+    // Pointed at a local stub; nothing here reaches Telegram.
+
+    #[tokio::test]
+    async fn get_updates_sends_the_offset_and_parses_a_callback_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:TOKEN/getUpdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"ok":true,"result":[
+                    {"update_id":41,
+                     "callback_query":{
+                        "id":"cb-1",
+                        "from":{"id":10000001,"is_bot":false,"first_name":"G"},
+                        "message":{"message_id":9,"chat":{"id":-42,"type":"private"}},
+                        "data":"approve:7"}}]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        let updates = transport.get_updates(Some(41), 25).await.unwrap();
+
+        assert_eq!(updates.len(), 1);
+        let query = updates[0].callback_query.as_ref().unwrap();
+        assert_eq!(updates[0].update_id, 41);
+        assert_eq!(query.from.id, 10_000_001, "the identity is from.id");
+        assert_eq!(query.message.as_ref().unwrap().chat.id, -42);
+        assert_eq!(query.data.as_deref(), Some("approve:7"));
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["offset"], 41);
+        assert_eq!(body["timeout"], 25);
+        assert_eq!(
+            body["allowed_updates"],
+            serde_json::json!(["callback_query"]),
+            "asking for less means the reply cannot carry private message text"
+        );
+    }
+
+    /// The very first poll after a fresh install has no offset to confirm.
+    #[tokio::test]
+    async fn get_updates_omits_the_offset_when_there_is_none() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true,"result":[]}"#))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        assert!(transport.get_updates(None, 25).await.unwrap().is_empty());
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("offset").is_none(), "{body}");
+    }
+
+    /// An update kind this build has never modelled must not fail the whole
+    /// batch: the offset still has to advance past it.
+    #[tokio::test]
+    async fn an_unmodelled_update_kind_parses_as_an_ignorable_update() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"ok":true,"result":[
+                    {"update_id":7,"message":{"message_id":1,"text":"hello"}},
+                    {"update_id":8,"some_future_field":{"x":1}}]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        let updates = transport.get_updates(None, 25).await.unwrap();
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u.callback_query.is_none()));
+        assert_eq!(updates[1].update_id, 8);
+    }
+
+    /// HTTP 200 with `ok: false` is how Telegram reports "your token is
+    /// wrong". A status-code-only check would call that a successful poll and
+    /// the loop would spin on it forever without the breaker ever seeing one.
+    #[tokio::test]
+    async fn get_updates_treats_ok_false_as_a_failure_without_leaking_the_token() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:SECRET", -42).unwrap();
+        let err = transport.get_updates(None, 25).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("Unauthorized"), "{text}");
+        assert!(
+            !text.contains("SECRET"),
+            "the token must not reach a log: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_callback_query_posts_the_id_and_the_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:TOKEN/answerCallbackQuery"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"ok":true,"result":true}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        transport
+            .answer_callback("cb-1", "Executed #7.")
+            .await
+            .unwrap();
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["callback_query_id"], "cb-1");
+        assert_eq!(body["text"], "Executed #7.");
+    }
+
+    #[tokio::test]
+    async fn a_refused_callback_answer_is_an_error_without_the_token() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"ok":false,"description":"query is too old"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:SECRET", -42).unwrap();
+        let err = transport.answer_callback("cb-1", "hi").await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("too old"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
     }
 }

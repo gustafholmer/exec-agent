@@ -10,8 +10,12 @@
 //! ([`telegram::TelegramTransport`]) so that everything worth getting wrong is
 //! testable without a network.
 
+pub mod log;
 pub mod policy;
 pub mod telegram;
+pub mod updates;
 
+pub use log::NotificationLog;
 pub use policy::{NotificationPolicy, NotifyConfig, Verdict};
 pub use telegram::{Notifier, TelegramConfig, TelegramTransport, TelegramUserId, Transport};
+pub use updates::{OffsetStore, UpdateLoop, UpdateSource};
