@@ -6,6 +6,7 @@ members = [
   "crates/ea-cli",
   "crates/ea-echo",
   "crates/ea-propose",
+  "crates/ea-canvas",
 ]
 
 [workspace.package]
