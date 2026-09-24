@@ -23,17 +23,47 @@ pub const APP_CONFIG_FILE: &str = "app.json";
 
 /// The redirect URI the authorize command listens on, and the one that must be
 /// registered in the Fortnox Developer Portal. Fortnox matches it exactly.
-pub const DEFAULT_REDIRECT_URI: &str = "http://localhost:8723/callback";
+///
+/// The port is **not** arbitrary. `http://localhost:8910/callback` is what the
+/// integration this connector replaces already has registered in the portal
+/// (`FORTNOX_REDIRECT_URI` in the TypeScript project's `.env`), so re-using it
+/// means the owner does not have to edit the portal entry at all — and an
+/// exact-match failure there is reported by Fortnox as a generic error with no
+/// hint that the URI is the cause. An earlier draft of this file guessed 8723;
+/// that guess would have cost a person a confusing afternoon.
+pub const DEFAULT_REDIRECT_URI: &str = "http://localhost:8910/callback";
 
-/// The scopes this connector asks for. `bookkeeping` covers vouchers and
-/// accounts, `invoice` and `supplierinvoice` the two unpaid-invoice lists,
-/// `archive` the receipt upload, `settings` the financial years.
+/// The scopes this connector asks for.
+///
+/// Derived from the endpoints the connector actually calls, cross-checked
+/// against the scope set the working TypeScript integration was granted:
+///
+/// | scope | what it is for here |
+/// |---|---|
+/// | `bookkeeping` | `/vouchers`, `/accounts`, `/financialyears` |
+/// | `invoice` | `/invoices` — kundfakturor, and `watch_poll`'s only signal |
+/// | `supplierinvoice` | `/supplierinvoices` — leverantörsfakturor |
+/// | `customer` | `/customers`, for the names on an invoice |
+/// | `archive` | `/inbox` and `/voucherfileconnections` — `attach_receipt` |
+///
+/// Two things deliberately absent. **`settings`** was in an earlier draft on
+/// the assumption that `/financialyears` needs it; the TypeScript integration
+/// reads `/financialyears` every day and was never granted `settings`, so
+/// `bookkeeping` covers it. **`supplier`** and **`companyinformation`** were
+/// granted to the TypeScript integration but nothing in this connector reaches
+/// `/suppliers` or `/companyinformation`, and a scope nothing uses is a scope
+/// that should not be asked for.
+///
+/// `archive` is the one direction this list is *wider* than the grant that
+/// exists today: `attach_receipt` is reached through `/inbox`, and the live
+/// `.env` does not carry `archive`. If consent fails naming a scope, that is
+/// the one — enable it on the integration in the Developer Portal.
 pub const SCOPES: &[&str] = &[
     "bookkeeping",
     "invoice",
     "supplierinvoice",
+    "customer",
     "archive",
-    "settings",
 ];
 
 /// The registered integration, as stored on disk.

@@ -566,6 +566,7 @@ dependencies = [
  "chrono",
  "ea-core",
  "ea-fortnox",
+ "reqwest",
  "rmcp",
  "rust_decimal",
  "serde",
@@ -575,6 +576,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 
