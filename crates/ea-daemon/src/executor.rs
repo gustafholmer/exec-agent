@@ -50,6 +50,23 @@ pub trait ToolCaller {
     ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send;
 }
 
+/// Sharing one caller between the executor and the scheduler's poll jobs.
+///
+/// The executor takes its caller by value, and the `watch_poll` jobs need the
+/// very same [`Registry`] — a second registry would mean a second child
+/// process per connector, two warm clients, and two sets of credentials open
+/// on the same account. One `Arc`, two owners.
+impl<T: ToolCaller + Send + Sync + ?Sized> ToolCaller for std::sync::Arc<T> {
+    fn call(
+        &self,
+        connector: &str,
+        tool: &str,
+        args: Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+        T::call(self, connector, tool, args)
+    }
+}
+
 impl ToolCaller for Registry {
     fn call(
         &self,

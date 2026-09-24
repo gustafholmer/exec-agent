@@ -1359,7 +1359,18 @@ mod tests {
             NeverCalls,
         );
         let mut server = crate::ipc::Server::new(&socket);
-        crate::daemon::Daemon::new(Arc::new(executor)).register(&mut server);
+        crate::daemon::Daemon::build(crate::daemon::Deps {
+            executor: Arc::new(executor),
+            actions: ActionStore::new(Arc::clone(&conn)),
+            conversations: ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
+            runs: RunStore::new(Arc::clone(&conn)),
+            scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
+            sessions: None,
+            pusher: None,
+            connectors: Vec::new(),
+            daily_session_budget: 60,
+        })
+        .register(&mut server);
         let daemon = server.spawn().await.expect("binding the daemon socket");
 
         let cwd = dir.path().join("session-cwd");
