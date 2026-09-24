@@ -148,6 +148,18 @@ pub struct Scheduler {
     breaker_threshold: u32,
     jobs: Mutex<Vec<Arc<JobState>>>,
     paused: AtomicBool,
+    /// Handles to the invocations [`Scheduler::start`]'s loop has spawned and
+    /// that have not been observed to finish.
+    ///
+    /// `start` used to discard what `tick` returned, which meant there was no
+    /// way to wait for in-flight work on the way out: `launchd` sends SIGTERM,
+    /// the process exits, and a `watch_poll` that was halfway through writing
+    /// events is simply cut off. Aborting them would be *safe* -- the overlap
+    /// marker is cleared by a guard the spawned future owns, so it clears on
+    /// drop too -- but safe is not the same as finished, and a job mid-write
+    /// is better waited for. Reaped on every tick so the vector does not grow
+    /// for the life of the process.
+    in_flight: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Scheduler {
@@ -171,6 +183,7 @@ impl Scheduler {
             breaker_threshold,
             jobs: Mutex::new(Vec::new()),
             paused: AtomicBool::new(false),
+            in_flight: Mutex::new(Vec::new()),
         }
     }
 
@@ -309,7 +322,13 @@ impl Scheduler {
                     state.failure_count.store(0, Ordering::SeqCst);
                     *lock(&state.last_error) = None;
                 }
-                Ok(Err(err)) => Self::record_failure(&state, threshold, err.to_string()),
+                // `{:#}` rather than `{}`: an `anyhow` error prints only its
+                // outermost context by default, and the outermost context
+                // here is something like "polling connector canvas", which is
+                // a restatement of the job's name rather than a reason. The
+                // alternate form appends the chain -- "...: 401 Unauthorized"
+                // -- which is the half `ea status` exists to show.
+                Ok(Err(err)) => Self::record_failure(&state, threshold, format!("{err:#}")),
                 Err(panic) => Self::record_failure(&state, threshold, panic_message(panic)),
             }
         }))
@@ -337,9 +356,72 @@ impl Scheduler {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                let _ = this.tick(Instant::now());
+                let spawned = this.tick(Instant::now());
+                this.retain(spawned);
             }
         })
+    }
+
+    /// Keep the handles this tick produced, dropping the ones that have
+    /// already finished.
+    fn retain(&self, spawned: Vec<JoinHandle<()>>) {
+        let mut in_flight = lock(&self.in_flight);
+        in_flight.retain(|handle| !handle.is_finished());
+        in_flight.extend(spawned);
+    }
+
+    /// How many spawned invocations this scheduler is still holding a handle
+    /// for. Approximate by nature -- a job that finished a microsecond ago is
+    /// still counted until the next tick reaps it -- and used by tests and by
+    /// the shutdown path's logging, never as a decision input.
+    pub fn in_flight(&self) -> usize {
+        lock(&self.in_flight)
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count()
+    }
+
+    /// Wait, for at most `timeout`, for every in-flight invocation to finish.
+    /// Returns `true` if they all did.
+    ///
+    /// This is the shutdown drain. The caller is expected to [`pause`] first,
+    /// so that no *new* invocation is spawned while this is waiting; pausing
+    /// is what makes the bound meaningful rather than a race with the tick
+    /// loop.
+    ///
+    /// Anything still running when the timeout expires is **not** aborted
+    /// here: the handles are simply dropped, which detaches the tasks and lets
+    /// the runtime's own shutdown deal with them. Dropping a `JoinHandle` does
+    /// not cancel its task, so a job that is one statement from committing
+    /// gets that statement; and because the overlap marker lives in a guard
+    /// owned by the spawned future, nothing leaks either way.
+    ///
+    /// [`pause`]: Scheduler::pause
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *lock(&self.in_flight));
+        if handles.is_empty() {
+            return true;
+        }
+        tracing::info!(jobs = handles.len(), "draining in-flight scheduler jobs");
+        let waited = tokio::time::timeout(timeout, async {
+            for handle in handles {
+                // A job that panicked is already recorded as a failure by
+                // `maybe_spawn`; the join error is of no further interest.
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        match waited {
+            Ok(()) => true,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    ?timeout,
+                    "scheduler jobs did not finish within the shutdown timeout"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -762,5 +844,146 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("job never became runnable again after being aborted before its first poll");
+    }
+    // -- the shutdown drain (Task 13, Addition 2) --------------------------
+
+    /// A job that records whether it ran to completion, so a drain can be
+    /// distinguished from an abort: an aborted future never reaches the flag.
+    fn completing_job(name: &str, interval: Duration, delay: Duration) -> (Job, Arc<AtomicBool>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let job = Job::new(name, interval, move || {
+            let flag = Arc::clone(&flag);
+            async move {
+                tokio::time::sleep(delay).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        (job, done)
+    }
+
+    /// The point of retaining handles at all: SIGTERM must not cut a
+    /// `watch_poll` off halfway through writing events.
+    #[tokio::test]
+    async fn drain_waits_for_a_job_that_is_still_running() {
+        let sched = Arc::new(Scheduler::new(3));
+        let (job, done) =
+            completing_job("slow", Duration::from_secs(60), Duration::from_millis(80));
+        sched.add(job);
+
+        let spawned = sched.tick(Instant::now());
+        assert_eq!(spawned.len(), 1);
+        sched.retain(spawned);
+        assert_eq!(
+            sched.in_flight(),
+            1,
+            "the handle must be retained, not dropped"
+        );
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the job cannot have finished yet"
+        );
+
+        assert!(
+            sched.drain(Duration::from_secs(5)).await,
+            "drain must succeed"
+        );
+        assert!(
+            done.load(Ordering::SeqCst),
+            "a drained job must have run to completion, not been cut off"
+        );
+        assert_eq!(sched.in_flight(), 0);
+    }
+
+    /// The bound is real: a job that will not finish must not hold shutdown
+    /// open forever.
+    #[tokio::test]
+    async fn drain_gives_up_after_its_timeout() {
+        let sched = Arc::new(Scheduler::new(3));
+        let (job, done) = completing_job("stuck", Duration::from_secs(60), Duration::from_secs(30));
+        sched.add(job);
+        sched.retain(sched.tick(Instant::now()));
+
+        let started = Instant::now();
+        assert!(
+            !sched.drain(Duration::from_millis(50)).await,
+            "drain must report that it gave up"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and must not block"
+        );
+        assert!(!done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn draining_with_nothing_in_flight_returns_immediately() {
+        let sched = Arc::new(Scheduler::new(3));
+        assert!(sched.drain(Duration::from_millis(1)).await);
+    }
+
+    /// Pausing before draining is what makes the bound meaningful: no new
+    /// invocation may be spawned while shutdown is waiting.
+    #[tokio::test]
+    async fn a_paused_scheduler_spawns_nothing_more_while_draining() {
+        let sched = Arc::new(Scheduler::new(3));
+        let probe = Probe::new();
+        sched.add(probe.ok_job("poll", Duration::from_millis(1)));
+        sched.retain(sched.tick(Instant::now()));
+        assert!(sched.drain(Duration::from_secs(5)).await);
+        assert_eq!(probe.calls(), 1);
+
+        sched.pause();
+        assert!(sched
+            .tick(Instant::now() + Duration::from_secs(10))
+            .is_empty());
+        assert_eq!(probe.calls(), 1, "a paused scheduler must spawn nothing");
+    }
+
+    /// Retained handles must not accumulate for the life of the process.
+    #[tokio::test]
+    async fn finished_handles_are_reaped_rather_than_accumulating() {
+        let sched = Arc::new(Scheduler::new(3));
+        let probe = Probe::new();
+        sched.add(probe.ok_job("poll", Duration::from_millis(0)));
+
+        for i in 0..5 {
+            sched.retain(sched.tick(Instant::now() + Duration::from_secs(i)));
+            // The job body is instantaneous; a couple of yields is enough for
+            // the spawned task to run and for `is_finished` to say so.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+        // One more tick to reap whatever the last round left behind.
+        sched.retain(sched.tick(Instant::now() + Duration::from_secs(10)));
+        assert!(
+            sched.in_flight() <= 1,
+            "finished handles must be reaped, found {}",
+            sched.in_flight()
+        );
+    }
+
+    /// `ea status` shows this string. It has to be the reason, not the label:
+    /// an `anyhow` error's default `Display` prints only its outermost
+    /// context, which for a connector poll is "polling connector canvas" —
+    /// a restatement of the job name.
+    #[tokio::test]
+    async fn the_recorded_failure_carries_the_whole_error_chain() {
+        let sched = Arc::new(Scheduler::new(1));
+        sched.add(Job::new("canvas", Duration::from_secs(60), || async {
+            Err(anyhow::anyhow!("401 Unauthorized").context("polling connector canvas"))
+        }));
+        await_all(sched.tick(Instant::now())).await;
+
+        let recorded = sched
+            .last_error("canvas")
+            .expect("a failure must be recorded");
+        assert!(recorded.contains("polling connector canvas"), "{recorded}");
+        assert!(
+            recorded.contains("401 Unauthorized"),
+            "the reason must survive: {recorded}"
+        );
+        assert!(sched.is_tripped("canvas"));
     }
 }
