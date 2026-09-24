@@ -25,6 +25,16 @@
 //!   failed) the breaker, so `ea status` has something to show the owner
 //!   beyond "not running" -- this is not in the brief's interface sketch, but
 //!   a breaker that trips silently is worse than no breaker at all.
+//! - **A tripped breaker is temporary.** This daemon runs unattended for
+//!   weeks; a breaker that only a restart could clear turns a transient
+//!   outage -- an expired session, a Canvas maintenance window, a flaky
+//!   network -- into a permanent one, and the owner finds out weeks later by
+//!   noticing that nothing has happened. So the breaker is *half-open* after
+//!   a cooling-off period ([`DEFAULT_BREAKER_COOLDOWN`], doubling to
+//!   [`MAX_BREAKER_COOLDOWN`]): one attempt is allowed, a success closes the
+//!   breaker, a failure re-opens it and waits longer. A human can short-cut
+//!   the wait with [`Scheduler::reset`], which `ea resume <job>` reaches over
+//!   the socket.
 //!
 //! `tick` takes the clock explicitly so callers -- tests, and [`Scheduler::start`]
 //! -- decide how time advances; nothing in here reads the wall clock itself
@@ -39,6 +49,29 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use tokio::task::JoinHandle;
+
+/// How long a tripped breaker waits before allowing one half-open attempt.
+///
+/// Five minutes. The shortest interval anything here actually runs on is the
+/// triage pass at five minutes and a connector `watch_poll` at five to thirty,
+/// so a cooldown shorter than this would only retry inside a window the job
+/// would not have run in anyway. Longer would be worse: the breaker exists to
+/// stop a *storm* of failing calls, and five failing calls spread over five
+/// minutes is not a storm. Note that the cooldown is a floor, not a schedule:
+/// a job whose own interval is longer keeps its own interval (see
+/// [`Scheduler::wait_for`]), so a 30-minute connector is never polled more
+/// often while broken than while healthy.
+pub const DEFAULT_BREAKER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// The ceiling the cooldown doubles up to.
+///
+/// One hour. A service that has been down long enough to fail eight
+/// consecutive half-open probes is not coming back in the next minute, and an
+/// hour keeps the daily cost of a dead connector at 24 calls while still
+/// meaning that *whenever* it comes back the daemon notices within the hour
+/// without anybody touching it. Anything longer and the owner would beat the
+/// daemon to it, which defeats the point of automatic recovery.
+pub const MAX_BREAKER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
 /// A future a job's `run` produces. Matches `futures::future::BoxFuture`'s
 /// shape, spelled out locally so this module does not need the rest of
@@ -96,8 +129,14 @@ struct JobState {
     /// last success or `reset`.
     failure_count: AtomicU32,
     /// Set once `failure_count` reaches the breaker threshold. A tripped job
-    /// is skipped by every subsequent `tick` until `reset`.
+    /// is skipped by every `tick` until its `cooldown` has elapsed, which buys
+    /// it one half-open attempt -- or until [`Scheduler::reset`] clears it.
     tripped: AtomicBool,
+    /// How long this job waits, while tripped, before that half-open attempt.
+    /// Starts at the scheduler's [`DEFAULT_BREAKER_COOLDOWN`], doubles every
+    /// time a half-open attempt fails, and is capped at
+    /// [`MAX_BREAKER_COOLDOWN`]. A success -- or a `reset` -- puts it back.
+    cooldown: Mutex<Duration>,
     /// The message from the most recent failure, cleared on the next
     /// success or on `reset`. This is what makes a tripped breaker visible
     /// to `ea status` instead of just a name with no explanation.
@@ -105,13 +144,14 @@ struct JobState {
 }
 
 impl JobState {
-    fn new(job: Job) -> Self {
+    fn new(job: Job, cooldown: Duration) -> Self {
         JobState {
             job,
             last_started: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             failure_count: AtomicU32::new(0),
             tripped: AtomicBool::new(false),
+            cooldown: Mutex::new(cooldown),
             last_error: Mutex::new(None),
         }
     }
@@ -146,6 +186,10 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// job is never invoked while a prior invocation of it is still running.
 pub struct Scheduler {
     breaker_threshold: u32,
+    /// What a job's cooldown starts at, and is reset to by a success.
+    breaker_cooldown: Duration,
+    /// What it doubles up to and no further.
+    max_breaker_cooldown: Duration,
     jobs: Mutex<Vec<Arc<JobState>>>,
     paused: AtomicBool,
     /// Handles to the invocations [`Scheduler::start`]'s loop has spawned and
@@ -179,8 +223,21 @@ impl Scheduler {
     const TICK_GRANULARITY: Duration = Duration::from_secs(1);
 
     pub fn new(breaker_threshold: u32) -> Self {
+        Self::with_cooldown(
+            breaker_threshold,
+            DEFAULT_BREAKER_COOLDOWN,
+            MAX_BREAKER_COOLDOWN,
+        )
+    }
+
+    /// [`Scheduler::new`] with explicit breaker cooldown bounds. Tests use it
+    /// to make the half-open path observable without waiting five real
+    /// minutes; production goes through `new`.
+    pub fn with_cooldown(breaker_threshold: u32, cooldown: Duration, max: Duration) -> Self {
         Scheduler {
             breaker_threshold,
+            breaker_cooldown: cooldown,
+            max_breaker_cooldown: max.max(cooldown),
             jobs: Mutex::new(Vec::new()),
             paused: AtomicBool::new(false),
             in_flight: Mutex::new(Vec::new()),
@@ -190,7 +247,7 @@ impl Scheduler {
     /// Register a job. Jobs are kept in the order they were added; `names`
     /// reflects that order.
     pub fn add(&self, job: Job) {
-        lock(&self.jobs).push(Arc::new(JobState::new(job)));
+        lock(&self.jobs).push(Arc::new(JobState::new(job, self.breaker_cooldown)));
     }
 
     /// Registered job names, in the order they were added.
@@ -231,14 +288,44 @@ impl Scheduler {
         self.find(name).and_then(|s| lock(&s.last_error).clone())
     }
 
-    /// Clear a tripped breaker (and its failure count and last error) so the
-    /// job is eligible to run again on the next tick it is due.
-    pub fn reset(&self, name: &str) {
-        if let Some(state) = self.find(name) {
-            state.tripped.store(false, Ordering::SeqCst);
-            state.failure_count.store(0, Ordering::SeqCst);
-            *lock(&state.last_error) = None;
+    /// How long until `name`'s next half-open attempt; `None` when the job is
+    /// not tripped, or unknown.
+    ///
+    /// This is the one read here that consults the wall clock, because the one
+    /// caller is `ea status` answering "when will this fix itself?" about the
+    /// real world rather than about a test's notion of time.
+    pub fn retry_in(&self, name: &str) -> Option<Duration> {
+        let state = self.find(name)?;
+        if !state.tripped.load(Ordering::SeqCst) {
+            return None;
         }
+        let wait = Self::wait_for(&state, true);
+        let last = (*lock(&state.last_started))?;
+        Some(wait.saturating_sub(Instant::now().saturating_duration_since(last)))
+    }
+
+    /// Clear a tripped breaker -- its failure count, its last error, its
+    /// backed-off cooldown, and the schedule it was waiting on -- so the job
+    /// runs on the next tick rather than at the end of the interval the
+    /// failing attempt started. Returns `false` for an unknown job name, which
+    /// is what lets the `resume` IPC method tell a human they typo'd rather
+    /// than silently doing nothing.
+    ///
+    /// This is the manual half of breaker recovery. The automatic half is the
+    /// half-open retry in [`Scheduler::maybe_spawn`]; a human should never
+    /// *have* to run this, but when a credential has just been fixed, waiting
+    /// out the cooldown is a needless hour.
+    pub fn reset(&self, name: &str) -> bool {
+        let Some(state) = self.find(name) else {
+            return false;
+        };
+        state.tripped.store(false, Ordering::SeqCst);
+        state.failure_count.store(0, Ordering::SeqCst);
+        *lock(&state.last_error) = None;
+        *lock(&state.cooldown) = self.breaker_cooldown;
+        *lock(&state.last_started) = None;
+        tracing::info!(job = name, "circuit breaker cleared by hand");
+        true
     }
 
     fn find(&self, name: &str) -> Option<Arc<JobState>> {
@@ -264,11 +351,21 @@ impl Scheduler {
             .collect()
     }
 
-    fn maybe_spawn(&self, state: Arc<JobState>, now: Instant) -> Option<JoinHandle<()>> {
-        if state.tripped.load(Ordering::SeqCst) {
-            return None;
+    /// How long this job waits between attempts: its own interval normally,
+    /// and at least the breaker's current cooldown while it is tripped.
+    ///
+    /// `max` rather than a replacement, so a broken 30-minute connector is
+    /// never polled *more* often than a healthy one -- the cooldown is a floor
+    /// on how quickly a tripped job may be retried, not a new schedule.
+    fn wait_for(state: &JobState, tripped: bool) -> Duration {
+        if tripped {
+            state.job.interval.max(*lock(&state.cooldown))
+        } else {
+            state.job.interval
         }
+    }
 
+    fn maybe_spawn(&self, state: Arc<JobState>, now: Instant) -> Option<JoinHandle<()>> {
         // Overlap guard: `compare_exchange` makes "is a run already in
         // flight, and if not, claim one" a single atomic step. Two ticks
         // racing on the same job can never both see `false` and proceed --
@@ -284,10 +381,17 @@ impl Scheduler {
         // From here on this tick holds exclusive claim on `state.running`
         // for this job, so reading and updating `last_started` needs no
         // separate synchronization against another tick doing the same.
+        //
+        // A tripped job is not skipped outright: it waits out its cooldown and
+        // then gets exactly one attempt through this same path, which is what
+        // makes the breaker half-open rather than a latch. The overlap guard
+        // above is what keeps "exactly one" true.
+        let tripped = state.tripped.load(Ordering::SeqCst);
+        let wait = Self::wait_for(&state, tripped);
         let due = {
             let mut last = lock(&state.last_started);
             let due = last
-                .map(|t| now.saturating_duration_since(t) >= state.job.interval)
+                .map(|t| now.saturating_duration_since(t) >= wait)
                 .unwrap_or(true);
             if due {
                 *last = Some(now);
@@ -298,8 +402,17 @@ impl Scheduler {
             state.running.store(false, Ordering::SeqCst);
             return None;
         }
+        if tripped {
+            tracing::info!(
+                job = %state.job.name,
+                waited = ?wait,
+                "circuit breaker half-open: retrying this job once"
+            );
+        }
 
         let threshold = self.breaker_threshold;
+        let initial_cooldown = self.breaker_cooldown;
+        let max_cooldown = self.max_breaker_cooldown;
         // Constructed here, on the calling thread, *before* `tokio::spawn` --
         // not as the first statement inside the spawned future. An `async
         // move` block captures its moved-in variables the instant the block
@@ -318,27 +431,69 @@ impl Scheduler {
             let _guard = guard;
             let fut = (state.job.run)();
             match AssertUnwindSafe(fut).catch_unwind().await {
-                Ok(Ok(())) => {
-                    state.failure_count.store(0, Ordering::SeqCst);
-                    *lock(&state.last_error) = None;
-                }
+                Ok(Ok(())) => Self::record_success(&state, initial_cooldown),
                 // `{:#}` rather than `{}`: an `anyhow` error prints only its
                 // outermost context by default, and the outermost context
                 // here is something like "polling connector canvas", which is
                 // a restatement of the job's name rather than a reason. The
                 // alternate form appends the chain -- "...: 401 Unauthorized"
                 // -- which is the half `ea status` exists to show.
-                Ok(Err(err)) => Self::record_failure(&state, threshold, format!("{err:#}")),
-                Err(panic) => Self::record_failure(&state, threshold, panic_message(panic)),
+                Ok(Err(err)) => {
+                    Self::record_failure(&state, threshold, max_cooldown, format!("{err:#}"))
+                }
+                Err(panic) => {
+                    Self::record_failure(&state, threshold, max_cooldown, panic_message(panic))
+                }
             }
         }))
     }
 
-    fn record_failure(state: &JobState, threshold: u32, message: String) {
+    /// A success clears everything the breaker was holding, including a
+    /// cooldown that had backed off. If this was the half-open attempt, the
+    /// breaker closes here -- which is the whole automatic-recovery path, and
+    /// it is worth a log line at `info`, because "the daemon started working
+    /// again at 04:12" is exactly the thing an owner wants to find afterwards.
+    fn record_success(state: &JobState, initial_cooldown: Duration) {
+        state.failure_count.store(0, Ordering::SeqCst);
+        *lock(&state.last_error) = None;
+        *lock(&state.cooldown) = initial_cooldown;
+        if state.tripped.swap(false, Ordering::SeqCst) {
+            tracing::info!(
+                job = %state.job.name,
+                "circuit breaker closed: the job recovered on its own"
+            );
+        }
+    }
+
+    fn record_failure(state: &JobState, threshold: u32, max_cooldown: Duration, message: String) {
         let count = state.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
         *lock(&state.last_error) = Some(message);
-        if count >= threshold {
+
+        if state.tripped.load(Ordering::SeqCst) {
+            // The half-open attempt failed: stay open, and wait longer next
+            // time. Without the doubling, a connector that is down for a week
+            // would be retried every five minutes for a week; with it, the
+            // wait walks up to an hour and stays there.
+            let mut cooldown = lock(&state.cooldown);
+            let next = cooldown.saturating_mul(2).min(max_cooldown);
+            let changed = next != *cooldown;
+            *cooldown = next;
+            drop(cooldown);
+            if changed {
+                tracing::warn!(
+                    job = %state.job.name,
+                    cooldown = ?next,
+                    "the half-open retry failed; backing off further"
+                );
+            }
+        } else if count >= threshold {
             state.tripped.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                job = %state.job.name,
+                failures = count,
+                cooldown = ?*lock(&state.cooldown),
+                "circuit breaker tripped; it will retry itself after the cooldown"
+            );
         }
     }
 
@@ -985,5 +1140,146 @@ mod tests {
             "the reason must survive: {recorded}"
         );
         assert!(sched.is_tripped("canvas"));
+    }
+
+    // -- half-open recovery -------------------------------------------------
+
+    /// A job whose failures can be switched off part-way through, so one test
+    /// can drive "broken, then fixed" without two schedulers.
+    fn flaky_job(name: &str, interval: Duration) -> (Job, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let healthy = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = healthy.clone();
+        let c = calls.clone();
+        let job = Job::new(name, interval, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            let healthy = h.load(Ordering::SeqCst);
+            async move {
+                if healthy {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("still broken"))
+                }
+            }
+        });
+        (job, healthy, calls)
+    }
+
+    /// The finding, stated as a test: five failures disable the job, and the
+    /// daemon is left running for weeks with that job dead. It must retry
+    /// itself.
+    #[tokio::test]
+    async fn a_tripped_breaker_retries_itself_after_the_cooldown() {
+        let cooldown = Duration::from_secs(300);
+        let sched = Scheduler::with_cooldown(1, cooldown, cooldown * 8);
+        let interval = Duration::from_secs(60);
+        let (job, _healthy, calls) = flaky_job("canvas", interval);
+        sched.add(job);
+
+        let t0 = Instant::now();
+        await_all(sched.tick(t0)).await;
+        assert!(sched.is_tripped("canvas"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Inside the cooldown: nothing, however many ticks arrive.
+        for secs in [60, 120, 299] {
+            assert!(sched.tick(t0 + Duration::from_secs(secs)).is_empty());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Past it: exactly one attempt.
+        await_all(sched.tick(t0 + cooldown)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one half-open attempt");
+        assert!(sched.is_tripped("canvas"), "it failed, so it stays open");
+    }
+
+    #[tokio::test]
+    async fn a_successful_half_open_attempt_closes_the_breaker() {
+        let cooldown = Duration::from_secs(300);
+        let sched = Scheduler::with_cooldown(1, cooldown, cooldown * 8);
+        let interval = Duration::from_secs(60);
+        let (job, healthy, calls) = flaky_job("canvas", interval);
+        sched.add(job);
+
+        let t0 = Instant::now();
+        await_all(sched.tick(t0)).await;
+        assert!(sched.is_tripped("canvas"));
+
+        // The outage ends.
+        healthy.store(true, Ordering::SeqCst);
+        await_all(sched.tick(t0 + cooldown)).await;
+
+        assert!(!sched.is_tripped("canvas"), "a good probe must close it");
+        assert_eq!(sched.last_error("canvas"), None);
+        assert_eq!(sched.retry_in("canvas"), None);
+
+        // And it is back on its own interval, not the cooldown.
+        await_all(sched.tick(t0 + cooldown + interval)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_half_open_attempt_backs_the_cooldown_off_to_the_cap() {
+        let cooldown = Duration::from_secs(300);
+        let max = Duration::from_secs(1200);
+        let sched = Scheduler::with_cooldown(1, cooldown, max);
+        let (job, _healthy, calls) = flaky_job("canvas", Duration::from_secs(60));
+        sched.add(job);
+
+        let mut at = Instant::now();
+        await_all(sched.tick(at)).await;
+        assert!(sched.is_tripped("canvas"));
+
+        // 300s, then 600s, then 1200s, then 1200s again: doubling, capped.
+        for expected in [300u64, 600, 1200, 1200] {
+            let wait = Duration::from_secs(expected);
+            assert!(
+                sched.tick(at + wait - Duration::from_secs(1)).is_empty(),
+                "must still be waiting {expected}s in"
+            );
+            at += wait;
+            await_all(sched.tick(at)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "one probe per cooldown");
+    }
+
+    /// The cooldown is a floor on retries, not a schedule: a connector that
+    /// polls every 30 minutes must not be polled every 5 while it is broken.
+    #[tokio::test]
+    async fn a_job_slower_than_the_cooldown_keeps_its_own_interval() {
+        let sched = Scheduler::with_cooldown(1, Duration::from_secs(300), Duration::from_secs(600));
+        let interval = Duration::from_secs(1800);
+        let (job, _healthy, calls) = flaky_job("canvas", interval);
+        sched.add(job);
+
+        let t0 = Instant::now();
+        await_all(sched.tick(t0)).await;
+        assert!(sched.tick(t0 + Duration::from_secs(300)).is_empty());
+        assert!(sched.tick(t0 + Duration::from_secs(1799)).is_empty());
+        await_all(sched.tick(t0 + interval)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reset_answers_whether_the_job_exists_and_makes_it_due_at_once() {
+        let probe = Probe::new();
+        let sched = Scheduler::new(1);
+        // An interval far longer than anything this test waits: without
+        // `reset` clearing the schedule too, the job would not be due again
+        // for an hour and `ea resume canvas` would look like it did nothing.
+        sched.add(probe.err_job("canvas", Duration::from_secs(3600)));
+
+        let t0 = Instant::now();
+        await_all(sched.tick(t0)).await;
+        assert!(sched.is_tripped("canvas"));
+        assert!(sched.retry_in("canvas").is_some());
+
+        assert!(!sched.reset("nosuchjob"), "an unknown job must say so");
+        assert!(sched.reset("canvas"));
+        assert!(!sched.is_tripped("canvas"));
+        assert_eq!(sched.retry_in("canvas"), None);
+
+        await_all(sched.tick(t0 + Duration::from_secs(1))).await;
+        assert_eq!(probe.calls(), 2, "resume must not wait out the interval");
     }
 }

@@ -16,9 +16,9 @@
 //!   `Policy::decide` has already run and, for `approve`, a human has said yes
 //!   to a specific stored action.
 //!
-//! `reject`, `pause` and `resume` reach no connector at all by construction:
-//! rejection is a status transition, and pausing is a flag the scheduler
-//! reads. `chat` starts a model session whose only write tool is
+//! `reject`, `pause`, `resume` and `resume_job` reach no connector at all by
+//! construction: rejection is a status transition, and pausing or clearing a
+//! breaker is a flag the scheduler reads. `chat` starts a model session whose only write tool is
 //! `mcp__ea-propose__propose_action`, which comes back to `propose` on this
 //! same socket and through the same gate.
 //!
@@ -151,6 +151,12 @@ struct ChatParams {
     message: String,
 }
 
+/// Params of `resume_job`.
+#[derive(Debug, Clone, Deserialize)]
+struct JobParams {
+    job: String,
+}
+
 /// Everything the daemon answers from.
 ///
 /// A struct rather than a long argument list because it is assembled once, in
@@ -203,7 +209,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     ///
     /// One place, so that "what can be asked of the daemon over its socket" is
     /// a list you can read in ten seconds rather than something scattered
-    /// through `main`. Nine methods; see the module docs for how each one
+    /// through `main`. Ten methods; see the module docs for how each one
     /// relates to the gate.
     pub fn register(self: &Arc<Self>, server: &mut ipc::Server) {
         macro_rules! method {
@@ -223,6 +229,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         method!("log", log);
         method!("pause", pause);
         method!("resume", resume);
+        method!("resume_job", resume_job);
         method!("chat", chat);
         method!("propose", propose);
     }
@@ -248,10 +255,16 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             .map(|name| {
                 let tripped = self.scheduler.is_tripped(&name);
                 let last_error = self.scheduler.last_error(&name);
+                // Seconds until the breaker's own half-open retry. Present
+                // only while tripped, and the answer to the question a tripped
+                // job immediately raises: do I have to do something about
+                // this, or will it fix itself?
+                let retry_in = self.scheduler.retry_in(&name).map(|d| d.as_secs());
                 json!({
                     "name": name,
                     "tripped": tripped,
                     "last_error": last_error,
+                    "retry_in_secs": retry_in,
                 })
             })
             .collect();
@@ -301,6 +314,41 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         self.scheduler.resume();
         tracing::info!("scheduler resumed over IPC");
         Ok(json!({ "paused": false }))
+    }
+
+    /// `resume_job` — clear one job's tripped circuit breaker.
+    ///
+    /// The manual half of breaker recovery, and the reason it exists: five
+    /// consecutive failures disable a job, and before this there was no way to
+    /// re-enable it short of restarting the daemon. The automatic half is the
+    /// scheduler's half-open retry, which means a transient outage heals with
+    /// nobody watching; this is for the case where the owner has just *fixed*
+    /// something and does not want to wait out the cooldown.
+    ///
+    /// Reaches no connector. It clears three atomics and a timestamp in the
+    /// scheduler; whether the job then does anything is decided entirely by
+    /// the job itself on the next tick, and a `watch_poll` job is still
+    /// subject to the policy check in `jobs::run_watch_poll`.
+    ///
+    /// An unknown job name is an error naming the jobs that do exist, because
+    /// the alternative — answering "ok" to `ea resume canavs` — is the kind of
+    /// silence this whole review is about.
+    pub async fn resume_job(&self, params: Value) -> anyhow::Result<Value> {
+        let params: JobParams = parse_params("resume_job", params)?;
+        let was_tripped = self.scheduler.is_tripped(&params.job);
+        if !self.scheduler.reset(&params.job) {
+            bail!(
+                "resume: there is no job called {:?}. Jobs: {}",
+                params.job,
+                self.scheduler.names().join(", ")
+            );
+        }
+        tracing::info!(job = %params.job, was_tripped, "breaker cleared over IPC");
+        Ok(json!({
+            "job": params.job,
+            "was_tripped": was_tripped,
+            "tripped": false,
+        }))
     }
 
     // ----------------------------------------------------------------------
@@ -690,6 +738,7 @@ record_voucher = "approve"
                 "log" => self.daemon.log(params).await,
                 "pause" => self.daemon.pause(params).await,
                 "resume" => self.daemon.resume(params).await,
+                "resume_job" => self.daemon.resume_job(params).await,
                 "chat" => self.daemon.chat(params).await,
                 "propose" => self.daemon.propose(params).await,
                 other => panic!("no such method {other}"),
@@ -905,6 +954,94 @@ record_voucher = "approve"
         assert!(
             reason.contains("401"),
             "a tripped breaker must say why: {reason}"
+        );
+        assert!(
+            canvas["retry_in_secs"].as_u64().is_some(),
+            "a tripped breaker must say when it will retry itself: {canvas}"
+        );
+    }
+
+    // -- clearing a tripped breaker without a restart -----------------------
+
+    /// A scheduler with one job that always fails and a breaker threshold of
+    /// one, plus a daemon wired to it. The finding this covers: before
+    /// `resume_job`, the only way out of this state was to restart the daemon.
+    async fn tripped_fixture() -> (Fixture, Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
+        let f = Fixture::new();
+        let scheduler = Arc::new(Scheduler::new(1));
+        scheduler.add(Job::new("canvas", Duration::from_secs(1800), || async {
+            Err(anyhow!("canvas: no usable credentials"))
+        }));
+        for handle in scheduler.tick(std::time::Instant::now()) {
+            handle.await.unwrap();
+        }
+        assert!(scheduler.is_tripped("canvas"));
+
+        let daemon = Daemon::build(Deps {
+            executor: Arc::clone(&f.daemon.executor),
+            actions: f.daemon.actions.clone(),
+            conversations: f.daemon.conversations.clone(),
+            runs: f.daemon.runs.clone(),
+            scheduler: Arc::clone(&scheduler),
+            sessions: None,
+            pusher: None,
+            connectors: vec!["canvas".to_string()],
+            daily_session_budget: 60,
+        });
+        (f, scheduler, daemon)
+    }
+
+    #[tokio::test]
+    async fn resume_job_clears_a_tripped_breaker_and_status_agrees() {
+        let (_f, scheduler, daemon) = tripped_fixture().await;
+
+        let before = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(before["jobs"][0]["tripped"], true);
+
+        let answer = daemon
+            .resume_job(json!({ "job": "canvas" }))
+            .await
+            .expect("resuming a known job must succeed");
+        assert_eq!(answer["job"], "canvas");
+        assert_eq!(answer["was_tripped"], true);
+        assert_eq!(answer["tripped"], false);
+        assert!(!scheduler.is_tripped("canvas"));
+
+        let after = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(after["jobs"][0]["tripped"], false);
+        assert!(after["jobs"][0]["last_error"].is_null());
+        assert!(after["jobs"][0]["retry_in_secs"].is_null());
+    }
+
+    /// Answering "ok" to a typo would be exactly the silent failure this
+    /// review is about: the owner would think they had fixed it.
+    #[tokio::test]
+    async fn resume_job_refuses_a_name_no_job_has() {
+        let (_f, scheduler, daemon) = tripped_fixture().await;
+        let err = daemon
+            .resume_job(json!({ "job": "canavs" }))
+            .await
+            .expect_err("an unknown job must be an error");
+        let text = format!("{err:#}");
+        assert!(text.contains("canavs"), "{text}");
+        assert!(
+            text.contains("canvas"),
+            "it must list the real jobs: {text}"
+        );
+        assert!(
+            scheduler.is_tripped("canvas"),
+            "a typo must not clear anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_job_reaches_no_connector() {
+        let (f, _scheduler, daemon) = tripped_fixture().await;
+        daemon.resume_job(json!({ "job": "canvas" })).await.unwrap();
+        assert!(
+            f.calls().is_empty(),
+            "clearing a breaker must not call anything: {:?}",
+            f.calls()
         );
     }
 
@@ -1157,6 +1294,7 @@ record_voucher = "approve"
             ("log", json!({ "n": 5 })),
             ("pause", Value::Null),
             ("resume", Value::Null),
+            ("resume_job", json!({ "job": "canvas" })),
             ("chat", json!({ "message": "hi" })),
             ("reject", json!({ "id": id })),
         ] {

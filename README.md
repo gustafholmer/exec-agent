@@ -133,9 +133,23 @@ script, it refuses rather than installing a daemon that cannot think.
 | `ea log [-n 20]` | recent runs: sessions and executed actions, with cost |
 | `ea pause` | stop the scheduler starting new work (in-flight work finishes) |
 | `ea resume` | undo `pause` |
+| `ea resume <job>` | clear one job's tripped circuit breaker at once |
 | `ea chat <message...>` | say something to the assistant |
 
 `ea queue` is formatted for reading; everything else prints the daemon's JSON.
+
+### When a job's breaker trips
+
+A job that fails `breaker_threshold` times in a row (five by default) stops
+running, and `ea status` shows it as `tripped` with the reason. It does **not**
+stop forever: after a cooldown of five minutes — doubling on each failed retry,
+up to an hour — the breaker goes half-open and allows one attempt. A success
+closes it and the job goes back on its own schedule; a failure re-opens it and
+waits longer. `retry_in_secs` in `ea status` says how long that is.
+
+So a Canvas outage, an expired token that gets refreshed, or a night without
+network heals with nobody watching. `ea resume <job>` is for when you have just
+fixed the cause yourself and do not want to wait out the cooldown.
 
 ## Where things live
 

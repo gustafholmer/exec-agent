@@ -49,8 +49,16 @@ enum Command {
     },
     /// Stop the scheduler starting new work. In-flight work finishes.
     Pause,
-    /// Undo `pause`.
-    Resume,
+    /// Undo `pause`, or — given a job name — clear that job's tripped
+    /// circuit breaker so it starts polling again.
+    ///
+    /// A job whose breaker has tripped retries itself after a cooldown, which
+    /// `ea status` shows as `retry_in_secs`. Name the job here when you have
+    /// just fixed whatever was broken and do not want to wait it out.
+    Resume {
+        /// The job, as `ea status` names it (a connector, or `triage`).
+        job: Option<String>,
+    },
     /// Say something to the assistant.
     Chat {
         /// The message. Quoting is optional: everything after `chat` is joined.
@@ -78,7 +86,13 @@ async fn main() -> anyhow::Result<()> {
         )?,
         Command::Log { n } => print_json(&client.call("log", json!({ "n": n })).await?)?,
         Command::Pause => print_json(&client.call("pause", Value::Null).await?)?,
-        Command::Resume => print_json(&client.call("resume", Value::Null).await?)?,
+        Command::Resume { job } => {
+            let answer = match job {
+                Some(job) => client.call("resume_job", json!({ "job": job })).await?,
+                None => client.call("resume", Value::Null).await?,
+            };
+            print_json(&answer)?
+        }
         Command::Chat { message } => {
             let message = message.join(" ");
             print_json(&client.call("chat", json!({ "message": message })).await?)?
