@@ -60,6 +60,17 @@
 //! read back and the reply describes the state it is actually in. See
 //! [`Notifier::already_handled`].
 //!
+//! # Who may press the buttons
+//!
+//! Exactly one person: the [`TelegramUserId`] handed to [`Notifier::new`],
+//! which is required rather than optional so that there is no "unconfigured,
+//! allow everything" state to fall into. A callback from any other id is
+//! refused before its payload is even parsed, and the refusal is
+//! indistinguishable from the reply to a button the daemon does not recognise.
+//! See [`Notifier::handle_callback`] for what a bot token does and does not
+//! let an attacker forge — required reading for whoever writes the update
+//! loop.
+//!
 //! # The token, and data arriving from the network
 //!
 //! The bot token is a bearer credential for the entire bot: anyone holding it
@@ -79,6 +90,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use ea_core::store::actions::{ActionStatus, ActionStore};
@@ -101,6 +113,35 @@ pub const TOKEN_FILE: &str = "telegram.token";
 /// The filename under the config directory holding the owner's chat id.
 pub const CHAT_ID_FILE: &str = "telegram.chat_id";
 
+/// The filename under the config directory holding the Telegram *user* id of
+/// the one person allowed to press the buttons.
+///
+/// Deliberately a separate file from [`CHAT_ID_FILE`], and not a reuse of it.
+/// A chat id and a user id are equal only in a 1:1 DM with the bot; in a group
+/// the chat id is the group's and belongs to no user at all, so reusing it
+/// would refuse the owner's own taps — a failure that reads as a bug rather
+/// than as a policy. A user id is not a credential (anyone the owner has
+/// messaged can see it), so this file needs no special mode; it lives beside
+/// the token because it is part of the same configuration.
+pub const OWNER_ID_FILE: &str = "telegram.owner_id";
+
+/// The single reply for every callback this daemon declines to act on.
+///
+/// Three situations share it — a malformed payload, an unknown verb, and a
+/// callback from someone who is not the owner — and that sharing is the point.
+/// If a stranger's reply differed from the malformed-data reply, anyone who
+/// found the bot could walk the action ids by diffing responses and learn
+/// which vouchers are pending. One constant, so the two texts cannot drift
+/// apart in a later edit.
+const UNRECOGNISED_REPLY: &str = "That button is not one I recognise. Nothing was done.";
+
+/// How long one Bot API call may take before it is abandoned.
+///
+/// `reqwest::Client::new()` has **no** timeout, so a stalled connection to a
+/// black-holed `api.telegram.org` blocks its caller until the process dies —
+/// and the caller is a scheduler job.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The public Bot API.
 pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 
@@ -120,11 +161,30 @@ pub trait Transport {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
+/// A Telegram **user** id: `callback_query.from.id`, the person who tapped.
+///
+/// A newtype rather than a bare `i64` because the wrong `i64` is right there
+/// in the same update. `message.chat.id` would compile just as happily in the
+/// place of `from.id` and authenticate nothing, and in a group the two are not
+/// even the same number. Construct it only where `from.id` is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TelegramUserId(pub i64);
+
+impl fmt::Display for TelegramUserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Turns actions into messages and button presses back into decisions.
 pub struct Notifier<T: Transport, C: ToolCaller> {
     transport: T,
     actions: ActionStore,
     executor: Arc<Executor<C>>,
+    /// The only user whose button presses are acted on. Not an `Option`: an
+    /// "unconfigured" variant is a branch that allows everyone, and this is
+    /// the gate in front of posting real vouchers.
+    owner: TelegramUserId,
 }
 
 /// A parsed button press. Constructed only by [`parse_callback`], so an
@@ -175,11 +235,19 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 impl<T: Transport, C: ToolCaller> Notifier<T, C> {
-    pub fn new(transport: T, actions: ActionStore, executor: Arc<Executor<C>>) -> Self {
+    /// `owner` is the one Telegram user whose taps count. It is required, by
+    /// design: there is no constructor that leaves the button unguarded.
+    pub fn new(
+        transport: T,
+        actions: ActionStore,
+        executor: Arc<Executor<C>>,
+        owner: TelegramUserId,
+    ) -> Self {
         Self {
             transport,
             actions,
             executor,
+            owner,
         }
     }
 
@@ -224,11 +292,53 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 
     /// Handle one button press and return what to show the human.
     ///
+    /// `from` is `callback_query.from.id` exactly as Telegram delivered it.
+    /// Anything but the configured owner is refused *before* the payload is
+    /// parsed and before the store is touched, and is answered with
+    /// [`UNRECOGNISED_REPLY`] — the same sentence a malformed payload gets, so
+    /// a stranger cannot learn that action #7 exists by diffing replies.
+    ///
     /// Infallible by design: this answers a callback query, and every outcome —
     /// including a malformed payload or a store fault — has to come back as
     /// something displayable. Failures are logged with their detail and
     /// reported to the human in general terms.
-    pub async fn handle_callback(&self, data: &str) -> String {
+    ///
+    /// # How much `from` is worth — read this before writing an update loop
+    ///
+    /// `from.id` is stamped by Telegram's servers, not by the sender, and
+    /// **the bot token does not let a third party forge it**. A stolen token
+    /// is bad in other ways: the holder can read everything sent to the bot,
+    /// send messages as the bot, and steal the update stream outright
+    /// (`deleteWebhook`, then `getUpdates`). What it does not buy is approval
+    /// injection, because the thief does not author the `from` field — Telegram
+    /// does.
+    ///
+    /// **That reasoning holds for long polling only. A webhook is unsigned.**
+    /// Telegram delivers webhook updates as a plain HTTP POST of JSON, and so
+    /// can anyone else who can reach the URL: the entire body is then
+    /// attacker-authored, `from.id` included, and this check is worth nothing.
+    /// An update loop built on a webhook **must** set a secret via
+    /// `setWebhook`'s `secret_token` and compare the
+    /// `X-Telegram-Bot-Api-Secret-Token` header on every request before the
+    /// body is believed. `from.id` alone is not sufficient there.
+    ///
+    /// The loop should also check `callback_query.message.chat.id` against the
+    /// configured [`TelegramConfig::chat_id`]. That field is not available at
+    /// this seam — this function is handed only the sender and the payload —
+    /// so it is the loop's to enforce.
+    pub async fn handle_callback(&self, from: TelegramUserId, data: &str) -> String {
+        if from != self.owner {
+            // `warn`, not `debug`: a tap from anyone else is either a
+            // misconfigured owner id or a stranger who found the bot, and both
+            // are worth seeing in a log. The sender id is recorded; the reply
+            // reveals nothing at all.
+            tracing::warn!(
+                from = from.0,
+                "refusing a telegram callback from a non-owner"
+            );
+            return UNRECOGNISED_REPLY.to_string();
+        }
+
         match parse_callback(data) {
             Some(Callback::Approve(id)) => self.approve(id).await,
             Some(Callback::Reject(id)) => self.reject(id),
@@ -236,7 +346,7 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
                 // Not an error: old buttons from a previous build, or someone
                 // poking the bot. Deliberately does not echo `data` back.
                 tracing::debug!("ignoring unrecognised telegram callback data");
-                "That button is not one I recognise. Nothing was done.".to_string()
+                UNRECOGNISED_REPLY.to_string()
             }
         }
     }
@@ -322,7 +432,12 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 /// type is that the token inside it never reaches an output stream by accident.
 pub struct TelegramConfig {
     token: String,
+    /// Where messages are sent. In a group this is the group's id and is not
+    /// any user's id — which is why it is not also the allow-list.
     pub chat_id: i64,
+    /// Who may press the buttons. Read from its own file; see
+    /// [`OWNER_ID_FILE`].
+    pub owner_id: TelegramUserId,
 }
 
 impl fmt::Debug for TelegramConfig {
@@ -330,6 +445,7 @@ impl fmt::Debug for TelegramConfig {
         f.debug_struct("TelegramConfig")
             .field("token", &"<redacted>")
             .field("chat_id", &self.chat_id)
+            .field("owner_id", &self.owner_id)
             .finish()
     }
 }
@@ -397,7 +513,25 @@ impl TelegramConfig {
             .parse()
             .with_context(|| format!("{} must contain a numeric chat id", chat_path.display()))?;
 
-        Ok(Self { token, chat_id })
+        // The owner's *user* id, from its own file. Not a credential, so no
+        // mode check — but required, because the alternative to knowing who
+        // the owner is, is letting anyone approve a voucher.
+        let owner_path = dir.join(OWNER_ID_FILE);
+        let owner_raw = std::fs::read_to_string(&owner_path)
+            .with_context(|| format!("reading {}", owner_path.display()))?;
+        let owner_id: i64 = owner_raw.trim().parse().with_context(|| {
+            format!(
+                "{} must contain the numeric Telegram user id of the one person \
+                 allowed to approve actions (this is a user id, not the chat id)",
+                owner_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            token,
+            chat_id,
+            owner_id: TelegramUserId(owner_id),
+        })
     }
 }
 
@@ -421,25 +555,61 @@ impl fmt::Debug for TelegramTransport {
 }
 
 impl TelegramTransport {
-    pub fn new(token: impl Into<String>, chat_id: i64) -> Self {
+    /// Fallible, and not because of the network: `reqwest::Client::new()`
+    /// *panics* if TLS initialisation fails, and this constructor runs at
+    /// daemon start. A daemon that cannot build an HTTPS client should say so
+    /// and exit, not abort inside a library call.
+    pub fn new(token: impl Into<String>, chat_id: i64) -> anyhow::Result<Self> {
         Self::with_base_url(DEFAULT_API_BASE, token, chat_id)
     }
 
-    pub fn from_config(config: &TelegramConfig) -> Self {
+    pub fn from_config(config: &TelegramConfig) -> anyhow::Result<Self> {
         Self::new(config.token.clone(), config.chat_id)
     }
 
     /// Point at a different Bot API origin. Telegram publishes a self-hostable
     /// Bot API server, and this is also how the transport is exercised against
     /// a local stub without ever reaching Telegram.
-    pub fn with_base_url(base: impl Into<String>, token: impl Into<String>, chat_id: i64) -> Self {
-        Self {
-            http: reqwest::Client::new(),
+    pub fn with_base_url(
+        base: impl Into<String>,
+        token: impl Into<String>,
+        chat_id: i64,
+    ) -> anyhow::Result<Self> {
+        Self::build(base, token, chat_id, HTTP_TIMEOUT)
+    }
+
+    /// The one place the client is constructed. Split out so the timeout is a
+    /// parameter a test can shorten instead of a 30-second wait.
+    fn build(
+        base: impl Into<String>,
+        token: impl Into<String>,
+        chat_id: i64,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("building the HTTPS client for the Telegram Bot API")?;
+        Ok(Self {
+            http,
             base: base.into().trim_end_matches('/').to_string(),
             token: token.into(),
             chat_id,
-        }
+        })
     }
+}
+
+/// The envelope every Bot API method answers with.
+///
+/// Only the two fields that decide success are modelled. `ok` is the one that
+/// matters: Telegram reports application-level failures — "chat not found",
+/// "bot was blocked by the user" — with **HTTP 200** and `ok: false`, so a
+/// status-code-only check calls those a delivered message.
+#[derive(serde::Deserialize)]
+struct ApiReply {
+    ok: bool,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 impl Transport for TelegramTransport {
@@ -476,18 +646,33 @@ impl Transport for TelegramTransport {
                 .context("sending a Telegram message")?;
 
             let status = response.status();
+
+            // The body is read on every path, success included: a 200 is not
+            // proof of delivery. Telegram's error bodies do not echo the token,
+            // but they are truncated anyway rather than pasted whole into a log.
+            let body = response
+                .text()
+                .await
+                .map_err(|err| err.without_url())
+                .context("reading Telegram's reply")?;
+            let envelope: Option<ApiReply> = serde_json::from_str(&body).ok();
+            let detail = envelope
+                .as_ref()
+                .and_then(|reply| reply.description.as_deref())
+                .map_or_else(|| truncate(&body, 300), |d| truncate(d, 300));
+
             if !status.is_success() {
-                // Telegram's error body is `{"ok":false,"description":...}` and
-                // does not echo the token, but it is truncated anyway rather
-                // than pasted whole into a log.
-                let detail = response
-                    .text()
-                    .await
-                    .map(|body| truncate(&body, 300))
-                    .unwrap_or_else(|_| "<no body>".to_string());
                 bail!("Telegram refused the message: HTTP {status}: {detail}");
             }
-            Ok(())
+            match envelope {
+                Some(reply) if reply.ok => Ok(()),
+                // HTTP 200, `ok: false`. The message was not delivered.
+                Some(_) => bail!("Telegram rejected the message: {detail}"),
+                None => bail!(
+                    "Telegram's reply was not the JSON envelope the Bot API \
+                     documents: {detail}"
+                ),
+            }
         }
     }
 }
@@ -504,6 +689,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The one user allowed to press the buttons in these tests.
+    const OWNER: TelegramUserId = TelegramUserId(10_000_001);
+
+    /// Anyone else. A plausible neighbour of the owner's id, because an
+    /// off-by-one in a comparison is exactly the bug this guards.
+    const STRANGER: TelegramUserId = TelegramUserId(10_000_002);
 
     /// What a transport was asked to send: the body, and the buttons as
     /// `(label, callback_data)`.
@@ -601,7 +793,7 @@ record_voucher = "approve"
 
         Fixture {
             _dir: dir,
-            notifier: Notifier::new(transport, ActionStore::new(conn.clone()), executor),
+            notifier: Notifier::new(transport, ActionStore::new(conn.clone()), executor, OWNER),
             sent,
             calls,
             actions: ActionStore::new(conn),
@@ -658,7 +850,10 @@ record_voucher = "approve"
         let f = fixture();
         let id = propose(&f.actions);
 
-        let reply = f.notifier.handle_callback(&format!("approve:{id}")).await;
+        let reply = f
+            .notifier
+            .handle_callback(OWNER, &format!("approve:{id}"))
+            .await;
 
         assert!(reply.contains("Executed"), "{reply}");
         assert_eq!(
@@ -678,7 +873,10 @@ record_voucher = "approve"
         let f = fixture();
         let id = propose(&f.actions);
 
-        let reply = f.notifier.handle_callback(&format!("reject:{id}")).await;
+        let reply = f
+            .notifier
+            .handle_callback(OWNER, &format!("reject:{id}"))
+            .await;
 
         assert!(reply.contains("Rejected"), "{reply}");
         let action = f.actions.get(id).unwrap().unwrap();
@@ -694,7 +892,7 @@ record_voucher = "approve"
     async fn an_unknown_action_id_answers_gracefully() {
         let f = fixture();
 
-        let reply = f.notifier.handle_callback("approve:999999").await;
+        let reply = f.notifier.handle_callback(OWNER, "approve:999999").await;
 
         assert!(
             reply.contains("not an action I know about"),
@@ -735,7 +933,7 @@ record_voucher = "approve"
         ];
 
         for data in malformed {
-            let reply = f.notifier.handle_callback(data).await;
+            let reply = f.notifier.handle_callback(OWNER, data).await;
             assert!(
                 reply.contains("not one I recognise"),
                 "{data:?} should be ignored politely, got: {reply}"
@@ -771,8 +969,8 @@ record_voucher = "approve"
         // in the argument would not live long enough.
         let tap = format!("approve:{id}");
         let (a, b) = tokio::join!(
-            f.notifier.handle_callback(&tap),
-            f.notifier.handle_callback(&tap)
+            f.notifier.handle_callback(OWNER, &tap),
+            f.notifier.handle_callback(OWNER, &tap)
         );
 
         assert_eq!(
@@ -810,11 +1008,19 @@ record_voucher = "approve"
 
         let one = {
             let f = f.clone();
-            tokio::spawn(async move { f.notifier.handle_callback(&format!("approve:{id}")).await })
+            tokio::spawn(async move {
+                f.notifier
+                    .handle_callback(OWNER, &format!("approve:{id}"))
+                    .await
+            })
         };
         let two = {
             let f = f.clone();
-            tokio::spawn(async move { f.notifier.handle_callback(&format!("approve:{id}")).await })
+            tokio::spawn(async move {
+                f.notifier
+                    .handle_callback(OWNER, &format!("approve:{id}"))
+                    .await
+            })
         };
         let (a, b) = (one.await.unwrap(), two.await.unwrap());
 
@@ -832,8 +1038,13 @@ record_voucher = "approve"
         let f = fixture();
         let id = propose(&f.actions);
 
-        f.notifier.handle_callback(&format!("reject:{id}")).await;
-        let reply = f.notifier.handle_callback(&format!("approve:{id}")).await;
+        f.notifier
+            .handle_callback(OWNER, &format!("reject:{id}"))
+            .await;
+        let reply = f
+            .notifier
+            .handle_callback(OWNER, &format!("approve:{id}"))
+            .await;
 
         assert!(reply.contains("already handled: rejected"), "{reply}");
         assert!(f.calls.lock().unwrap().is_empty());
@@ -883,6 +1094,103 @@ record_voucher = "approve"
         assert_eq!(truncate("abc", 10), "abc");
     }
 
+    /// The button posts a real voucher to company accounting. A tap from
+    /// anyone but the owner must change nothing at all: no transition, no
+    /// connector call, and a reply that does not admit the action exists.
+    #[tokio::test]
+    async fn a_callback_from_anyone_but_the_owner_does_nothing() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        for data in [format!("approve:{id}"), format!("reject:{id}")] {
+            let reply = f.notifier.handle_callback(STRANGER, &data).await;
+
+            assert_eq!(
+                reply, UNRECOGNISED_REPLY,
+                "a stranger gets the generic reply and nothing else: {reply}"
+            );
+            assert!(
+                !reply.contains(&id.to_string()),
+                "the reply named the action: {reply}"
+            );
+            let lower = reply.to_lowercase();
+            for leak in [
+                "approve",
+                "reject",
+                "action",
+                "owner",
+                "allowed",
+                "permission",
+            ] {
+                assert!(
+                    !lower.contains(leak),
+                    "the reply leaked {leak:?} to a stranger: {reply}"
+                );
+            }
+        }
+
+        assert!(
+            f.calls.lock().unwrap().is_empty(),
+            "a non-owner tap must make zero connector calls"
+        );
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Proposed,
+            "a non-owner tap must not move the action"
+        );
+    }
+
+    /// The generic reply is the whole defence against probing, so it is
+    /// asserted rather than assumed: if a stranger's reply for a *valid* id
+    /// differed from the reply to garbage by even one byte, anyone who found
+    /// the bot could walk the id space and learn which vouchers are pending.
+    #[tokio::test]
+    async fn a_wrong_sender_and_malformed_data_get_byte_identical_replies() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        let malformed_from_owner = f.notifier.handle_callback(OWNER, "nonsense").await;
+        let valid_from_stranger = f
+            .notifier
+            .handle_callback(STRANGER, &format!("approve:{id}"))
+            .await;
+        let unknown_from_stranger = f.notifier.handle_callback(STRANGER, "approve:999999").await;
+        let malformed_from_stranger = f.notifier.handle_callback(STRANGER, "nonsense").await;
+
+        assert_eq!(
+            valid_from_stranger.as_bytes(),
+            malformed_from_owner.as_bytes(),
+            "a valid id from a stranger must be indistinguishable from garbage"
+        );
+        assert_eq!(unknown_from_stranger, malformed_from_owner);
+        assert_eq!(malformed_from_stranger, malformed_from_owner);
+        assert_eq!(
+            valid_from_stranger, "That button is not one I recognise. Nothing was done.",
+            "the exact text a stranger sees"
+        );
+
+        assert!(f.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Proposed
+        );
+    }
+
+    /// And the owner is unaffected by any of it.
+    #[tokio::test]
+    async fn the_owner_still_approves_exactly_as_before() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        let reply = f
+            .notifier
+            .handle_callback(OWNER, &format!("approve:{id}"))
+            .await;
+
+        assert_eq!(reply, format!("Executed #{id}."));
+        assert_eq!(f.calls.lock().unwrap().len(), 1);
+    }
+
     // --- the token, which must never leave the config directory ---
 
     fn write_secret(dir: &Path, name: &str, contents: &str, mode: u32) {
@@ -897,6 +1205,7 @@ record_voucher = "approve"
         let dir = TempDir::new().unwrap();
         write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue-_x\n", 0o600);
         write_secret(dir.path(), CHAT_ID_FILE, "-1001234567890\n", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321\n", 0o644);
 
         let config = TelegramConfig::load_from(dir.path()).unwrap();
 
@@ -904,11 +1213,46 @@ record_voucher = "approve"
         assert_eq!(config.chat_id, -1_001_234_567_890);
     }
 
+    /// The owner id is its own field and its own file. A group chat id is
+    /// negative and belongs to no user; taking it for an allow-list would lock
+    /// the owner out of their own bot.
+    #[test]
+    fn the_owner_id_is_a_separate_field_from_the_chat_id() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue-_x", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "-1001234567890", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321", 0o644);
+
+        let config = TelegramConfig::load_from(dir.path()).unwrap();
+
+        assert_eq!(config.owner_id, TelegramUserId(7_654_321));
+        assert_ne!(
+            config.owner_id.0, config.chat_id,
+            "a group chat id is not a user id; they must not be conflated"
+        );
+    }
+
+    /// No owner id, no bot. There is no "allow everyone" default to fall into.
+    #[test]
+    fn a_missing_owner_id_is_an_error_not_an_open_door() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue-_x", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+
+        let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
+        assert!(err.contains(OWNER_ID_FILE), "{err}");
+
+        write_secret(dir.path(), OWNER_ID_FILE, "not-a-number", 0o644);
+        let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
+        assert!(err.contains("user id"), "{err}");
+    }
+
     #[test]
     fn a_world_readable_token_is_refused_and_not_echoed() {
         let dir = TempDir::new().unwrap();
         write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue", 0o644);
         write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321", 0o644);
 
         let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
 
@@ -927,6 +1271,7 @@ record_voucher = "approve"
         // request at a different endpoint.
         write_secret(dir.path(), TOKEN_FILE, "123456:AA/../getUpdates", 0o600);
         write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321", 0o644);
 
         let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
 
@@ -947,6 +1292,7 @@ record_voucher = "approve"
 
         write_secret(dir.path(), TOKEN_FILE, "   \n", 0o600);
         write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321", 0o644);
         let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
         assert!(err.contains("is empty"), "{err}");
     }
@@ -956,13 +1302,14 @@ record_voucher = "approve"
         let dir = TempDir::new().unwrap();
         write_secret(dir.path(), TOKEN_FILE, "123456:SeCrEtValue", 0o600);
         write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+        write_secret(dir.path(), OWNER_ID_FILE, "7654321", 0o644);
 
         let config = TelegramConfig::load_from(dir.path()).unwrap();
         let debug = format!("{config:?}");
         assert!(!debug.contains("SeCrEtValue"), "{debug}");
         assert!(debug.contains("redacted"), "{debug}");
 
-        let transport = TelegramTransport::from_config(&config);
+        let transport = TelegramTransport::from_config(&config).unwrap();
         let debug = format!("{transport:?}");
         assert!(!debug.contains("SeCrEtValue"), "{debug}");
     }
@@ -987,7 +1334,8 @@ record_voucher = "approve"
             .mount(&server)
             .await;
 
-        let transport = TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42);
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
         transport
             .send(
                 "Approve this action?",
@@ -1029,7 +1377,8 @@ record_voucher = "approve"
             .mount(&server)
             .await;
 
-        let transport = TelegramTransport::with_base_url(server.uri(), "123456:SeCrEtValue", 1);
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:SeCrEtValue", 1).unwrap();
         let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
 
         assert!(err.contains("401"), "{err}");
@@ -1050,12 +1399,116 @@ record_voucher = "approve"
         let uri = server.uri();
         drop(server);
 
-        let transport = TelegramTransport::with_base_url(uri, "123456:SeCrEtValue", 1);
+        let transport = TelegramTransport::with_base_url(uri, "123456:SeCrEtValue", 1).unwrap();
         let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
 
         assert!(
             !err.contains("SeCrEtValue"),
             "the error leaked the token: {err}"
+        );
+    }
+
+    /// Telegram reports application-level failures — "chat not found", "bot
+    /// was blocked by the user" — with **HTTP 200** and `ok: false`. Checking
+    /// only the status code calls those a delivered message.
+    #[tokio::test]
+    async fn a_200_with_ok_false_is_a_failure_and_carries_the_description() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:SeCrEtValue", 1).unwrap();
+        let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
+
+        assert!(
+            err.contains("chat not found"),
+            "the description is the only thing that says what went wrong: {err}"
+        );
+        assert!(
+            !err.contains("SeCrEtValue"),
+            "the error leaked the token: {err}"
+        );
+    }
+
+    /// A 200 that is not the documented envelope at all — a captive proxy, a
+    /// misconfigured self-hosted Bot API server — is also not a delivery.
+    #[tokio::test]
+    async fn a_200_that_is_not_the_bot_api_envelope_is_a_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>signed in?</html>"))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:SeCrEtValue", 1).unwrap();
+        let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
+
+        assert!(err.contains("envelope"), "{err}");
+        assert!(!err.contains("SeCrEtValue"), "{err}");
+    }
+
+    /// `reqwest::Client::new()` has no timeout whatsoever, and in Task 13 the
+    /// caller of this is a scheduler job: one black-holed `api.telegram.org`
+    /// would hold it until the process dies. The production value is 30 s;
+    /// the test shortens it so the test is fast. What is under test is that
+    /// the client has a timeout at all.
+    #[tokio::test]
+    async fn a_stalled_send_gives_up_instead_of_blocking_forever() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_string(r#"{"ok":true}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let transport = TelegramTransport::build(
+            server.uri(),
+            "123456:SeCrEtValue",
+            1,
+            Duration::from_millis(150),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the send did not time out; it waited {elapsed:?}"
+        );
+        assert!(
+            !err.contains("SeCrEtValue"),
+            "the timeout error leaked the token: {err}"
+        );
+    }
+
+    /// The production constructor is fallible rather than panicking, and its
+    /// happy path still builds.
+    #[test]
+    fn the_default_transport_builds_rather_than_panicking() {
+        assert!(TelegramTransport::new("123456:TOKEN", 1).is_ok());
+        assert!(
+            HTTP_TIMEOUT > Duration::ZERO,
+            "a timeout of zero is no timeout"
         );
     }
 }

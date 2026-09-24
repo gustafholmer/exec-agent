@@ -14,4 +14,4 @@ pub mod policy;
 pub mod telegram;
 
 pub use policy::{NotificationPolicy, NotifyConfig, Verdict};
-pub use telegram::{Notifier, TelegramConfig, TelegramTransport, Transport};
+pub use telegram::{Notifier, TelegramConfig, TelegramTransport, TelegramUserId, Transport};
