@@ -634,7 +634,10 @@ mod tests {
         // The owner regenerates the token in Canvas and rewrites the file.
         // The process keeps running.
         write_credentials(dir.path(), &mock.uri(), "second-token");
-        server.list_courses().await.expect("the call after the change");
+        server
+            .list_courses()
+            .await
+            .expect("the call after the change");
 
         let tokens: Vec<String> = mock
             .received_requests()
@@ -673,7 +676,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server = CanvasServer::new(dir.path());
 
-        let err = server.list_courses().await.expect_err("nothing to read yet");
+        let err = server
+            .list_courses()
+            .await
+            .expect_err("nothing to read yet");
         assert!(err.contains("credentials.json"), "{err}");
         assert!(err.contains("chmod 600"), "{err}");
 

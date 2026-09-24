@@ -2343,7 +2343,8 @@ record_voucher = "approve"
             "the answer is still there, cut short"
         );
         assert_eq!(
-            on_the_wire, reply,
+            on_the_wire,
+            reply,
             "the reply is cut to fit the note, so the transport has nothing \
              left to take: {} bytes",
             reply.len()
