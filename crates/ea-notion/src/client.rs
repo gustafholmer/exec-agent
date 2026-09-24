@@ -106,6 +106,17 @@ pub const MAX_PAGES: usize = 50;
 /// in requests.
 const PAGE_SIZE: u32 = 100;
 
+/// Ceiling on how many data sources a single database may report.
+///
+/// [`NotionClient::query_database`] resolves a database to its data sources
+/// and queries every one of them, so an unbounded `data_sources[]` array
+/// turns one call into `1 + N × `[`MAX_PAGES`]` requests with no ceiling on
+/// `N`. A real database is one data source, or a handful after a deliberate
+/// split; 12 is generous headroom above that. Reaching it is an error,
+/// discarding what was parsed, rather than silently querying only the first
+/// [`MAX_DATA_SOURCES`] — the same standard as [`MAX_PAGES`].
+pub const MAX_DATA_SOURCES: usize = 12;
+
 /// Blocks per `children` array. Notion's documented maximum per request;
 /// [`NotionClient::append_blocks`] chunks to it rather than letting a long
 /// append fail with a 400.
@@ -221,6 +232,25 @@ pub enum NotionError {
         operation: String,
         max_pages: usize,
         page_size: u32,
+    },
+
+    /// A database reported more data sources than [`MAX_DATA_SOURCES`].
+    ///
+    /// [`NotionClient::query_database`] queries every data source a database
+    /// reports, so an unbounded count turns one call into an unbounded number
+    /// of requests. Refused before any of them are queried, the same
+    /// discard-and-error standard as [`NotionError::PaginationCap`].
+    #[error(
+        "notion: database {database_id:?} reports {count} data sources, more than the {max} \
+         this build will iterate. Querying it would mean up to {count} × {max_pages} requests \
+         with no ceiling on the number of data sources. If it really has that many, resolve \
+         them with data_sources() and call query_data_source() directly for the ones you need."
+    )]
+    TooManyDataSources {
+        database_id: String,
+        count: usize,
+        max: usize,
+        max_pages: usize,
     },
 
     /// The caller asked for something impossible: a malformed id, a base URL
@@ -378,7 +408,13 @@ pub fn retry_delay(retry_after: Option<&str>, policy: &RetryPolicy) -> Duration 
     let parsed = retry_after
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|secs| secs.is_finite() && *secs >= 0.0)
-        .map(Duration::from_secs_f64);
+        // `Duration::from_secs_f64` panics when the value is finite but still
+        // out of `Duration`'s representable range — a server-controlled
+        // `Retry-After` of "1e30" or a 24-digit integer both parse to `Some`
+        // finite, non-negative `f64` and would panic here if converted with
+        // the non-fallible constructor. `try_from_secs_f64` turns that case
+        // into `None`, which falls through to the default backoff below.
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
 
     parsed
         .unwrap_or(policy.default_backoff)
@@ -602,6 +638,16 @@ impl NotionClient {
     ///
     /// Returns the raw Notion objects. A page's title comes out of
     /// [`page_title`] applied to its `properties`.
+    ///
+    /// **This sends no `filter`, so results are pages and data sources
+    /// mixed.** `POST /v1/search` accepts a `filter` narrowing to one
+    /// `object` type; this call omits it, and Notion's response carries an
+    /// `"object"` field (`"page"` or `"data_source"`) on every result but
+    /// does not sort or separate them. A caller that assumes every element of
+    /// the returned `Vec` is a page — and calls [`page_title`] or
+    /// [`fetch_page`](Self::fetch_page) on all of them uncritically — will
+    /// mis-render or mis-fetch the data sources mixed in. Check `"object"`
+    /// before treating a result as a page.
     pub async fn search(
         &self,
         query: Option<&str>,
@@ -660,6 +706,15 @@ impl NotionClient {
                 ),
             });
         };
+
+        if entries.len() > MAX_DATA_SOURCES {
+            return Err(NotionError::TooManyDataSources {
+                database_id: id,
+                count: entries.len(),
+                max: MAX_DATA_SOURCES,
+                max_pages: MAX_PAGES,
+            });
+        }
 
         let mut sources = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -826,6 +881,18 @@ impl NotionClient {
     /// No `position` is sent, so Notion's default — the end — applies; under
     /// [`NOTION_VERSION`] the old flat `after` parameter no longer exists and
     /// position is an object, which is why nothing here sends one.
+    ///
+    /// **This is not atomic across chunks.** Each chunk is one `PATCH`
+    /// request; if chunk *N* fails, every chunk before it has already been
+    /// appended to the page and there is no rollback — this returns `Err`
+    /// with the page left partially written. A caller that retries the whole
+    /// call on that error will re-append chunks 1..N-1 a second time,
+    /// duplicating content. A caller that needs exactly-once semantics across
+    /// a multi-chunk append must track how many chunks succeeded (the
+    /// partial `Vec` of created blocks is lost on error, since this returns
+    /// `Result<Vec<Value>, NotionError>` rather than `(Vec<Value>,
+    /// Option<NotionError>)`) and resume from there rather than blindly
+    /// re-calling with the full `blocks` slice.
     pub async fn append_blocks(
         &self,
         page_id: &str,
@@ -1524,6 +1591,8 @@ mod tests {
             "NaN",
             "inf",
             "Wed, 21 Oct 2026 07:28:00 GMT",
+            "1e30",
+            "99999999999999999999999",
         ] {
             assert_eq!(
                 retry_delay(Some(junk), &policy),
@@ -2076,6 +2145,48 @@ mod tests {
             .expect_err("malformed");
         assert!(matches!(err, NotionError::Malformed { .. }), "{err}");
         assert!(format!("{err}").contains("data_sources"), "{err}");
+    }
+
+    /// A database reporting more than [`MAX_DATA_SOURCES`] sources is refused
+    /// before any of them is queried — `query_database` would otherwise fan
+    /// out to one `query_data_source` call (itself up to `MAX_PAGES`
+    /// requests) per source, with no ceiling on how many sources a hostile or
+    /// malformed reply can report.
+    #[tokio::test]
+    async fn a_database_with_too_many_data_sources_is_refused_not_iterated() {
+        let server = MockServer::start().await;
+        let sources: Vec<Value> = (0..MAX_DATA_SOURCES + 1)
+            .map(|n| serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "name": format!("Source {n}") }))
+            .collect();
+        Mock::given(http_method("GET"))
+            .and(path(format!("/v1/databases/{DB_ID}")))
+            .respond_with(json_body(serde_json::json!({ "data_sources": sources })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .query_database(DB_ID, None)
+            .await
+            .expect_err("too many data sources must be refused, not iterated");
+        assert!(
+            matches!(err, NotionError::TooManyDataSources { .. }),
+            "{err}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains(&(MAX_DATA_SOURCES + 1).to_string()),
+            "names the count found: {text}"
+        );
+        assert!(
+            text.contains(&MAX_DATA_SOURCES.to_string()),
+            "names the cap: {text}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "only the one GET databases/{{id}} call — no data_sources/*/query request"
+        );
     }
 
     #[tokio::test]
