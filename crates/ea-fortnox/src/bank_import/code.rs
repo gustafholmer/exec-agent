@@ -46,6 +46,19 @@
 //! * **`LON` is listed last rather than next to `LÖN`.** Upstream's ordering
 //!   makes its own `HALLON` entry unreachable; see the comment at that entry in
 //!   [`KEYWORD_TO_BAS`].
+//!
+//! # Known limitation, deliberately left alone
+//!
+//! **`LON` is a three-character substring key.** Moving it fixed `HALLON`,
+//! which was the one collision with another entry in the table, but it did not
+//! change what a three-letter key is: any bank text containing the letters
+//! `LON` and no earlier keyword still codes to 7010 (lön). `SALONG`,
+//! `LONDON`, `BALLONG`, `MELONI` all do. That is inherited behaviour in a
+//! table the owner maintains, and the fix — word-boundary matching, or a
+//! longer key — would diverge from upstream for texts nobody here has seen.
+//! It is reported rather than fixed: the owner should either rename the entry
+//! or accept the miscodings, and either way a `LÅG`-confidence row is meant to
+//! be reviewed in the `Förslag` sheet before it is approved.
 
 use anyhow::{bail, Result};
 use rust_decimal::prelude::ToPrimitive;
@@ -212,6 +225,12 @@ pub const KEYWORD_TO_BAS: [(&str, &str); 41] = [
     // this to be the only such pair. `LON` therefore lives down here with the
     // other generic keys, and `keyword_table_is_ordered_specific_before_generic`
     // fails if any future entry recreates the problem.
+    //
+    // KNOWN LIMITATION, NOT FIXED: this is still a three-character substring
+    // key, so `SALONG`, `LONDON` and anything else containing the letters
+    // still code to 7010. Only the collision with another *table entry* was
+    // fixed; the general over-matching is upstream's and is left to the table's
+    // owner. See the module docs.
     ("LON", "7010"),
     // bank fees: the generic key must stay last
     ("SEB AVGIFT", "6570"),
@@ -707,6 +726,22 @@ mod tests {
             code(&seb("-30000", "LÖNEUTBETALNING"), None).bas_konto,
             "7010"
         );
+    }
+
+    #[test]
+    fn lon_still_over_matches_any_text_containing_those_three_letters() {
+        // NOT A BUG BEING FIXED — a known limitation, pinned so it is visible
+        // rather than surprising. Moving `LON` fixed the collision with the
+        // table's own `HALLON` entry; it did not stop a three-letter
+        // substring key from matching ordinary Swedish and English words.
+        // Changing that would diverge from upstream for texts nobody here has
+        // seen, so it is reported to the table's owner instead. See the
+        // module docs.
+        for text in ["SALONG SAX", "LONDON HEATHROW", "BALLONGFÄRD"] {
+            let c = code(&seb("-500", text), None);
+            assert_eq!(c.bas_konto, "7010", "{text}");
+            assert_eq!(c.confidence, Confidence::Lag, "{text}");
+        }
     }
 
     #[test]
