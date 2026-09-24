@@ -39,6 +39,7 @@ use ea_daemon::daemon::{Daemon, Deps, SHUTDOWN_DRAIN};
 use ea_daemon::executor::Executor;
 use ea_daemon::ipc;
 use ea_daemon::jobs::{self, Pusher, TriageDeps};
+use ea_daemon::lock::InstanceLock;
 use ea_daemon::notify::log::NotificationLog;
 use ea_daemon::notify::policy::NotificationPolicy;
 use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, TOKEN_FILE};
@@ -63,6 +64,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config_dir = ea_core::paths::config_dir();
     let state_dir = ea_core::paths::state_dir();
+
+    // Before anything else touches the state directory. A second daemon
+    // sharing this directory would share the database, the session budget and
+    // the connectors' credentials, and would take the control socket away from
+    // the first one without either noticing — see `lock`. Held for the whole
+    // of `main`; the kernel releases it however this process ends.
+    let _instance = InstanceLock::acquire(&ea_core::paths::lock_path())?;
 
     let config = DaemonConfig::load_from(&config_dir)?;
     tracing::info!(?config, "configuration loaded");
@@ -147,6 +155,19 @@ async fn main() -> anyhow::Result<()> {
             "telegram is not configured: nothing will be pushed and no button can be pressed"
         );
     }
+
+    // --- what the last run left behind --------------------------------------
+    //
+    // Before the scheduler starts and before the socket is bound: an action
+    // the previous process was mid-way through executing when it died is
+    // resolved as failed-with-unknown-outcome and never retried. See
+    // `recovery`.
+    ea_daemon::recovery::sweep_stranded(
+        &ActionStore::new(Arc::clone(&conn)),
+        &NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        pusher.as_ref(),
+    )
+    .await?;
 
     // --- scheduler ---------------------------------------------------------
     let scheduler = Arc::new(Scheduler::with_cooldown(

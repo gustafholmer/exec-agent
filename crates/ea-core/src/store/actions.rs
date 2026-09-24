@@ -301,6 +301,52 @@ impl ActionStore {
         Ok(changed == 1)
     }
 
+    /// Every action left in the half-state [`claim_for_execution`] creates:
+    /// `approved`, with `executed_at` already stamped.
+    ///
+    /// Reachable only by a crash — the process dying, or being killed, between
+    /// the claim and `mark_executed`/`mark_failed`. Such a row is invisible
+    /// everywhere else: [`ActionStore::pending`] and [`ActionStore::expire_stale`]
+    /// look only at `proposed`, `ea status` counts only pending, and every
+    /// retention DELETE lists terminal statuses that `approved` is not one of.
+    /// The owner approved something and it silently never happened.
+    ///
+    /// Oldest first, so a report of them reads chronologically.
+    ///
+    /// [`claim_for_execution`]: ActionStore::claim_for_execution
+    pub fn stranded(&self) -> anyhow::Result<Vec<Action>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM actions
+             WHERE status = 'approved' AND executed_at IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Resolve one stranded row as `failed`, with `reason`, **keeping the
+    /// `executed_at` stamp that recorded when it was claimed**.
+    ///
+    /// Deliberately not `mark_failed`: that one stamps `executed_at = now`,
+    /// which would overwrite the only record of when the lost attempt actually
+    /// started. The `executed_at IS NOT NULL` conjunct is what keeps this
+    /// method from being a way to fail an action that is legitimately mid-
+    /// flight in a live executor — that row has no stamp yet.
+    ///
+    /// Returns `false` when the row was not (or is no longer) stranded.
+    pub fn fail_stranded(&self, id: i64, reason: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE actions SET status = 'failed', reason = ?2
+                 WHERE id = ?1 AND status = 'approved' AND executed_at IS NOT NULL",
+                params![id, reason],
+            )
+            .context("resolving a stranded action")?;
+        Ok(changed == 1)
+    }
+
     pub fn expire_stale(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -393,6 +439,101 @@ mod tests {
         let failed = store.mark_failed(a.id, "connector timed out").unwrap();
         assert_eq!(failed.status, ActionStatus::Failed);
         assert_eq!(failed.reason.as_deref(), Some("connector timed out"));
+    }
+
+    /// A crash between the claim and the outcome leaves exactly this row, and
+    /// before `stranded()` nothing in the system could see it.
+    #[test]
+    fn a_claimed_but_unfinished_action_is_stranded() {
+        let (_dir, conn) = temp_store();
+        let store = ActionStore::new(conn);
+        let a = store.propose(input()).unwrap();
+        store.approve(a.id).unwrap();
+        assert!(store.claim_for_execution(a.id).unwrap());
+        // ... and now the process dies.
+
+        assert!(
+            store.pending().unwrap().is_empty(),
+            "a stranded row is invisible to pending()"
+        );
+        assert_eq!(
+            store
+                .expire_stale(Utc::now() + Duration::days(365))
+                .unwrap(),
+            0,
+            "a stranded row is invisible to expire_stale"
+        );
+
+        let stranded = store.stranded().unwrap();
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].id, a.id);
+    }
+
+    #[test]
+    fn an_approved_action_nobody_has_claimed_is_not_stranded() {
+        let (_dir, conn) = temp_store();
+        let store = ActionStore::new(conn);
+        let a = store.propose(input()).unwrap();
+        store.approve(a.id).unwrap();
+        assert!(
+            store.stranded().unwrap().is_empty(),
+            "an approved-but-unclaimed action is waiting for the executor, not stranded"
+        );
+    }
+
+    #[test]
+    fn finished_actions_are_not_stranded() {
+        let (_dir, conn) = temp_store();
+        let store = ActionStore::new(conn);
+        for outcome in ["executed", "failed"] {
+            let a = store.propose(input()).unwrap();
+            store.approve(a.id).unwrap();
+            assert!(store.claim_for_execution(a.id).unwrap());
+            if outcome == "executed" {
+                store.mark_executed(a.id, "ok").unwrap();
+            } else {
+                store.mark_failed(a.id, "nope").unwrap();
+            }
+        }
+        assert!(store.stranded().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolving_a_stranded_action_keeps_the_claim_stamp() {
+        let (_dir, conn) = temp_store();
+        let store = ActionStore::new(conn);
+        let a = store.propose(input()).unwrap();
+        store.approve(a.id).unwrap();
+        store.claim_for_execution(a.id).unwrap();
+        let claimed_at = store.get(a.id).unwrap().unwrap().executed_at.unwrap();
+
+        assert!(store.fail_stranded(a.id, "the daemon crashed").unwrap());
+
+        let row = store.get(a.id).unwrap().unwrap();
+        assert_eq!(row.status, ActionStatus::Failed);
+        assert_eq!(row.reason.as_deref(), Some("the daemon crashed"));
+        assert_eq!(
+            row.executed_at.as_deref(),
+            Some(claimed_at.as_str()),
+            "the claim stamp is the only record of when the lost attempt started"
+        );
+        assert!(store.stranded().unwrap().is_empty());
+    }
+
+    /// The conjunct that matters: an approved action with no claim stamp is
+    /// one the executor may be about to run, and must not be failed from under
+    /// it by a recovery sweep.
+    #[test]
+    fn fail_stranded_refuses_an_unclaimed_approved_action() {
+        let (_dir, conn) = temp_store();
+        let store = ActionStore::new(conn);
+        let a = store.propose(input()).unwrap();
+        store.approve(a.id).unwrap();
+        assert!(!store.fail_stranded(a.id, "crash").unwrap());
+        assert_eq!(
+            store.get(a.id).unwrap().unwrap().status,
+            ActionStatus::Approved
+        );
     }
 
     #[test]

@@ -74,6 +74,11 @@ pub fn socket_path() -> PathBuf {
     state_dir().join("daemon.sock")
 }
 
+/// The single-instance lockfile. See `ea_daemon::lock`.
+pub fn lock_path() -> PathBuf {
+    state_dir().join("daemon.lock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
