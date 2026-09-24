@@ -327,7 +327,16 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "connectors": self.connectors,
             "sessions_available": self.chat.sessions_available(),
             "notifier_configured": self.pusher.is_some(),
-            "daily_session_budget": self.chat.daily_session_budget(),
+            // Spent against the ceiling, over the owner's day rather than
+            // UTC's. Together with `digest_pending` above, these are the two
+            // numbers that say at a glance whether the daemon is working or
+            // quietly stuck: a budget at its ceiling means triage has stopped
+            // scoring and the briefings have stopped writing, and a digest
+            // that keeps climbing past a day means the briefing that drains
+            // it is not running.
+            "sessions_today": self.chat.budget().status_line(Utc::now()),
+            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).unwrap_or_default(),
+            "daily_session_budget": self.chat.budget().limit(),
             "chat_model": self.chat.model(),
             "facts": self.chat.facts().all().map(|f| f.len()).unwrap_or_default(),
             "started_at": self.started_at.to_rfc3339(),
@@ -605,6 +614,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::budget::Budget;
     use crate::chat::ChatService;
     use crate::scheduler::Job;
     use crate::session::{SessionOutcome, SessionRequest};
@@ -772,9 +782,12 @@ record_voucher = "approve"
             let chat = Arc::new(ChatService::new(
                 conversations.clone(),
                 facts.clone(),
-                RunStore::new(Arc::clone(&conn)),
                 sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
-                budget,
+                Budget::new(
+                    RunStore::new(Arc::clone(&conn)),
+                    budget,
+                    crate::notify::policy::DEFAULT_TIME_ZONE,
+                ),
                 crate::config::DEFAULT_CHAT_MODEL,
                 crate::notify::policy::DEFAULT_TIME_ZONE,
             ));
@@ -1594,28 +1607,77 @@ record_voucher = "approve"
         assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
     }
 
-    /// The budget is a ceiling on model spend, and it has to actually stop a
-    /// session rather than merely being reported.
+    /// **The owner's own message is never refused.**
+    ///
+    /// The budget stops the work the daemon decided to do on its own — triage
+    /// degrades to tier 0, the briefings wait for tomorrow — and neither of
+    /// those has a human sitting in front of it. A typed message does, it has
+    /// no cheaper tier to fall back to, and the moment the owner reaches for
+    /// chat is usually the moment they are asking why the daemon has gone
+    /// quiet. Refusing then leaves them editing a config file to get a
+    /// sentence out of it.
+    ///
+    /// What the budget does instead is say so on every turn past the ceiling,
+    /// while still counting the spend, so `ea status` stays honest and the
+    /// unattended work is what stops first.
     #[tokio::test]
-    async fn chat_stops_starting_sessions_once_the_daily_budget_is_spent() {
+    async fn chat_answers_the_owner_even_when_the_daily_budget_is_spent() {
         let f = Fixture::build(true, 2);
-        for _ in 0..2 {
-            let reply = f.call("chat", json!({ "message": "hi" })).await.unwrap();
-            assert_eq!(reply["reply"], "here is your answer");
-        }
+
+        let first = f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        assert_eq!(first["reply"], "here is your answer");
+        assert!(first["note"].is_null(), "under the ceiling: {first}");
+
+        // The turn that spends the last session says so on itself rather than
+        // waiting for the next one to be surprised.
+        let second = f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        assert_eq!(second["reply"], "here is your answer");
+        assert!(
+            second["note"].as_str().unwrap().contains("budget"),
+            "{second}"
+        );
+
         let third = f
             .call("chat", json!({ "message": "hi again" }))
             .await
             .unwrap();
-        assert!(third["reply"].is_null(), "{third}");
-        assert!(third["note"].as_str().unwrap().contains("budget"));
+        assert_eq!(
+            third["reply"], "here is your answer",
+            "the owner is answered: {third}"
+        );
+        let note = third["note"].as_str().unwrap();
+        assert!(note.contains("budget"), "{note}");
+        assert!(note.contains("Europe/Stockholm"), "{note}");
         assert_eq!(
             f.sessions.as_ref().unwrap().seen.lock().unwrap().len(),
-            2,
-            "no third session may be started"
+            3,
+            "the third session runs"
         );
-        // The message is still recorded, budget or no budget.
         assert!(third["message_id"].as_i64().unwrap() > 0);
+
+        // And the spend is visible rather than hidden: over the ceiling, and
+        // saying so.
+        let status = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(status["sessions_today"], "3/2");
+        assert_eq!(status["sessions_spent_today"], 3);
+    }
+
+    /// The two numbers `ea status` exists to put next to each other.
+    #[tokio::test]
+    async fn status_reports_the_sessions_spent_today_against_the_ceiling() {
+        let f = Fixture::build(true, 60);
+        let before = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(before["sessions_today"], "0/60");
+        assert_eq!(before["daily_session_budget"], 60);
+        assert_eq!(before["digest_pending"], 0);
+
+        f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        f.daemon.notify_log.push_digest("held back").unwrap();
+
+        let after = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(after["sessions_today"], "1/60");
+        assert_eq!(after["sessions_spent_today"], 1);
+        assert_eq!(after["digest_pending"], 1);
     }
 
     /// A chat session must not be handed connector servers, and must reach the
@@ -1670,9 +1732,12 @@ record_voucher = "approve"
         let chat = Arc::new(ChatService::new(
             f.conversations.clone(),
             f.facts.clone(),
-            f.daemon.runs.clone(),
             f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
-            60,
+            Budget::new(
+                f.daemon.runs.clone(),
+                60,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            ),
             "claude-opus-4-5",
             crate::notify::policy::DEFAULT_TIME_ZONE,
         ));

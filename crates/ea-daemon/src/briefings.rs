@@ -50,9 +50,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use ea_core::policy::{Mode, Policy};
 use ea_core::store::events::{kinds, Event, EventStore};
-use ea_core::store::runs::RunStore;
 use serde_json::{json, Value};
 
+use crate::budget::Budget;
 use crate::executor::ToolCaller;
 use crate::jobs::Pusher;
 use crate::notify::log::NotificationLog;
@@ -130,7 +130,6 @@ const ACCOUNT_LEDGER_TOOL: &str = "account_ledger";
 /// [`ToolCaller`] returns an `impl Future` and so is not `dyn`-compatible.
 pub struct BriefingDeps<C: ToolCaller> {
     pub events: EventStore,
-    pub runs: RunStore,
     pub log: NotificationLog,
     /// Absent when `claude` could not be resolved at start-up. A briefing then
     /// reports that rather than silently not happening.
@@ -145,7 +144,9 @@ pub struct BriefingDeps<C: ToolCaller> {
     /// `NotifyConfig::threshold`: the line above which an event was worth an
     /// interruption. The morning briefing reports what crossed it.
     pub threshold: u8,
-    pub daily_session_budget: u32,
+    /// The day's ceiling on model sessions. A briefing that would push it over
+    /// is skipped and says so; the next one is tomorrow, or next week.
+    pub budget: Budget,
 }
 
 /// What one briefing did. Returned rather than logged so tests can assert it.
@@ -171,6 +172,11 @@ pub struct Material {
     pub sections: Vec<(String, String)>,
 }
 
+/// What a section with no content says, rather than vanishing. An empty
+/// heading invites the model to fill the gap; a heading followed by this does
+/// not.
+pub const EMPTY_SECTION: &str = "(nothing)";
+
 impl Material {
     fn push(&mut self, heading: impl Into<String>, body: impl Into<String>) {
         let body = body.into();
@@ -178,11 +184,21 @@ impl Material {
         self.sections.push((
             heading.into(),
             if body.is_empty() {
-                "(nothing)".to_string()
+                EMPTY_SECTION.to_string()
             } else {
                 body.to_string()
             },
         ));
+    }
+
+    /// Is every section empty?
+    ///
+    /// The morning briefing's cheap path: material with nothing in it is
+    /// nothing for a model to write about, and spending a Sonnet session to
+    /// have it say so costs money to produce a worse sentence than
+    /// [`NOTHING_NEEDED`].
+    pub fn is_empty(&self) -> bool {
+        self.sections.iter().all(|(_, body)| body == EMPTY_SECTION)
     }
 
     /// The prompt body: every section, headed.
@@ -532,10 +548,10 @@ async fn deliver<C: ToolCaller>(
         tracing::warn!(briefing = kind, "no session runner; skipping");
         return Ok(outcome);
     };
-    if crate::jobs::session_budget_spent(&deps.runs, deps.daily_session_budget, Utc::now())? {
+    if !deps.budget.try_consume(Utc::now())? {
         outcome.note = Some(format!(
-            "the daily session budget of {} is spent, so there is no briefing",
-            deps.daily_session_budget
+            "{}, so there is no briefing",
+            deps.budget.spent_note()
         ));
         tracing::warn!(briefing = kind, "daily session budget spent; skipping");
         return Ok(outcome);
@@ -588,10 +604,34 @@ async fn deliver<C: ToolCaller>(
     Ok(outcome)
 }
 
+/// What the morning briefing says on a morning with nothing in it.
+///
+/// **Silence is not an acceptable answer here.** A daemon that has nothing to
+/// report and a daemon that died in the night look identical from the owner's
+/// phone, and the second one is the failure this whole system is supposed to
+/// prevent rather than cause. One short line every morning is the cheapest
+/// liveness signal there is, and it costs no session: an empty briefing is
+/// exactly the case where a model has nothing to add.
+pub const NOTHING_NEEDED: &str = "Nothing needing you this morning.";
+
 /// The daily briefing: today's calendar, what triage has not looked at, what
 /// crossed the interruption threshold, and the accumulated digest.
 ///
 /// `since` is the previous anchor — what "since the last briefing" means.
+///
+/// # The morning is never silent
+///
+/// Three things can leave [`deliver`] with nothing sent — no session runner,
+/// a spent budget, or a session that answered with whitespace — and a fourth,
+/// an empty gather, never reaches it at all. All four used to produce no
+/// message. They now produce a short one that says which it was, because the
+/// owner reading nothing cannot tell any of them from a dead daemon, and the
+/// anxiety of not knowing is the thing this system exists to remove.
+///
+/// The fallback deliberately does **not** carry the digest. It is a liveness
+/// line, not a substitute briefing: the backlog stays in the log and goes out
+/// with the next real one, which is also why `digest_lines` stays zero and the
+/// prefix is not dropped.
 pub async fn run_morning_briefing<C: ToolCaller>(
     deps: &BriefingDeps<C>,
     now: DateTime<Utc>,
@@ -600,9 +640,21 @@ pub async fn run_morning_briefing<C: ToolCaller>(
     // Read without clearing, and clear exactly this prefix afterwards — see
     // `NotificationLog::drop_digest_prefix`. Clearing first would lose the
     // backlog if the session or the send failed; clearing last would throw away
-    // lines triage pushed while the session was running.
+    // lines triage pushed while the session was running. It is also what makes
+    // a second briefing on the same day report nothing twice: the first one
+    // dropped exactly the lines it sent.
     let digest = deps.log.digest()?;
     let material = morning_material(deps, now, since, &digest)?;
+
+    if material.is_empty() {
+        tracing::info!("nothing to brief on; sending the short line instead of a session");
+        let mut outcome = BriefingOutcome {
+            note: Some("nothing needing the owner, so no session was spent".to_string()),
+            ..BriefingOutcome::default()
+        };
+        outcome.sent = push_fallback(deps, NOTHING_NEEDED).await?;
+        return Ok(outcome);
+    }
 
     let mut outcome = deliver(
         deps,
@@ -615,8 +667,44 @@ pub async fn run_morning_briefing<C: ToolCaller>(
     if outcome.sent {
         deps.log.drop_digest_prefix(digest.len())?;
         outcome.digest_lines = digest.len();
+        return Ok(outcome);
+    }
+
+    // Nothing went out, and the reason is in `note`. Say it rather than
+    // leaving the morning blank.
+    if let Some(note) = outcome.note.clone() {
+        outcome.sent = push_fallback(deps, &fallback_line(&note, digest.len())).await?;
     }
     Ok(outcome)
+}
+
+/// The one-line stand-in for a briefing that could not be written.
+fn fallback_line(note: &str, held: usize) -> String {
+    let mut line = format!("No briefing this morning: {note}.");
+    if held > 0 {
+        line.push_str(&format!(
+            " {held} item{} {} waiting in the digest and will keep.",
+            if held == 1 { "" } else { "s" },
+            if held == 1 { "is" } else { "are" },
+        ));
+    }
+    line
+}
+
+/// Push a short line, returning whether it went anywhere.
+///
+/// A missing notifier is not an error: a daemon with no Telegram credentials
+/// is a configuration the owner chose, and the note already records it.
+async fn push_fallback<C: ToolCaller>(deps: &BriefingDeps<C>, text: &str) -> anyhow::Result<bool> {
+    let Some(pusher) = deps.pusher.as_ref() else {
+        tracing::warn!("no notifier configured; the morning line was not sent");
+        return Ok(false);
+    };
+    pusher
+        .notify(text)
+        .await
+        .context("sending the morning briefing's short line")?;
+    Ok(true)
 }
 
 /// The weekly accounting pass.
@@ -656,6 +744,7 @@ mod tests {
     use chrono_tz::Europe::Stockholm;
     use ea_core::store::events::RecordInput;
     use ea_core::store::kv::KvStore;
+    use ea_core::store::runs::RunStore;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -816,7 +905,6 @@ record_voucher = "approve"
         let sessions = SpySessions::new("the briefing");
         let deps = BriefingDeps {
             events: events.clone(),
-            runs: RunStore::new(Arc::clone(&conn)),
             log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
             sessions: Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
@@ -824,7 +912,7 @@ record_voucher = "approve"
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            daily_session_budget: 60,
+            budget: Budget::new(RunStore::new(Arc::clone(&conn)), 60, Stockholm),
         };
         Fixture {
             _dir: dir,
@@ -994,6 +1082,10 @@ record_voucher = "approve"
         use crate::session::{build_argv, McpConfig};
 
         let f = fixture();
+        // A digest line is connector-authored text, which is exactly the
+        // provenance this test is about — and it is what makes the morning
+        // material non-empty enough to be worth a session at all.
+        f.log.push_digest("[kth] examiner mail (40)").unwrap();
         run_morning_briefing(
             &f.deps,
             utc("2026-09-25T05:00:00Z"),
@@ -1104,6 +1196,142 @@ record_voucher = "approve"
         assert_eq!(f.log.digest_len().unwrap(), 0);
     }
 
+    /// **A second briefing on the same day must not repeat the first one.**
+    ///
+    /// The digest is a backlog, not a feed: a line reported at 07:00 and
+    /// reported again at 07:05 teaches the owner to stop reading the 07:00
+    /// one. `drop_digest_prefix` is what makes the second pass see an empty
+    /// backlog, and this is the test that it is actually called.
+    #[tokio::test]
+    async fn a_second_briefing_the_same_day_does_not_repeat_the_digest() {
+        let f = fixture();
+        // Something other than the digest, so the second briefing still has
+        // material and takes the session path rather than the short line.
+        record(
+            &f.events,
+            "google",
+            "today",
+            kinds::CALENDAR_EVENT,
+            json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
+        );
+        f.log.push_digest("[notion] a page moved (30)").unwrap();
+
+        let first = run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:00:00Z"),
+            utc("2026-09-24T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.digest_lines, 1);
+
+        let second = run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:30:00Z"),
+            utc("2026-09-25T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.digest_lines, 0);
+
+        let prompts = f.sessions.requests();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].prompt.contains("a page moved"),
+            "{}",
+            prompts[0].prompt
+        );
+        assert!(
+            !prompts[1].prompt.contains("a page moved"),
+            "the second briefing must not report it again: {}",
+            prompts[1].prompt
+        );
+        assert_eq!(f.log.digest_len().unwrap(), 0);
+    }
+
+    /// A line pushed *while* the session was running belongs to the next
+    /// briefing, not to the void: only the prefix that was read is dropped.
+    #[tokio::test]
+    async fn a_line_that_arrives_during_the_briefing_is_kept_for_the_next_one() {
+        let f = fixture();
+        f.log.push_digest("reported").unwrap();
+
+        let outcome = run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:00:00Z"),
+            utc("2026-09-24T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.digest_lines, 1);
+
+        // Standing in for a triage pass that landed mid-session: the prefix
+        // rule is what decides which briefing this belongs to.
+        f.log.push_digest("arrived later").unwrap();
+        assert_eq!(f.log.digest().unwrap(), vec!["arrived later".to_string()]);
+    }
+
+    /// **An empty morning is a short message, not silence.**
+    ///
+    /// A daemon with nothing to report and a daemon that died in the night
+    /// look identical from the owner's phone. One line every morning is the
+    /// cheapest liveness signal there is — and it costs no session, because a
+    /// model asked to write about nothing produces a worse sentence than the
+    /// constant does.
+    #[tokio::test]
+    async fn an_empty_digest_produces_a_short_message_rather_than_silence() {
+        let f = fixture();
+
+        let outcome = run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:00:00Z"),
+            utc("2026-09-24T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.sent, "the morning is never silent");
+        assert!(!outcome.thought, "and it costs nothing to say so");
+        assert_eq!(f.pusher.sent(), vec![NOTHING_NEEDED.to_string()]);
+        assert!(
+            f.sessions.requests().is_empty(),
+            "no session may be spent on an empty briefing"
+        );
+    }
+
+    /// The brief's sequence, end to end: the briefing drains the digest, and
+    /// the second one that day has nothing left — so it says so rather than
+    /// going quiet.
+    #[tokio::test]
+    async fn the_briefing_after_a_drain_says_nothing_needing_you() {
+        let f = fixture();
+        f.log.push_digest("[notion] a page moved (30)").unwrap();
+
+        run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:00:00Z"),
+            utc("2026-09-24T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.log.digest_len().unwrap(), 0);
+
+        let second = run_morning_briefing(
+            &f.deps,
+            utc("2026-09-25T05:30:00Z"),
+            utc("2026-09-25T05:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        assert!(second.sent);
+        assert!(!second.thought);
+        assert_eq!(
+            f.pusher.sent(),
+            vec!["the briefing".to_string(), NOTHING_NEEDED.to_string()]
+        );
+    }
+
     /// **The digest must not be destroyed by a briefing that never arrived.**
     /// The owner would never learn what was in it.
     #[tokio::test]
@@ -1129,6 +1357,9 @@ record_voucher = "approve"
 
     /// No `claude` on PATH is a degraded daemon, not a failed job: the breaker
     /// must not trip on it, and the digest must survive.
+    ///
+    /// It must also not be *silent*. A morning with no message is how the
+    /// owner would learn about a broken install — which is to say, never.
     #[tokio::test]
     async fn without_a_session_runner_the_briefing_says_so_and_keeps_the_digest() {
         let mut f = fixture();
@@ -1143,15 +1374,33 @@ record_voucher = "approve"
         .await
         .unwrap();
 
-        assert!(!outcome.thought && !outcome.sent);
+        assert!(!outcome.thought, "no session ran");
+        assert!(outcome.sent, "but the morning is not silent");
         assert!(outcome.note.unwrap().contains("no session runner"));
-        assert_eq!(f.log.digest_len().unwrap(), 1);
+        let sent = f.pusher.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("no session runner"), "{}", sent[0]);
+        assert!(
+            sent[0].contains("1 item is waiting"),
+            "the owner is told the backlog is safe: {}",
+            sent[0]
+        );
+
+        assert_eq!(
+            f.log.digest_len().unwrap(),
+            1,
+            "the short line is not a briefing, so it drains nothing"
+        );
+        assert_eq!(outcome.digest_lines, 0);
     }
 
     #[tokio::test]
     async fn a_spent_budget_skips_the_briefing_without_failing_it() {
         let mut f = fixture();
-        f.deps.daily_session_budget = 0;
+        f.deps.budget = Budget::new(RunStore::new(Arc::clone(&f.conn)), 0, Stockholm);
+        // Non-empty material, so the short-line path is not what is being
+        // measured here: this is the session that must not start.
+        f.log.push_digest("something worth a briefing").unwrap();
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1294,6 +1543,7 @@ record_voucher = "approve"
     #[tokio::test]
     async fn every_briefing_session_pins_its_model_and_takes_no_connectors() {
         let f = fixture();
+        f.log.push_digest("something to brief on").unwrap();
         run_morning_briefing(
             &f.deps,
             utc("2026-09-25T05:00:00Z"),
@@ -1350,7 +1600,6 @@ record_voucher = "approve"
         let f = fixture();
         let deps = BriefingDeps {
             events: f.deps.events.clone(),
-            runs: f.deps.runs.clone(),
             log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             sessions: f.deps.sessions.clone(),
             pusher: f.deps.pusher.clone(),
@@ -1358,7 +1607,7 @@ record_voucher = "approve"
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            daily_session_budget: 60,
+            budget: Budget::new(RunStore::new(Arc::clone(&f.conn)), 60, Stockholm),
         };
 
         let outcome = run_vat_prep(&deps, utc("2026-10-01T07:00:00Z"))

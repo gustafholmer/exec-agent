@@ -35,9 +35,9 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use ea_core::store::conversations::ConversationStore;
 use ea_core::store::facts::{Fact, FactStore};
-use ea_core::store::runs::RunStore;
 use serde::Serialize;
 
+use crate::budget::Budget;
 use crate::session::{SessionRequest, ToolScope};
 use crate::triage::SessionBoundary;
 
@@ -100,8 +100,9 @@ pub struct ChatTurn {
     pub message_id: i64,
     /// The assistant's answer, or `None` when no session could be run.
     pub reply: Option<String>,
-    /// Why there is no reply, in a sentence for a human. `None` when there is
-    /// one.
+    /// What a human should know about this turn beyond the reply itself, in
+    /// a sentence: why there is no reply, or — when there is one — that it was
+    /// answered over the day's session budget. `None` on an ordinary turn.
     pub note: Option<String>,
 }
 
@@ -122,9 +123,8 @@ pub trait ChatResponder: Send + Sync {
 pub struct ChatService {
     conversations: ConversationStore,
     facts: FactStore,
-    runs: RunStore,
     sessions: Option<Arc<dyn SessionBoundary>>,
-    daily_session_budget: u32,
+    budget: Budget,
     model: String,
     time_zone: Tz,
     /// Held for the whole of a turn. See the module docs: this is what makes a
@@ -136,18 +136,16 @@ impl ChatService {
     pub fn new(
         conversations: ConversationStore,
         facts: FactStore,
-        runs: RunStore,
         sessions: Option<Arc<dyn SessionBoundary>>,
-        daily_session_budget: u32,
+        budget: Budget,
         model: impl Into<String>,
         time_zone: Tz,
     ) -> Self {
         Self {
             conversations,
             facts,
-            runs,
             sessions,
-            daily_session_budget,
+            budget,
             model: model.into(),
             time_zone,
             turn: tokio::sync::Mutex::new(()),
@@ -165,8 +163,11 @@ impl ChatService {
         self.sessions.is_some()
     }
 
-    pub fn daily_session_budget(&self) -> u32 {
-        self.daily_session_budget
+    /// The day's session ceiling, as `ea status` reports it. Chat is not
+    /// stopped by it — see [`ChatService::say`] — but it is counted against
+    /// it, and the count is what the owner reads.
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// The model a chat turn runs on, reported by `ea status` so that what the
@@ -182,6 +183,33 @@ impl ChatService {
     /// thread at once. A caller that arrives during someone else's turn waits
     /// for it; that is deliberate, and it is why `ea chat`'s client timeout is
     /// generous.
+    ///
+    /// # The budget does not refuse the owner
+    ///
+    /// This is the one session kind [`Budget`] does not stop, and the
+    /// asymmetry is deliberate rather than an oversight:
+    ///
+    /// * The budget exists to bound **unattended** spend — work the daemon
+    ///   starts by itself, on a timer, while nobody is watching. A typed
+    ///   message is not that. It is bounded by the owner's own patience, and
+    ///   it is the only session in the system a human is waiting on.
+    /// * Triage degrades to tier 0 and briefings wait for tomorrow because
+    ///   both have somewhere to degrade *to*. Chat has neither a cheaper tier
+    ///   nor a next occurrence: refusing it is the whole failure, not a
+    ///   reduced version of the service.
+    /// * A refusal arrives at exactly the wrong moment. The owner typing into
+    ///   a daemon that has gone quiet is usually asking *why it has gone
+    ///   quiet*, and the answer "I will not answer you" leaves them editing a
+    ///   config file and restarting a daemon to get a sentence out of it.
+    ///
+    /// What the budget does instead is **tell them**, on every turn past the
+    /// ceiling, and keep counting: a chatty day spends the budget, and it is
+    /// the background work that stops. That ordering is the point — the
+    /// daemon sheds what it chose to do before it sheds what it was asked to
+    /// do. The spend stays visible in `ea status` (`sessions_today: 63/60`)
+    /// and in the note on every over-budget turn, so this is not an unbounded
+    /// hole: it is a bound the owner has to keep choosing to cross, one
+    /// message at a time, while being told.
     pub async fn say(&self, surface: &str, message: &str) -> anyhow::Result<ChatTurn> {
         let surface = validated_surface(surface)?;
         let message = message.trim().to_string();
@@ -208,7 +236,7 @@ impl ChatService {
         let outcome = self.reply_to(conversation_id, surface, &message).await;
 
         let (reply, note) = match outcome {
-            Ok(Some(reply)) => (Some(reply), None),
+            Ok(Some(reply)) => (Some(reply), self.over_budget_note()),
             Ok(None) => (None, Some(self.why_no_reply())),
             // Not swallowed into a note: the caller asked a question and did
             // not get an answer, and a turn that failed must not leave an
@@ -232,8 +260,11 @@ impl ChatService {
         })
     }
 
-    /// Run one chat session, or `None` when there is no session runner or the
-    /// day's budget is spent.
+    /// Run one chat session, or `None` when there is no session runner.
+    ///
+    /// A spent budget is *not* a reason to return `None`; see
+    /// [`ChatService::say`]. No `claude` on PATH is, because then there is
+    /// nothing to run at all.
     async fn reply_to(
         &self,
         conversation_id: i64,
@@ -243,9 +274,6 @@ impl ChatService {
         let Some(sessions) = self.sessions.as_ref() else {
             return Ok(None);
         };
-        if crate::jobs::session_budget_spent(&self.runs, self.daily_session_budget, Utc::now())? {
-            return Ok(None);
-        }
 
         let relevant = self.facts.matching(message)?;
         let now = Utc::now().with_timezone(&self.time_zone);
@@ -285,16 +313,33 @@ impl ChatService {
         Ok(Some(outcome.text))
     }
 
+    /// The only reason a turn has no reply: nothing to run it with.
     fn why_no_reply(&self) -> String {
-        if self.sessions.is_none() {
-            "recorded, but this daemon has no session runner (is `claude` on PATH?), \
-             so there is no reply"
-                .to_string()
-        } else {
-            format!(
-                "recorded, but the daily session budget of {} is spent, so there is no reply",
-                self.daily_session_budget
-            )
+        "recorded, but this daemon has no session runner (is `claude` on PATH?), \
+         so there is no reply"
+            .to_string()
+    }
+
+    /// The caveat carried alongside a reply that was answered over the day's
+    /// ceiling.
+    ///
+    /// Read *after* the turn, so the session this turn just spent is included
+    /// in the count: the note on the turn that crosses the line says so on
+    /// that turn, not on the next one.
+    fn over_budget_note(&self) -> Option<String> {
+        match self.budget.is_spent(Utc::now()) {
+            Ok(false) => None,
+            Ok(true) => Some(format!(
+                "answered anyway, but {} — background triage and the briefings \
+                 are running without a model until then",
+                self.budget.spent_note()
+            )),
+            Err(err) => {
+                // A budget that cannot be counted must not cost the owner
+                // their answer; it is a caveat, not a gate.
+                tracing::warn!(error = %format!("{err:#}"), "could not count today's sessions");
+                None
+            }
         }
     }
 }
@@ -372,6 +417,8 @@ fn fenced(text: &str) -> String {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+
+    use ea_core::store::runs::RunStore;
 
     use super::*;
     use crate::session::SessionOutcome;
@@ -595,9 +642,12 @@ mod tests {
         let service = Arc::new(ChatService::new(
             conversations.clone(),
             facts.clone(),
-            RunStore::new(Arc::clone(&conn)),
             Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
-            60,
+            Budget::new(
+                RunStore::new(Arc::clone(&conn)),
+                60,
+                chrono_tz::Europe::Stockholm,
+            ),
             "claude-sonnet-4-5",
             chrono_tz::Europe::Stockholm,
         ));
@@ -859,9 +909,12 @@ mod tests {
         let service = ChatService::new(
             conversations.clone(),
             FactStore::new(Arc::clone(&conn)),
-            RunStore::new(Arc::clone(&conn)),
             None,
-            60,
+            Budget::new(
+                RunStore::new(Arc::clone(&conn)),
+                60,
+                chrono_tz::Europe::Stockholm,
+            ),
             "claude-sonnet-4-5",
             chrono_tz::Europe::Stockholm,
         );

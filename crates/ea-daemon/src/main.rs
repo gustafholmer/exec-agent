@@ -36,6 +36,7 @@ use ea_core::store::retention::RetentionStore;
 use ea_core::store::runs::RunStore;
 use ea_core::store::schedules::ScheduleStore;
 use ea_daemon::briefings::BriefingDeps;
+use ea_daemon::budget::Budget;
 use ea_daemon::chat::{ChatResponder, ChatService};
 use ea_daemon::config::DaemonConfig;
 use ea_daemon::connectors::{self, Registry};
@@ -138,12 +139,20 @@ async fn main() -> anyhow::Result<()> {
     // message on the phone and `ea chat` in the terminal are two clients of
     // this one object, which is what makes a thread started on one continue on
     // the other — and what stops two messages running two sessions at once.
+    // One ceiling, read by all three places that start a session. Derived
+    // from the `runs` table rather than counted in memory, so a restart does
+    // not refund the day's spend, and bounded by the owner's midnight rather
+    // than UTC's. See `ea_daemon::budget`.
+    let budget = Budget::new(
+        RunStore::new(Arc::clone(&conn)),
+        config.daily_session_budget,
+        config.notify.time_zone,
+    );
     let chat = Arc::new(ChatService::new(
         ConversationStore::new(Arc::clone(&conn)),
         FactStore::new(Arc::clone(&conn)),
-        RunStore::new(Arc::clone(&conn)),
         sessions.clone(),
-        config.daily_session_budget,
+        budget.clone(),
         config.chat_model.clone(),
         config.notify.time_zone,
     ));
@@ -220,13 +229,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TriageDeps {
             events: EventStore::new(Arc::clone(&conn)),
             actions: ActionStore::new(Arc::clone(&conn)),
-            runs: RunStore::new(Arc::clone(&conn)),
             sessions: sessions.clone(),
             pusher: pusher.clone(),
             log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
             notify: NotificationPolicy::new(config.notify.clone()),
             rules: config.tier0.clone(),
-            daily_session_budget: config.daily_session_budget,
+            budget: budget.clone(),
         }),
     ));
     // The cron jobs: the three briefings, on the owner's wall clock rather
@@ -237,7 +245,6 @@ async fn main() -> anyhow::Result<()> {
     schedules::register_built_ins(&schedule_store, chrono::Utc::now())?;
     let briefings = Arc::new(BriefingDeps {
         events: EventStore::new(Arc::clone(&conn)),
-        runs: RunStore::new(Arc::clone(&conn)),
         log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
         sessions: sessions.clone(),
         pusher: pusher.clone(),
@@ -245,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
         policy: policy.clone(),
         time_zone: config.notify.time_zone,
         threshold: config.notify.threshold,
-        daily_session_budget: config.daily_session_budget,
+        budget: budget.clone(),
     });
     for job in schedules::briefing_jobs(
         schedule_store.clone(),

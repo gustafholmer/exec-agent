@@ -273,6 +273,36 @@ mod tests {
         assert!(log.digest().unwrap().is_empty());
     }
 
+    /// **The digest has to survive a restart**, for the same reason the rate
+    /// limit does: the daemon runs under `launchd` with `KeepAlive`, and a
+    /// backlog held in memory would be thrown away by the crash that made the
+    /// owner most want to read it. It lives in the `kv` table, so nothing is
+    /// lost and the morning briefing still finds it.
+    #[test]
+    fn the_digest_survives_a_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let log = store(&dir);
+            log.push_digest("[kth] examiner mail (40)").unwrap();
+            log.push_digest("[notion] a page moved (30)").unwrap();
+        }
+
+        // A brand-new process, a brand-new connection, the same database.
+        let reopened = store(&dir);
+        assert_eq!(
+            reopened.digest().unwrap(),
+            vec![
+                "[kth] examiner mail (40)".to_string(),
+                "[notion] a page moved (30)".to_string()
+            ]
+        );
+        assert_eq!(reopened.digest_len().unwrap(), 2);
+
+        // And a drain after the restart still clears exactly what it read.
+        reopened.drop_digest_prefix(2).unwrap();
+        assert_eq!(store(&dir).digest_len().unwrap(), 0);
+    }
+
     #[test]
     fn the_digest_is_bounded_and_drops_the_oldest() {
         let dir = TempDir::new().unwrap();

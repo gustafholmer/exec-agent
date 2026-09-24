@@ -121,13 +121,48 @@ pub const CRON_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// occurrences, so nothing legitimate reaches the bound.
 const MAX_CANDIDATES: usize = 4096;
 
-/// How far [`Schedule::resolve`] walks forward out of a spring-forward gap
-/// before giving up.
+/// How far [`local_instant`] walks forward out of a spring-forward gap before
+/// giving up.
 ///
 /// A day. Every real gap is an hour (Lord Howe Island's is thirty minutes);
 /// a day is a bound rather than an estimate, and reaching it means the zone
 /// data says something this code should not guess about.
 const MAX_GAP_MINUTES: i64 = 24 * 60;
+
+/// Turn a local wall-clock time into the instant a human in `time_zone` means
+/// by it.
+///
+/// **The one place in this daemon that converts a wall clock to an instant.**
+/// Cron schedules go through it ([`Schedule::resolve`]) and so does the daily
+/// session budget's midnight ([`crate::budget::Budget::day_start`]); a fourth
+/// approach to time zones is how one of them ends up an hour out twice a year
+/// and nobody notices until a briefing arrives at 06:00.
+///
+/// The two DST cases are the whole point:
+///
+/// * **Ambiguous** — the clock went back and this wall-clock time happens
+///   twice. The first one is the answer. For a cron schedule
+///   [`Schedule::next_after`] then makes sure the second is never treated as a
+///   fresh occurrence; for a day boundary the earlier instant is simply the
+///   start of the longer day, which is what "since midnight" means.
+/// * **None** — the clock went forward and this wall-clock time does not
+///   exist. The next instant that does is the answer, never "skip the day".
+///   A 00:00 that does not exist is not hypothetical: Asia/Beirut and
+///   Chile/Santiago have both moved their clocks at midnight, and a budget
+///   that returned `None` there would have to fall back to something.
+pub fn local_instant(time_zone: Tz, local: NaiveDateTime) -> Option<DateTime<Utc>> {
+    match time_zone.from_local_datetime(&local) {
+        LocalResult::Single(at) => Some(at.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, _latest) => Some(earliest.with_timezone(&Utc)),
+        LocalResult::None => (1..=MAX_GAP_MINUTES).find_map(|minutes| {
+            let shifted = local.checked_add_signed(Duration::minutes(minutes))?;
+            time_zone
+                .from_local_datetime(&shifted)
+                .earliest()
+                .map(|at| at.with_timezone(&Utc))
+        }),
+    }
+}
 
 /// One cron entry, evaluated in one time zone.
 ///
@@ -189,24 +224,11 @@ impl Schedule {
 
     /// Turn a local wall-clock time into the instant this schedule means by it.
     ///
-    /// The two DST cases are the whole point; see the module docs.
+    /// [`local_instant`], in this schedule's zone. The two DST cases are the
+    /// whole point; they are documented there, and shared with the budget's
+    /// day boundary so there is exactly one of them.
     fn resolve(&self, local: NaiveDateTime) -> Option<DateTime<Utc>> {
-        match self.time_zone.from_local_datetime(&local) {
-            LocalResult::Single(at) => Some(at.with_timezone(&Utc)),
-            // The clock went back and this wall-clock time happens twice. The
-            // first one is the job's; `next_after` makes sure the second is
-            // never treated as a fresh occurrence.
-            LocalResult::Ambiguous(earliest, _latest) => Some(earliest.with_timezone(&Utc)),
-            // The clock went forward and this wall-clock time does not exist.
-            // The next instant that does is the answer — never "skip the day".
-            LocalResult::None => (1..=MAX_GAP_MINUTES).find_map(|minutes| {
-                let shifted = local.checked_add_signed(Duration::minutes(minutes))?;
-                self.time_zone
-                    .from_local_datetime(&shifted)
-                    .earliest()
-                    .map(|at| at.with_timezone(&Utc))
-            }),
-        }
+        local_instant(self.time_zone, local)
     }
 
     /// Is this schedule due at `now`?
@@ -482,6 +504,30 @@ mod tests {
     /// to be wrong, so the premise is a test rather than a comment: if the
     /// `chrono-tz` database ever disagrees, this fails first and names why,
     /// instead of the behaviour tests failing for a reason nobody can see.
+    /// The shared helper, exercised on its own: everything that converts a
+    /// wall clock to an instant in this daemon goes through it, and the
+    /// budget's midnight is now one of those callers.
+    #[test]
+    fn local_instant_resolves_both_dst_cases() {
+        let naive = |text: &str| text.parse::<NaiveDateTime>().unwrap();
+
+        // Ordinary: one answer.
+        assert_eq!(
+            local_instant(Stockholm, naive("2026-09-24T00:00:00")),
+            Some(utc("2026-09-23T22:00:00Z"))
+        );
+        // Ambiguous (clocks back): the earlier of the two.
+        assert_eq!(
+            local_instant(Stockholm, naive("2026-10-25T02:30:00")),
+            Some(utc("2026-10-25T00:30:00Z"))
+        );
+        // Absent (clocks forward): the next instant that does exist.
+        assert_eq!(
+            local_instant(Stockholm, naive("2027-03-28T02:30:00")),
+            Some(utc("2027-03-28T01:00:00Z"))
+        );
+    }
+
     #[test]
     fn stockholm_repeats_0230_on_2026_10_25_and_skips_it_on_2027_03_28() {
         let at = |text: &str| {

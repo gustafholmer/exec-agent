@@ -1214,9 +1214,12 @@ mod end_to_end {
         let chat = Arc::new(crate::chat::ChatService::new(
             conversations.clone(),
             ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
-            RunStore::new(Arc::clone(&conn)),
             Some(Arc::new(CannedSessions) as Arc<dyn crate::triage::SessionBoundary>),
-            60,
+            crate::budget::Budget::new(
+                RunStore::new(Arc::clone(&conn)),
+                60,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            ),
             crate::config::DEFAULT_CHAT_MODEL,
             crate::notify::policy::DEFAULT_TIME_ZONE,
         ));
