@@ -175,6 +175,10 @@ pub struct Deps<C: ToolCaller> {
     pub pusher: Option<Arc<dyn Pusher>>,
     pub connectors: Vec<String>,
     pub daily_session_budget: u32,
+    /// The model `ea chat` runs on. Never empty: an unset model is inherited
+    /// from the human's own interactive settings, which is the bug this field
+    /// exists to close. See [`crate::config::DEFAULT_CHAT_MODEL`].
+    pub chat_model: String,
 }
 
 /// The daemon's state, shared by every connection the IPC server accepts.
@@ -189,6 +193,7 @@ pub struct Daemon<C: ToolCaller> {
     pusher: Option<Arc<dyn Pusher>>,
     connectors: Vec<String>,
     daily_session_budget: u32,
+    chat_model: String,
     started_at: DateTime<Utc>,
 }
 
@@ -205,6 +210,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             pusher: deps.pusher,
             connectors: deps.connectors,
             daily_session_budget: deps.daily_session_budget,
+            chat_model: deps.chat_model,
             started_at: Utc::now(),
         })
     }
@@ -287,6 +293,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "sessions_available": self.sessions.is_some(),
             "notifier_configured": self.pusher.is_some(),
             "daily_session_budget": self.daily_session_budget,
+            "chat_model": self.chat_model,
             "started_at": self.started_at.to_rfc3339(),
         }))
     }
@@ -484,7 +491,14 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // Read tools are not in `session::ALLOWED_TOOLS` anyway; handing a
             // chat session connector servers would spawn children it cannot
             // call.
-            .with_connectors(Vec::<String>::new());
+            .with_connectors(Vec::<String>::new())
+            // Explicit, and the whole point of the field. Unset, the CLI
+            // inherits the model the human last picked for interactive work —
+            // `opus-5[1m]` on this machine, around 30x tier 1's rate — and
+            // charges it against the same daily session budget, so a chat
+            // would silently cost thirty triage passes and the price would
+            // change whenever the owner changed an editor setting.
+            .with_model(&self.chat_model);
         if let Some(previous) = self.conversations.claude_session(conversation_id)? {
             request = request.with_resume(previous);
         }
@@ -723,6 +737,7 @@ record_voucher = "approve"
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
                 connectors: vec!["canvas".to_string()],
                 daily_session_budget: budget,
+                chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
             });
 
             Self {
@@ -957,6 +972,7 @@ record_voucher = "approve"
             pusher: None,
             connectors: vec!["canvas".to_string()],
             daily_session_budget: 60,
+            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         });
         let status = daemon.status(Value::Null).await.unwrap();
         let canvas = &status["jobs"][0];
@@ -1029,6 +1045,7 @@ record_voucher = "approve"
             pusher: None,
             connectors: vec!["canvas".to_string()],
             daily_session_budget: 60,
+            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         });
         (f, scheduler, daemon)
     }
@@ -1431,5 +1448,64 @@ record_voucher = "approve"
             crate::session::ALLOWED_TOOLS,
             "mcp__ea-propose__propose_action"
         );
+    }
+
+    /// The finding: `ea chat` built its request with no `.with_model`, so it
+    /// inherited the human's interactive model — `opus-5[1m]`, about 30x tier
+    /// 1's rate — and charged it against the same daily session budget. The
+    /// model must be explicit, and it must be the configured one.
+    #[tokio::test]
+    async fn a_chat_session_names_its_model_rather_than_inheriting_one() {
+        let f = Fixture::new();
+        f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
+        assert_eq!(
+            seen[0].model.as_deref(),
+            Some(crate::config::DEFAULT_CHAT_MODEL),
+            "an unset model is inherited from the human's own settings"
+        );
+        // By literal too, so a rename of the constant cannot quietly change
+        // what this daemon spends.
+        assert_eq!(seen[0].model.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    /// Triage's pin is a separate decision and must not follow chat's.
+    #[test]
+    fn triage_and_chat_are_pinned_to_different_models_on_purpose() {
+        assert_eq!(crate::triage::TIER1_MODEL, "claude-haiku-4-5");
+        assert_ne!(
+            crate::triage::TIER1_MODEL,
+            crate::config::DEFAULT_CHAT_MODEL
+        );
+    }
+
+    /// A model the owner configured must actually be used, or the setting is
+    /// decoration.
+    #[tokio::test]
+    async fn a_configured_chat_model_is_the_one_used() {
+        let f = Fixture::new();
+        let daemon = Daemon::build(Deps {
+            executor: Arc::clone(&f.daemon.executor),
+            actions: f.daemon.actions.clone(),
+            conversations: f.daemon.conversations.clone(),
+            events: f.daemon.events.clone(),
+            runs: f.daemon.runs.clone(),
+            scheduler: Arc::clone(&f.scheduler),
+            sessions: f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
+            pusher: None,
+            connectors: Vec::new(),
+            daily_session_budget: 60,
+            chat_model: "claude-opus-4-5".to_string(),
+        });
+        daemon.chat(json!({ "message": "hi" })).await.unwrap();
+
+        let model = {
+            let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
+            seen[0].model.clone()
+        };
+        assert_eq!(model.as_deref(), Some("claude-opus-4-5"));
+
+        let status = daemon.status(Value::Null).await.unwrap();
+        assert_eq!(status["chat_model"], "claude-opus-4-5");
     }
 }

@@ -19,6 +19,7 @@ pub mod executor;
 pub mod ipc;
 pub mod jobs;
 pub mod notify;
+pub mod retention;
 pub mod scheduler;
 pub mod session;
 pub mod triage;

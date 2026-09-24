@@ -1370,6 +1370,7 @@ mod tests {
             pusher: None,
             connectors: Vec::new(),
             daily_session_budget: 60,
+            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         })
         .register(&mut server);
         let daemon = server.spawn().await.expect("binding the daemon socket");

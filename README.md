@@ -57,6 +57,12 @@ cat > ~/.config/exec-agent/config.toml <<'TOML'
 # Sessions a day, across triage and chat. A ceiling on spend, not a target.
 daily_session_budget = 60
 
+# The model `ea chat` runs on. Set explicitly on purpose: left unset, the CLI
+# inherits whatever you last picked interactively (opus-5[1m] here, ~30x tier
+# 1's rate) and charges it against the budget above. Triage is separately
+# pinned to claude-haiku-4-5 in code and is not affected by this.
+chat_model = "claude-sonnet-4-5"
+
 [notify]
 threshold    = 60        # salience at or above which you get interrupted
 quiet_start  = "22:00"   # local wall clock, in the zone below
@@ -68,8 +74,38 @@ time_zone    = "Europe/Stockholm"
 muted_sources = []
 muted_kinds   = []
 keywords      = ["invoice"]   # rescues a muted event that mentions one
+
+[retention]
+events_days        = 90       # triaged events; an untriaged one is never pruned
+runs_days          = 90       # finished runs; a `running` row is kept
+actions_days       = 180      # terminal actions only — see below
+conversations_days = 90       # never the one you are currently talking in
+interval_hours     = 24
+log_max_bytes      = 8388608  # rotate daemon.{out,err}.log past 8 MiB
 TOML
 ```
+
+### Retention
+
+Everything else in this system is append-only, which over years of unattended
+running is a leak rather than an audit trail. A `retention` job runs daily and
+deletes **terminal rows only**:
+
+| table | kept | never deleted |
+|---|---|---|
+| `events` | 90 days after creation, once triaged | anything still untriaged |
+| `runs` | 90 days, once finished | a `running` row — the only lead on a killed session |
+| `actions` | 180 days, and only `executed`/`rejected`/`expired`/`failed` | anything `proposed` or `approved`: a question you have not answered is not old data |
+| `conversations`, `messages` | 90 days | the newest conversation, and any with a message inside the window |
+
+`actions` keeps twice as long as the rest because it is the record of what this
+system actually did to the world.
+
+The same job rotates the `launchd` logs, which have no rotation of their own:
+past `log_max_bytes` the file is copied to `<name>.1` and truncated **in place**
+— the same inode, because `launchd` holds the descriptor and a rename would
+leave the daemon writing into the archived file. One generation is kept, so the
+ceiling is two files per stream.
 
 ### Telegram
 
@@ -158,7 +194,7 @@ fixed the cause yourself and do not want to wait out the cooldown.
 | configuration and credentials | `~/.config/exec-agent/` |
 | database (`events`, `actions`, `runs`, …) | `~/.local/state/exec-agent/state.db` |
 | control socket (mode `0600`) | `~/.local/state/exec-agent/daemon.sock` |
-| daemon logs | `~/.local/state/exec-agent/daemon.{out,err}.log` |
+| daemon logs | `~/.local/state/exec-agent/daemon.{out,err}.log` (plus one rotated `.1` each) |
 | session working directory | `~/.local/state/exec-agent/sessions/` |
 
 Both directories are created mode `0700`. `$EA_CONFIG_DIR` and `$EA_STATE_DIR`
@@ -189,10 +225,11 @@ two claims — an in-memory one against a double tap, and a conditional `UPDATE`
 in SQLite that is never released — so an action can reach a connector at most
 once even across a crash.
 
-**The control socket has no method that calls a connector.** `status`, `queue`
-and `log` read local state; `pause` and `resume` set a flag; `reject` is a
-status transition; `approve` and `propose` go through the executor; `chat`
-starts a session whose only write tool comes back through `propose`. A method
+**The control socket has no method that calls a connector.** Ten methods:
+`status`, `queue` and `log` read local state; `pause`, `resume` and
+`resume_job` set flags in the scheduler; `reject` is a status transition;
+`approve` and `propose` go through the executor; `chat` starts a session whose
+only write tool comes back through `propose`. A method
 named something like `connectors.call` was on this socket once and was removed
 for exactly this reason. Do not add it back: anything that can reach the socket
 could then call any tool on any connector with the gate bypassed.

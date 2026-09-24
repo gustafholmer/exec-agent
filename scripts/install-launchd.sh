@@ -90,6 +90,10 @@ cat > "$PLIST" <<PLIST_EOF
     <string>info</string>
   </dict>
 
+  <!-- launchd has no log rotation of its own. The daemon rotates these two
+       files itself, in its daily retention job: past 8 MiB (configurable as
+       retention.log_max_bytes) each is copied to <name>.1 and truncated in
+       place, keeping the inode this plist's descriptors point at. -->
   <key>StandardOutPath</key>
   <string>$LOG_DIR/daemon.out.log</string>
   <key>StandardErrorPath</key>

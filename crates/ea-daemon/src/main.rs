@@ -31,6 +31,7 @@ use ea_core::store::actions::ActionStore;
 use ea_core::store::conversations::ConversationStore;
 use ea_core::store::events::EventStore;
 use ea_core::store::kv::KvStore;
+use ea_core::store::retention::RetentionStore;
 use ea_core::store::runs::RunStore;
 use ea_daemon::config::DaemonConfig;
 use ea_daemon::connectors::{self, Registry};
@@ -42,6 +43,7 @@ use ea_daemon::notify::log::NotificationLog;
 use ea_daemon::notify::policy::NotificationPolicy;
 use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, TOKEN_FILE};
 use ea_daemon::notify::updates::{OffsetStore, UpdateLoop};
+use ea_daemon::retention::{retention_job, RetentionDeps};
 use ea_daemon::scheduler::Scheduler;
 use ea_daemon::session::SessionRunner;
 use ea_daemon::triage::SessionBoundary;
@@ -165,6 +167,19 @@ async fn main() -> anyhow::Result<()> {
             daily_session_budget: config.daily_session_budget,
         }),
     ));
+    // The only job that deletes anything. Everything else in this daemon is
+    // append-only, which over the years this thing is meant to run unattended
+    // is a leak rather than an audit trail.
+    scheduler.add(retention_job(
+        config.retention.interval,
+        Arc::new(RetentionDeps {
+            store: RetentionStore::new(Arc::clone(&conn)),
+            policy: config.retention.policy,
+            // Where the plist points StandardOutPath and StandardErrorPath.
+            log_dir: state_dir.clone(),
+            log_max_bytes: config.retention.log_max_bytes,
+        }),
+    ));
     tracing::info!(jobs = ?scheduler.names(), "scheduled");
 
     // --- the socket --------------------------------------------------------
@@ -179,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         pusher,
         connectors: connector_names,
         daily_session_budget: config.daily_session_budget,
+        chat_model: config.chat_model.clone(),
     });
 
     let socket_path = ea_core::paths::socket_path();

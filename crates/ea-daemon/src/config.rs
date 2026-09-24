@@ -26,8 +26,11 @@ use chrono::NaiveTime;
 use chrono_tz::Tz;
 use serde::Deserialize;
 
+use ea_core::store::retention::RetentionPolicy;
+
 use crate::notify::policy::NotifyConfig;
 use crate::notify::telegram::TelegramConfig;
+use crate::retention::{DEFAULT_LOG_MAX_BYTES, DEFAULT_RETENTION_INTERVAL_SECS};
 use crate::triage::Tier0Rules;
 
 /// Name of the file under the config directory.
@@ -46,6 +49,20 @@ pub const DEFAULT_TRIAGE_INTERVAL_SECS: u64 = 300;
 /// Environment override for where connectors are discovered.
 pub const CONNECTORS_DIR_ENV: &str = "EA_CONNECTORS_DIR";
 
+/// The model `ea chat` runs on when nothing says otherwise.
+///
+/// Sonnet, set explicitly. Leaving it unset inherits whatever the human last
+/// chose interactively — `opus-5[1m]` on this machine, roughly 30x tier 1's
+/// rate — and charges it against the same `daily_session_budget`, so the price
+/// of chat would change silently whenever the owner changed an editor setting.
+/// Chat is the one place where the better model is genuinely worth something:
+/// it is low-frequency, the owner is waiting for the answer, and unlike triage
+/// it is open-ended rather than classification. Sonnet is the middle of that
+/// argument — materially better than Haiku at conversation, a fraction of
+/// Opus's rate — and `chat_model` in `config.toml` is there for an owner who
+/// wants to pay for more or less.
+pub const DEFAULT_CHAT_MODEL: &str = "claude-sonnet-4-5";
+
 /// The resolved configuration the daemon runs on.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -54,10 +71,33 @@ pub struct DaemonConfig {
     pub daily_session_budget: u32,
     pub breaker_threshold: u32,
     pub triage_interval: Duration,
+    /// The model `ea chat` runs on. See [`DEFAULT_CHAT_MODEL`].
+    pub chat_model: String,
+    /// How long terminal rows are kept, and how big a launchd log may get.
+    pub retention: RetentionSettings,
     /// Where `discover` looks for connector directories.
     pub connectors_dir: PathBuf,
     /// Present only when the `[telegram]` block was written out in full.
     pub telegram: Option<TelegramSettings>,
+}
+
+/// The `[retention]` block: what the daily prune keeps, and how large the
+/// launchd logs may grow before they are rotated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSettings {
+    pub policy: RetentionPolicy,
+    pub interval: Duration,
+    pub log_max_bytes: u64,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            policy: RetentionPolicy::default(),
+            interval: Duration::from_secs(DEFAULT_RETENTION_INTERVAL_SECS),
+            log_max_bytes: DEFAULT_LOG_MAX_BYTES,
+        }
+    }
 }
 
 /// The `[telegram]` block, when there is one.
@@ -119,9 +159,66 @@ struct RawConfig {
     #[serde(default)]
     triage_interval_secs: Option<u64>,
     #[serde(default)]
+    chat_model: Option<String>,
+    #[serde(default)]
+    retention: RawRetention,
+    #[serde(default)]
     connectors_dir: Option<PathBuf>,
     #[serde(default)]
     telegram: Option<TelegramSettings>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetention {
+    #[serde(default)]
+    events_days: Option<i64>,
+    #[serde(default)]
+    runs_days: Option<i64>,
+    #[serde(default)]
+    actions_days: Option<i64>,
+    #[serde(default)]
+    conversations_days: Option<i64>,
+    #[serde(default)]
+    interval_hours: Option<u64>,
+    #[serde(default)]
+    log_max_bytes: Option<u64>,
+}
+
+impl RawRetention {
+    /// Every window is floored at a day and every size at 64 KiB. A retention
+    /// policy of zero would delete rows the instant they became terminal,
+    /// which is a configuration mistake rather than an intention — and a
+    /// deletion, unlike every other setting here, cannot be undone by fixing
+    /// the file.
+    fn into_settings(self) -> RetentionSettings {
+        let defaults = RetentionSettings::default();
+        RetentionSettings {
+            policy: RetentionPolicy {
+                events_days: self
+                    .events_days
+                    .unwrap_or(defaults.policy.events_days)
+                    .max(1),
+                runs_days: self.runs_days.unwrap_or(defaults.policy.runs_days).max(1),
+                actions_days: self
+                    .actions_days
+                    .unwrap_or(defaults.policy.actions_days)
+                    .max(1),
+                conversations_days: self
+                    .conversations_days
+                    .unwrap_or(defaults.policy.conversations_days)
+                    .max(1),
+            },
+            interval: self
+                .interval_hours
+                .map(|hours| Duration::from_secs(hours.max(1) * 3600))
+                .unwrap_or(defaults.interval),
+            log_max_bytes: self
+                .log_max_bytes
+                .unwrap_or(defaults.log_max_bytes)
+                .max(64 * 1024),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -177,6 +274,8 @@ impl Default for DaemonConfig {
             daily_session_budget: DEFAULT_DAILY_SESSION_BUDGET,
             breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
             triage_interval: Duration::from_secs(DEFAULT_TRIAGE_INTERVAL_SECS),
+            chat_model: DEFAULT_CHAT_MODEL.to_string(),
+            retention: RetentionSettings::default(),
             connectors_dir: default_connectors_dir(),
             telegram: None,
         }
@@ -229,6 +328,20 @@ impl DaemonConfig {
             crate::notify::telegram::require_owner_only(&path)?;
         }
 
+        // An empty `chat_model` is the one value that must not fall back to
+        // the default: somebody who wrote `chat_model = ""` is asking for
+        // something, and the thing they would silently get is the inherited
+        // interactive model this setting exists to stop.
+        let chat_model = match raw.chat_model {
+            Some(model) if model.trim().is_empty() => Err(anyhow::anyhow!(
+                "chat_model is empty. Name a model (the default is {DEFAULT_CHAT_MODEL:?}), \
+                 or remove the line; it cannot be left blank, because an unset model means \
+                 the CLI inherits whatever you last used interactively."
+            )),
+            Some(model) => Ok(model),
+            None => Ok(DEFAULT_CHAT_MODEL.to_string()),
+        };
+
         let notify = raw.notify.into_config()?;
         if notify.max_per_hour == 0 {
             bail!(
@@ -252,6 +365,8 @@ impl DaemonConfig {
                     .unwrap_or(DEFAULT_TRIAGE_INTERVAL_SECS)
                     .max(1),
             ),
+            chat_model: chat_model?,
+            retention: raw.retention.into_settings(),
             connectors_dir: raw.connectors_dir.unwrap_or_else(default_connectors_dir),
             telegram: raw.telegram,
         })
@@ -283,7 +398,77 @@ mod tests {
             config.triage_interval,
             Duration::from_secs(DEFAULT_TRIAGE_INTERVAL_SECS)
         );
+        assert_eq!(config.chat_model, DEFAULT_CHAT_MODEL);
+        assert_eq!(config.retention, RetentionSettings::default());
         assert!(config.telegram.is_none());
+    }
+
+    /// The whole point of the field: chat must never be left to inherit the
+    /// human's interactive model, so the default has to be a real model name.
+    #[test]
+    fn chat_defaults_to_a_named_model_and_not_to_the_inherited_one() {
+        let dir = TempDir::new().unwrap();
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.chat_model, "claude-sonnet-4-5");
+        assert!(!config.chat_model.is_empty());
+    }
+
+    #[test]
+    fn chat_model_is_configurable() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "chat_model = \"claude-opus-4-5\"\n");
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.chat_model, "claude-opus-4-5");
+    }
+
+    /// An empty string would silently mean "inherit", which is the bug.
+    #[test]
+    fn an_empty_chat_model_is_an_error_rather_than_a_silent_inherit() {
+        let dir = TempDir::new().unwrap();
+        write(&dir, "chat_model = \"\"\n");
+        let err = DaemonConfig::load_from(dir.path()).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("chat_model is empty"), "{text}");
+        assert!(text.contains("claude-sonnet-4-5"), "{text}");
+    }
+
+    #[test]
+    fn the_retention_block_is_read() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            r#"
+[retention]
+events_days = 30
+runs_days = 45
+actions_days = 365
+conversations_days = 14
+interval_hours = 6
+log_max_bytes = 1048576
+"#,
+        );
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.retention.policy.events_days, 30);
+        assert_eq!(config.retention.policy.runs_days, 45);
+        assert_eq!(config.retention.policy.actions_days, 365);
+        assert_eq!(config.retention.policy.conversations_days, 14);
+        assert_eq!(config.retention.interval, Duration::from_secs(6 * 3600));
+        assert_eq!(config.retention.log_max_bytes, 1024 * 1024);
+    }
+
+    /// A deletion cannot be undone by fixing the file afterwards, so a zero or
+    /// negative window is floored rather than taken literally.
+    #[test]
+    fn a_zero_retention_window_is_floored_at_a_day() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "[retention]\nevents_days = 0\nactions_days = -5\nlog_max_bytes = 1\n",
+        );
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(config.retention.policy.events_days, 1);
+        assert_eq!(config.retention.policy.actions_days, 1);
+        assert_eq!(config.retention.log_max_bytes, 64 * 1024);
     }
 
     #[test]
