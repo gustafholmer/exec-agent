@@ -1,0 +1,28 @@
+# Discovered by the daemon: a directory holding both connector.toml and
+# policy.toml is a connector. `command` is resolved against the running
+# executable's directory first, then $PATH, so a release build next to
+# ea-daemon needs no install step.
+#
+# `name` must equal this directory's basename, and no two connectors may claim
+# the same name — both are hard startup errors. See `ea_daemon::connectors`.
+name = "kth"
+command = "ea-kth"
+args = []
+
+# Five minutes.
+#
+# The Google connector polls mail every two minutes, and this one is cheaper
+# per poll than that one: Microsoft Graph returns message bodies in the list
+# response, so a poll here is a single request per account, where Gmail's is
+# 1 + 25. Cost is not what sets this interval.
+#
+# What sets it is what the mail is. A KTH mailbox carries schedule changes,
+# examiner mail and administrative deadlines — things measured in hours and
+# days. Two minutes would buy nothing a human could act on, while making this
+# connector the noisiest thing in the scheduler's log. Five minutes is inside
+# the daemon's own triage cadence and well inside any deadline that arrives by
+# university mail.
+#
+# The cost of the longer interval is bounded and stated: a message can sit
+# unreported for up to five minutes.
+watch_interval_secs = 300
