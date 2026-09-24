@@ -345,7 +345,7 @@ thing to check.
 
 ### Going on holiday
 
-Two mechanisms, and they stop different things. Pick by what you want to be
+Three mechanisms, and they stop different things. Pick by what you want to be
 true while you are away.
 
 **`daily_session_budget = 0` in `config.toml`, then restart.** A ceiling of
