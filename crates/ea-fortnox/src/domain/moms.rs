@@ -105,33 +105,43 @@ pub fn split_gross(gross: Decimal, rate: u8) -> Result<MomsSplit> {
     // rounded one, because that is what `moms.ts` rounds; see the doc comment
     // for the measurement behind that choice.
     //
-    // Both lines divide and subtract the *raw* `gross`, not the rounded one,
-    // again matching `moms.ts`. It matters only when the caller passes an
-    // amount finer than an öre, and then it matters: `splitGross(1250.005,
-    // 25)` upstream is `{net: 1000, vat: 250.01}`, where rounding `gross` to
-    // 1250.01 first and dividing that would give `{net: 1000.01, vat: 250}`.
-    // Both reconcile; upstream's uses the undegraded input to place the net,
-    // so it is the one kept.
+    // `net` divides the *raw* `gross`, not the rounded one, again matching
+    // `moms.ts`. It matters only when the caller passes an amount finer than
+    // an öre, and then it matters: `splitGross(1250.005, 25)` upstream is
+    // `{net: 1000, vat: 250.01}`, where rounding `gross` to 1250.01 first and
+    // dividing that would give `{net: 1000.01, vat: 250}`. Both reconcile;
+    // upstream's uses the undegraded input to place the net, so it is the one
+    // kept.
     let net = round2(gross / divisor);
 
     // The reported gross: upstream's third field, and the figure the two
-    // lines add up to.
+    // lines add up to. From here on `gross` is this *rounded* value, not the
+    // raw input above — that shadowing is what the next line depends on.
     let gross = round2(gross);
 
-    // `vat` is a *plain subtraction* of two whole-öre figures. It is exact,
-    // so `net + vat == gross` holds by construction rather than by luck, and
-    // there is nothing left for a rounding rule to disagree about.
+    // `vat` is a plain subtraction of `net` from the *rounded* `gross`, with
+    // no second rounding step. That is the deliberate divergence from
+    // `moms.ts`, which writes `round2(gross - net)` — subtracting the *raw*
+    // gross and rounding the residual. Subtracting the rounded gross instead
+    // is what makes this exact: both operands are already whole öre, so
+    // `net + vat == gross` holds by construction and there is nothing left
+    // for a rounding rule to disagree about — the `round2` upstream applies
+    // here would be a no-op on this input and is correctly omitted.
     //
-    // Upstream writes `round2(gross - net)`, and that second `round2` is a
-    // trap this port must not copy. It looks like a no-op and is one for any
-    // 2dp input, but for an input carrying sub-öre dust the residual can be
-    // exactly -0.005 — `splitGross(0.005, 0)`: `net` rounds up to 0.01, so
-    // `gross - net` is -0.005. JavaScript's `Math.round` breaks that tie
-    // toward +infinity (`Math.round(-0.5) === -0`), so upstream gets `vat: 0`
-    // and reconciles. `money::round2` is half away from *zero* — deliberately,
-    // see its doc comment — so it would return -0.01 and produce a voucher
-    // that is two öre out with a negative VAT line. The reconciliation sweep
-    // `reconciles_for_inputs_finer_than_an_ore` caught exactly this.
+    // That divergence is not cosmetic. Subtracting the *raw* gross instead
+    // (matching upstream's operand, only without its rounding step) can hand
+    // `round2` a residual that is an exact negative half-öre midpoint:
+    // `splitGross(0.005, 0)`: `net` rounds up to 0.01, so `raw_gross - net` is
+    // -0.005. JavaScript's `Math.round` breaks that tie toward +infinity
+    // (`Math.round(-0.5) === -0`), so upstream's `round2(-0.005)` is `-0`,
+    // `vat` is `0`, and it reconciles. `money::round2` is half away from
+    // *zero* — deliberately, see its doc comment — so it would turn that same
+    // -0.005 into -0.01, one öre short of the rounded gross, producing a
+    // voucher with a negative VAT line. Subtracting the rounded gross removes
+    // the sub-öre residual before `round2` would ever see it, so the trap
+    // upstream's asymmetric rounding papers over cannot occur here. The
+    // reconciliation sweep `reconciles_for_inputs_finer_than_an_ore` is what
+    // caught this.
     //
     // `net <= gross` because `gross / divisor <= gross` for any rate >= 0 and
     // `round2` is monotonic, so `vat` is never negative.
