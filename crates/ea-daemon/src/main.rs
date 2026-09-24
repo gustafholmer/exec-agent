@@ -48,7 +48,7 @@ use ea_daemon::lock::InstanceLock;
 use ea_daemon::notify::log::NotificationLog;
 use ea_daemon::notify::policy::NotificationPolicy;
 use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, TOKEN_FILE};
-use ea_daemon::notify::updates::{OffsetStore, UpdateLoop};
+use ea_daemon::notify::updates::{HandledUpdates, OffsetStore, UpdateLoop};
 use ea_daemon::retention::{retention_job, RetentionDeps};
 use ea_daemon::scheduler::Scheduler;
 use ea_daemon::schedules;
@@ -182,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&notifier),
             credentials.chat_id,
             OffsetStore::new(KvStore::new(Arc::clone(&conn))),
+            HandledUpdates::new(KvStore::new(Arc::clone(&conn))),
         ));
         pusher = Some(notifier as Arc<dyn Pusher>);
         tracing::info!(owner = %credentials.owner_id, "telegram configured");
