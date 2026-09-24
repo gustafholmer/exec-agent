@@ -362,6 +362,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "ea-core",
+ "futures",
  "libc",
  "reqwest",
  "rmcp",

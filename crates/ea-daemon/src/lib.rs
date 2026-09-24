@@ -17,5 +17,6 @@ pub mod daemon;
 pub mod executor;
 pub mod ipc;
 pub mod notify;
+pub mod scheduler;
 pub mod session;
 pub mod triage;

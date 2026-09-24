@@ -26,6 +26,7 @@ toml.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
