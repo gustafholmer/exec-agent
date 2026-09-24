@@ -47,7 +47,7 @@ use anyhow::{bail, Context};
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use ea_core::policy::{Mode, Policy};
-use ea_core::store::events::{Event, EventStore};
+use ea_core::store::events::{kinds, Event, EventStore};
 use ea_core::store::runs::RunStore;
 use serde_json::{json, Value};
 
@@ -103,16 +103,14 @@ const READ_LIMIT: usize = 8_000;
 // --------------------------------------------------------------------------
 // The kinds the briefings read
 // --------------------------------------------------------------------------
-
-/// `ea_google::watch::KIND_EVENT`. Named here rather than imported: the daemon
-/// deliberately does not depend on any connector crate — connectors are child
-/// processes reached over MCP, and a compile-time dependency on one would make
-/// the daemon un-buildable without it.
-const CALENDAR_EVENT_KIND: &str = "calendar_event";
-/// `ea_google::watch::KIND_CONFLICT`.
-const CALENDAR_CONFLICT_KIND: &str = "calendar_conflict";
-/// `ea_fortnox_mcp::watch::TAX_DEADLINE_KIND`.
-const TAX_DEADLINE_KIND: &str = "tax_deadline";
+//
+// Imported from [`ea_core::store::events::kinds`], not restated here. The
+// daemon still has no compile-time dependency on any connector crate —
+// connectors are child processes reached over MCP — but every connector and
+// the daemon already depend on `ea-core`, which owns the `events` table these
+// strings are persisted in. So the emitter and this reader now name the same
+// constant, and renaming `calendar_event` is a compile error on both sides
+// instead of an empty calendar section nobody is told about.
 
 /// The connector and tool a briefing reads, always named by a constant.
 const FORTNOX: &str = "fortnox";
@@ -284,7 +282,7 @@ pub fn todays_calendar(
 ) -> anyhow::Result<Vec<Event>> {
     let today = now.with_timezone(&time_zone).date_naive();
     let mut found: Vec<Event> = Vec::new();
-    for kind in [CALENDAR_EVENT_KIND, CALENDAR_CONFLICT_KIND] {
+    for kind in [kinds::CALENDAR_EVENT, kinds::CALENDAR_CONFLICT] {
         for event in events.by_kind(kind, MATERIAL_LIMIT)? {
             if starts_on(&event, today, time_zone) {
                 found.push(event);
@@ -430,7 +428,7 @@ pub async fn vat_material<C: ToolCaller>(
     // source for them, and already in the database.
     material.push(
         "Upcoming declaration deadlines",
-        lines(&deps.events.by_kind(TAX_DEADLINE_KIND, MATERIAL_LIMIT)?),
+        lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT)?),
     );
     Ok(material)
 }
@@ -817,21 +815,21 @@ record_voucher = "approve"
             &f.events,
             "google",
             "late",
-            CALENDAR_EVENT_KIND,
+            kinds::CALENDAR_EVENT,
             json!({ "title": "midnight standup", "start": "2026-09-24T22:30:00Z" }),
         );
         record(
             &f.events,
             "google",
             "today",
-            CALENDAR_EVENT_KIND,
+            kinds::CALENDAR_EVENT,
             json!({ "title": "lunch", "start": "2026-09-25T10:00:00Z" }),
         );
         record(
             &f.events,
             "google",
             "tomorrow",
-            CALENDAR_EVENT_KIND,
+            kinds::CALENDAR_EVENT,
             json!({ "title": "next week", "start": "2026-09-30T10:00:00Z" }),
         );
 
@@ -852,7 +850,7 @@ record_voucher = "approve"
             &f.events,
             "google",
             "clash",
-            CALENDAR_CONFLICT_KIND,
+            kinds::CALENDAR_CONFLICT,
             json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
         );
         let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
@@ -868,7 +866,7 @@ record_voucher = "approve"
             &f.events,
             "google",
             "today",
-            CALENDAR_EVENT_KIND,
+            kinds::CALENDAR_EVENT,
             json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
         );
         let scored = record(
@@ -1054,7 +1052,7 @@ record_voucher = "approve"
             &f.events,
             "fortnox",
             "tax-deadline:moms:2026-09",
-            TAX_DEADLINE_KIND,
+            kinds::TAX_DEADLINE,
             json!({ "label": "Momsdeklaration", "due_on": "2026-10-12" }),
         );
 

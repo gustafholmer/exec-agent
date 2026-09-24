@@ -82,6 +82,7 @@
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
+use ea_core::store::events::kinds;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{authorize_command, Auth};
@@ -90,14 +91,19 @@ use crate::gmail::{GmailClient, Mail};
 
 /// The `kind` on an upcoming-event row. Triage mutes and keyword rules match
 /// on it, so these are stable names rather than anything derived per item.
-pub const KIND_EVENT: &str = "calendar_event";
+///
+/// The names themselves live in [`ea_core::store::events::kinds`], which owns
+/// the table these rows land in: the daemon's briefings select on these
+/// strings, and a private copy here would let a rename here empty a briefing
+/// section with no error and no failing test.
+pub const KIND_EVENT: &str = kinds::CALENDAR_EVENT;
 /// The `kind` on a conflict row.
-pub const KIND_CONFLICT: &str = "calendar_conflict";
+pub const KIND_CONFLICT: &str = kinds::CALENDAR_CONFLICT;
 /// The `kind` on an unread-mail row.
-pub const KIND_MAIL: &str = "mail";
+pub const KIND_MAIL: &str = kinds::MAIL;
 /// The `kind` on the synthetic row reporting an account this poll could not
 /// read. See the module docs.
-pub const KIND_CONNECTOR_ERROR: &str = "connector_error";
+pub const KIND_CONNECTOR_ERROR: &str = kinds::CONNECTOR_ERROR;
 
 /// What a failing account was being asked for, as it appears in an error
 /// row's payload.

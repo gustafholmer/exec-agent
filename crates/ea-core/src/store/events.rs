@@ -5,6 +5,48 @@ use chrono::Utc;
 use rusqlite::{params, Connection, Row};
 use serde::Serialize;
 
+/// The `kind` strings that go into the `events` table, owned by the crate that
+/// owns the table.
+///
+/// **Why here and not in each connector.** These strings cross a process
+/// boundary: a connector writes one into a watch entry, the daemon hands it
+/// back to [`EventStore::record`], and the briefings and triage rules then
+/// read rows out by it. Until this module existed, each side held its own
+/// `const` with the same literal in it, so renaming `calendar_event` in
+/// `ea-google` left the morning briefing reading a kind nothing emits any
+/// more — an empty calendar section, no error, and no failing test, because
+/// the reader's tests wrote events using the reader's own copy of the string
+/// and so stayed self-consistent while being wrong.
+///
+/// The daemon still has no compile-time dependency on any connector crate —
+/// connectors are child processes reached over MCP — but every connector *and*
+/// the daemon already depend on `ea-core`, and `ea-core` owns the store these
+/// strings are persisted in. Naming them here makes a rename a compile error
+/// on both sides of the boundary instead of a silent hole in a briefing.
+///
+/// A connector may still emit a kind that is not listed here; what it must not
+/// do is keep a second private constant for one that is.
+pub mod kinds {
+    /// An upcoming calendar event. Emitted by `ea-google`.
+    pub const CALENDAR_EVENT: &str = "calendar_event";
+    /// Two calendar events that overlap. Emitted by `ea-google`.
+    pub const CALENDAR_CONFLICT: &str = "calendar_conflict";
+    /// An unread message. Emitted by `ea-google` (Gmail) and `ea-kth` (Graph);
+    /// deliberately the same kind from both, because a mail is a mail.
+    pub const MAIL: &str = "mail";
+    /// A coursework assignment. Emitted by `ea-canvas`.
+    pub const ASSIGNMENT: &str = "assignment";
+    /// A row in a watched Notion database. Emitted by `ea-notion`.
+    pub const DATABASE_ITEM: &str = "database_item";
+    /// An invoice that is still open. Emitted by `ea-fortnox-mcp`.
+    pub const UNPAID_INVOICE: &str = "unpaid_invoice";
+    /// A declaration falling due. Emitted by `ea-fortnox-mcp`.
+    pub const TAX_DEADLINE: &str = "tax_deadline";
+    /// The synthetic row a poll emits for an account it could not read.
+    /// Emitted by `ea-google` and `ea-kth`.
+    pub const CONNECTOR_ERROR: &str = "connector_error";
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -266,7 +308,7 @@ mod tests {
         RecordInput {
             source: source.into(),
             external_id: external_id.into(),
-            kind: "assignment".into(),
+            kind: kinds::ASSIGNMENT.into(),
             payload,
         }
     }
@@ -285,18 +327,18 @@ mod tests {
         let (_dir, conn) = temp_store();
         let store = EventStore::new(conn);
         store
-            .record(of_kind("google", "c1", "calendar_event"))
+            .record(of_kind("google", "c1", kinds::CALENDAR_EVENT))
             .unwrap();
-        store.record(of_kind("google", "m1", "mail")).unwrap();
+        store.record(of_kind("google", "m1", kinds::MAIL)).unwrap();
         store
-            .record(of_kind("google", "c2", "calendar_event"))
+            .record(of_kind("google", "c2", kinds::CALENDAR_EVENT))
             .unwrap();
 
-        let found = store.by_kind("calendar_event", 10).unwrap();
+        let found = store.by_kind(kinds::CALENDAR_EVENT, 10).unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(ids, vec!["c2", "c1"], "newest first, and no mail");
 
-        assert_eq!(store.by_kind("calendar_event", 1).unwrap().len(), 1);
+        assert_eq!(store.by_kind(kinds::CALENDAR_EVENT, 1).unwrap().len(), 1);
         assert!(store
             .by_kind("nothing_records_this", 10)
             .unwrap()

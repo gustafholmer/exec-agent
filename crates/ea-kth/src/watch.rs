@@ -53,16 +53,20 @@
 
 use anyhow::bail;
 use chrono::{DateTime, SecondsFormat, Utc};
+use ea_core::store::events::kinds;
 use serde::{Deserialize, Serialize};
 
 use crate::mail::{Mail, MailTransport};
 
 /// The `kind` on an unread-mail row. Triage mutes and keyword rules match on
 /// it, so these are stable names.
-pub const KIND_MAIL: &str = "mail";
+///
+/// The names live in [`ea_core::store::events::kinds`], shared with every
+/// other emitter and with the daemon that reads these rows back out.
+pub const KIND_MAIL: &str = kinds::MAIL;
 /// The `kind` on the synthetic row reporting an account this poll could not
 /// read.
-pub const KIND_CONNECTOR_ERROR: &str = "connector_error";
+pub const KIND_CONNECTOR_ERROR: &str = kinds::CONNECTOR_ERROR;
 
 /// How many unread messages one poll fetches per account.
 ///

@@ -132,6 +132,7 @@
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, NaiveDate, SecondsFormat, TimeZone, Utc};
+use ea_core::store::events::kinds;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -139,7 +140,10 @@ use crate::client::{page_title, NotionClient, MAX_DATA_SOURCES, UNTITLED};
 
 /// The `kind` every row carries. Triage mutes and keyword rules match on it,
 /// so it is one stable name rather than something derived per database.
-pub const KIND_ITEM: &str = "database_item";
+///
+/// The name lives in [`ea_core::store::events::kinds`], shared with the daemon
+/// that reads these rows back out.
+pub const KIND_ITEM: &str = kinds::DATABASE_ITEM;
 
 /// Notion's `"object"` discriminator, for the two types this crate knows.
 pub const OBJECT_PAGE: &str = "page";

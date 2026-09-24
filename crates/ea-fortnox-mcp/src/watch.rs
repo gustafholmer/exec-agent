@@ -48,15 +48,21 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use ea_core::store::events::kinds;
+
 use crate::deadlines::{self, Deadline};
 use crate::tools::{amount_value, coerce_amount};
 
 /// The `kind` on an unpaid-invoice row. Triage mutes and keywords match on it,
 /// so it is a stable name rather than something derived per invoice.
-pub const UNPAID_INVOICE_KIND: &str = "unpaid_invoice";
+///
+/// The names live in [`ea_core::store::events::kinds`]: the daemon's VAT
+/// briefing selects `tax_deadline` rows back out, and a private copy here
+/// would let a rename empty that section with no error.
+pub const UNPAID_INVOICE_KIND: &str = kinds::UNPAID_INVOICE;
 
 /// The `kind` on a tax-deadline row.
-pub const TAX_DEADLINE_KIND: &str = "tax_deadline";
+pub const TAX_DEADLINE_KIND: &str = kinds::TAX_DEADLINE;
 
 /// One change, in the shape the daemon's event store records:
 /// `(source, external_id)` is the idempotency key, `source` being the
