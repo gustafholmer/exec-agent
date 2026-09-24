@@ -83,6 +83,7 @@ fn restrict(path: &Path) {
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("events", "triage_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("events", "triage_error", "TEXT"),
+    ("facts", "updated_at", "TEXT"),
 ];
 
 /// Indexes over columns from [`ADDED_COLUMNS`]. They cannot live in
@@ -184,6 +185,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(error, None);
+    }
+
+    /// `facts` predates `updated_at`: every daemon that has been running since
+    /// Phase 1 has the table without the column, and `remember` writes it.
+    #[test]
+    fn a_facts_table_predating_updated_at_gains_the_column() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE facts (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   topic TEXT NOT NULL, body TEXT NOT NULL,
+                   created_at TEXT NOT NULL)",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).expect("opening an older database must migrate it");
+        conn.execute_batch(
+            "INSERT INTO facts (topic, body, created_at)
+             VALUES ('tenta','on the 14th','2026-09-01T00:00:00Z')",
+        )
+        .unwrap();
+        let updated: Option<String> = conn
+            .query_row("SELECT updated_at FROM facts WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("the added column must exist");
+        assert_eq!(updated, None);
     }
 
     #[test]

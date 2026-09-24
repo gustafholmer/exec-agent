@@ -18,9 +18,13 @@
 //!
 //! `reject`, `pause`, `resume` and `resume_job` reach no connector at all by
 //! construction: rejection is a status transition, and pausing or clearing a
-//! breaker is a flag the scheduler reads. `chat` starts a model session whose only write tool is
-//! `mcp__ea-propose__propose_action`, which comes back to `propose` on this
-//! same socket and through the same gate.
+//! breaker is a flag the scheduler reads. `remember`, `facts` and `forget` are
+//! the same kind of thing one layer in: they read and write the `facts` table
+//! and touch nothing else, which is exactly why `remember` is `auto` — a fact
+//! is internal state, not an effect on the world. `chat` starts a model
+//! session whose only write tools are `mcp__ea-propose__propose_action` and
+//! `mcp__ea-propose__remember`, both of which come back to this same socket:
+//! the first through the gate, the second into the `facts` table.
 //!
 //! What must stay absent is a method that names a connector and a tool and
 //! calls it. `connectors.call` was removed from this socket once already for
@@ -32,20 +36,21 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use ea_core::store::actions::{ActionStore, ProposeInput};
-use ea_core::store::conversations::ConversationStore;
 use ea_core::store::events::EventStore;
 use ea_core::store::runs::RunStore;
+use ea_core::store::schedules::ScheduleStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::chat::ChatService;
 use crate::executor::{Executor, ToolCaller};
 use crate::ipc;
 use crate::jobs::Pusher;
 use crate::notify::log::NotificationLog;
 use crate::scheduler::Scheduler;
-use crate::session::SessionRequest;
-use crate::triage::SessionBoundary;
+use crate::schedules::Schedule;
 
 /// How long a proposal waits for a human before it expires. The brief's
 /// default, and the only one there is until a caller asks for another.
@@ -69,17 +74,6 @@ pub const DEFAULT_LOG_LIMIT: i64 = 20;
 /// entire ledger into one IPC line (the protocol's own line cap would then
 /// truncate it into unparseable JSON).
 pub const MAX_LOG_LIMIT: i64 = 500;
-
-/// `kind` recorded on the `runs` row of a chat session.
-pub const CHAT_RUN_KIND: &str = "chat";
-
-/// What a chat session is told it is.
-pub const CHAT_SYSTEM_PROMPT: &str = concat!(
-    "You are the user's executive assistant, answering over a text interface. ",
-    "Be brief and concrete. You cannot act directly: the only way to change ",
-    "anything in the world is the propose_action tool, which records a proposal ",
-    "for the user to approve. Never claim to have done something you only proposed."
-);
 
 /// Params of the `propose` method.
 ///
@@ -151,6 +145,23 @@ struct LogParams {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatParams {
     message: String,
+    /// Where the message came from. Defaults to the terminal, because that is
+    /// the client that does not say: `ea chat` is one process and one socket,
+    /// while Telegram messages do not reach this method at all — they go
+    /// straight to the same [`ChatService`] from the update loop.
+    #[serde(default = "default_surface")]
+    surface: String,
+}
+
+fn default_surface() -> String {
+    crate::chat::SURFACE_CLI.to_string()
+}
+
+/// Params of `remember`.
+#[derive(Debug, Clone, Deserialize)]
+struct RememberParams {
+    topic: String,
+    body: String,
 }
 
 /// Params of `resume_job`.
@@ -168,37 +179,41 @@ struct JobParams {
 pub struct Deps<C: ToolCaller> {
     pub executor: Arc<Executor<C>>,
     pub actions: ActionStore,
-    pub conversations: ConversationStore,
     pub events: EventStore,
     pub runs: RunStore,
     pub scheduler: Arc<Scheduler>,
-    pub sessions: Option<Arc<dyn SessionBoundary>>,
+    /// The cron entries, read-only here: `status` answers "when is the next
+    /// briefing", which is the one question a scheduled job raises that the
+    /// interval jobs never did.
+    pub schedules: ScheduleStore,
+    /// The zone the cron entries are evaluated in — the owner's, the same one
+    /// quiet hours use.
+    pub time_zone: Tz,
+    /// The conversation, shared with the Telegram update loop: both surfaces
+    /// are clients of one thread, and one turn runs at a time. It owns the
+    /// session runner, the chat model, the daily budget and the `facts` table
+    /// it injects, so this struct no longer carries any of them separately.
+    pub chat: Arc<ChatService>,
     pub pusher: Option<Arc<dyn Pusher>>,
     /// Read-only here: `status` reports how much is waiting for a digest
     /// nobody delivers yet, and how much the cap has thrown away.
     pub notify_log: NotificationLog,
     pub connectors: Vec<String>,
-    pub daily_session_budget: u32,
-    /// The model `ea chat` runs on. Never empty: an unset model is inherited
-    /// from the human's own interactive settings, which is the bug this field
-    /// exists to close. See [`crate::config::DEFAULT_CHAT_MODEL`].
-    pub chat_model: String,
 }
 
 /// The daemon's state, shared by every connection the IPC server accepts.
 pub struct Daemon<C: ToolCaller> {
     executor: Arc<Executor<C>>,
     actions: ActionStore,
-    conversations: ConversationStore,
     events: EventStore,
     runs: RunStore,
     scheduler: Arc<Scheduler>,
-    sessions: Option<Arc<dyn SessionBoundary>>,
+    schedules: ScheduleStore,
+    time_zone: Tz,
+    chat: Arc<ChatService>,
     pusher: Option<Arc<dyn Pusher>>,
     notify_log: NotificationLog,
     connectors: Vec<String>,
-    daily_session_budget: u32,
-    chat_model: String,
     started_at: DateTime<Utc>,
 }
 
@@ -207,16 +222,15 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         Arc::new(Self {
             executor: deps.executor,
             actions: deps.actions,
-            conversations: deps.conversations,
             events: deps.events,
             runs: deps.runs,
             scheduler: deps.scheduler,
-            sessions: deps.sessions,
+            schedules: deps.schedules,
+            time_zone: deps.time_zone,
+            chat: deps.chat,
             pusher: deps.pusher,
             notify_log: deps.notify_log,
             connectors: deps.connectors,
-            daily_session_budget: deps.daily_session_budget,
-            chat_model: deps.chat_model,
             started_at: Utc::now(),
         })
     }
@@ -225,8 +239,10 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     ///
     /// One place, so that "what can be asked of the daemon over its socket" is
     /// a list you can read in ten seconds rather than something scattered
-    /// through `main`. Ten methods; see the module docs for how each one
-    /// relates to the gate.
+    /// through `main`. Thirteen methods; see the module docs for how each one
+    /// relates to the gate. The three added with the chat surface — `remember`,
+    /// `facts`, `forget` — are reads and writes of the `facts` table, and none
+    /// of them reaches a connector.
     pub fn register(self: &Arc<Self>, server: &mut ipc::Server) {
         macro_rules! method {
             ($name:literal, $call:ident) => {
@@ -248,6 +264,9 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         method!("resume_job", resume_job);
         method!("chat", chat);
         method!("propose", propose);
+        method!("remember", remember);
+        method!("facts", facts);
+        method!("forget", forget);
     }
 
     // ----------------------------------------------------------------------
@@ -295,20 +314,71 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // silent failure the rest of this endpoint exists to prevent.
             "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
             // Scores held back by the threshold, by quiet hours or by the
-            // hourly rate limit. Nothing delivers them yet — the morning
-            // briefing is Phase 4 — so without these two numbers a backlog
-            // accumulating, and then silently falling off the 200-line cap,
-            // would be invisible to the one person it belongs to.
+            // hourly rate limit. The morning briefing now delivers them, so
+            // `digest_pending` is normally the hours since the last briefing
+            // rather than a permanent backlog — which is exactly why it is
+            // still here: a number that keeps climbing past a day means the
+            // briefing has stopped, and `digest_dropped` counts what the
+            // 200-line cap has destroyed in the meantime.
             "digest_pending": self.notify_log.digest_len().unwrap_or_default(),
             "digest_dropped": self.notify_log.digest_dropped().unwrap_or_default(),
             "jobs": jobs,
+            "schedules": self.schedule_status(),
             "connectors": self.connectors,
-            "sessions_available": self.sessions.is_some(),
+            "sessions_available": self.chat.sessions_available(),
             "notifier_configured": self.pusher.is_some(),
-            "daily_session_budget": self.daily_session_budget,
-            "chat_model": self.chat_model,
+            // Spent against the ceiling, over the owner's day rather than
+            // UTC's. Together with `digest_pending` above, these are the two
+            // numbers that say at a glance whether the daemon is working or
+            // quietly stuck: a budget at its ceiling means triage has stopped
+            // scoring and the briefings have stopped writing, and a digest
+            // that keeps climbing past a day means the briefing that drains
+            // it is not running.
+            "sessions_today": self.chat.budget().status_line(Utc::now()),
+            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).unwrap_or_default(),
+            "daily_session_budget": self.chat.budget().limit(),
+            "chat_model": self.chat.model(),
+            "facts": self.chat.facts().all().map(|f| f.len()).unwrap_or_default(),
             "started_at": self.started_at.to_rfc3339(),
         }))
+    }
+
+    /// The cron entries, with the next time each is due.
+    ///
+    /// `next_run_at` is the part worth having. A briefing that has silently
+    /// stopped and one that is simply not due until tomorrow look identical
+    /// from outside, and the difference between "07:00 tomorrow" and `null` is
+    /// the difference between a healthy schedule and a row whose expression no
+    /// longer parses.
+    ///
+    /// Read errors degrade to an empty list rather than failing `status`: this
+    /// endpoint is what someone reaches for when things are already wrong, and
+    /// it must answer.
+    fn schedule_status(&self) -> Vec<Value> {
+        let rows = match self.schedules.all() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "could not read the schedules table");
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .map(|row| {
+                let next = row.last_run_at.and_then(|last| {
+                    Schedule::parse(&row.name, &row.cron, self.time_zone, Some(last))
+                        .ok()?
+                        .next_after(last)
+                });
+                json!({
+                    "name": row.name,
+                    "cron": row.cron,
+                    "time_zone": self.time_zone.name(),
+                    "enabled": row.enabled,
+                    "last_run_at": row.last_run_at.map(|at| at.to_rfc3339()),
+                    "next_run_at": next.map(|at| at.to_rfc3339()),
+                })
+            })
+            .collect()
     }
 
     /// `queue` — the proposals waiting for a human.
@@ -443,100 +513,60 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
 
     /// `chat` — say something to the assistant.
     ///
-    /// The message is appended to the current conversation first and
-    /// unconditionally, so nothing the human said is lost even if the session
-    /// then fails, is skipped for budget, or the daemon is running without a
-    /// `claude` binary at all. The conversation id comes back either way.
+    /// A thin adapter over [`ChatService::say`], which both surfaces share: the
+    /// Telegram update loop calls the same method on the same instance, so a
+    /// thread started on the phone continues here mid-sentence and two
+    /// messages can never run two sessions against one conversation.
     ///
-    /// A chat session gets no connectors and one write tool
-    /// (`mcp__ea-propose__propose_action`, via `session::ALLOWED_TOOLS`), which
-    /// re-enters this daemon at `propose` and goes through the gate like
-    /// anything else. Nothing it can do reaches a connector directly.
+    /// A chat session gets no connectors and two write tools — `propose_action`
+    /// and `remember`, via `session::ToolScope::ProposeAndRemember` -- the only
+    /// scope that includes the second, and chat is the only kind that uses it,
+    /// because a chat prompt is the owner's own words. The first re-enters this
+    /// daemon at `propose` and goes through the gate like anything else; the
+    /// second writes a row to `facts`. Nothing a session can do reaches a
+    /// connector directly.
+    ///
+    /// A session that *fails* is an error to the caller, not a note: a turn
+    /// that produced no answer must not leave a phantom reply in the thread.
     pub async fn chat(&self, params: Value) -> anyhow::Result<Value> {
         let params: ChatParams = parse_params("chat", params)?;
-        let message = params.message.trim().to_string();
-        if message.is_empty() {
-            bail!("chat: `message` must not be empty");
-        }
-
-        let conversation_id = self.conversations.current()?;
-        let stored = self
-            .conversations
-            .append(conversation_id, "user", "cli", &message)?;
-
-        let (reply, note) = match self.reply_to(conversation_id, &message).await {
-            Ok(Some(reply)) => (Some(reply), None),
-            Ok(None) => (None, Some(self.why_no_reply())),
-            Err(err) => {
-                tracing::warn!(error = %format!("{err:#}"), "chat session failed");
-                (None, Some(format!("the session failed: {err:#}")))
-            }
-        };
-
-        if let Some(reply) = &reply {
-            self.conversations
-                .append(conversation_id, "assistant", "cli", reply)?;
-        }
-
-        Ok(json!({
-            "conversation_id": conversation_id,
-            "message_id": stored.id,
-            "reply": reply,
-            "note": note,
-        }))
+        let turn = self.chat.say(&params.surface, &params.message).await?;
+        serde_json::to_value(turn).context("chat: serialising the turn")
     }
 
-    /// Run one chat session, or `None` when there is no session runner or the
-    /// day's budget is spent.
-    async fn reply_to(
-        &self,
-        conversation_id: i64,
-        message: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let Some(sessions) = self.sessions.as_ref() else {
-            return Ok(None);
-        };
-        if crate::jobs::session_budget_spent(&self.runs, self.daily_session_budget, Utc::now())? {
-            return Ok(None);
-        }
+    // ----------------------------------------------------------------------
+    // Memory
+    //
+    // Three methods that read and write the `facts` table and nothing else.
+    // No connector is reachable from any of them, which is the whole reason
+    // `remember` is `auto` rather than a proposal: a fact is internal state,
+    // reversible with `forget`, and gating it behind a human tap would mean
+    // the assistant never learns anything.
+    // ----------------------------------------------------------------------
 
-        let mut request = SessionRequest::new(CHAT_RUN_KIND, message, CHAT_SYSTEM_PROMPT)
-            // Read tools are not in `session::ALLOWED_TOOLS` anyway; handing a
-            // chat session connector servers would spawn children it cannot
-            // call.
-            .with_connectors(Vec::<String>::new())
-            // Explicit, and the whole point of the field. Unset, the CLI
-            // inherits the model the human last picked for interactive work —
-            // `opus-5[1m]` on this machine, around 30x tier 1's rate — and
-            // charges it against the same daily session budget, so a chat
-            // would silently cost thirty triage passes and the price would
-            // change whenever the owner changed an editor setting.
-            .with_model(&self.chat_model);
-        if let Some(previous) = self.conversations.claude_session(conversation_id)? {
-            request = request.with_resume(previous);
-        }
-
-        let outcome = sessions.run_session(request).await?;
-        if let Some(session_id) = &outcome.session_id {
-            // Recorded so the next message continues the same thread rather
-            // than starting from nothing.
-            self.conversations
-                .set_claude_session(conversation_id, session_id)?;
-        }
-        Ok(Some(outcome.text))
+    /// `remember` — store a fact under a topic, replacing what was there.
+    ///
+    /// Called by the `remember` tool on `ea-propose` and by nothing else in
+    /// production. Same topic twice updates rather than duplicating; see
+    /// [`ea_core::store::facts`].
+    pub async fn remember(&self, params: Value) -> anyhow::Result<Value> {
+        let params: RememberParams = parse_params("remember", params)?;
+        let fact = self.chat.facts().remember(&params.topic, &params.body)?;
+        serde_json::to_value(fact).context("remember: serialising the fact")
     }
 
-    fn why_no_reply(&self) -> String {
-        if self.sessions.is_none() {
-            "recorded, but this daemon has no session runner (is `claude` on PATH?), \
-             so there is no reply"
-                .to_string()
-        } else {
-            format!(
-                "recorded, but the daily session budget of {} is spent, so there is no reply",
-                self.daily_session_budget
-            )
-        }
+    /// `facts` — everything the assistant has been told to remember.
+    pub async fn facts(&self, _params: Value) -> anyhow::Result<Value> {
+        let facts = self.chat.facts().all()?;
+        serde_json::to_value(facts).context("facts: serialising the facts")
+    }
+
+    /// `forget` — delete one fact. Says plainly when there was nothing there,
+    /// rather than reporting a deletion that did not happen.
+    pub async fn forget(&self, params: Value) -> anyhow::Result<Value> {
+        let params: IdParams = parse_params("forget", params)?;
+        let existed = self.chat.facts().forget(params.id)?;
+        Ok(json!({ "id": params.id, "forgotten": existed }))
     }
 
     /// Put a proposal in front of the human, if there is a way to.
@@ -577,14 +607,18 @@ mod tests {
     use std::sync::Mutex;
 
     use ea_core::policy::Policy;
+    use ea_core::store::conversations::ConversationStore;
+    use ea_core::store::facts::FactStore;
     use ea_core::store::kv::KvStore;
     use ea_core::store::runs::RunStore;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::budget::Budget;
+    use crate::chat::ChatService;
     use crate::scheduler::Job;
-    use crate::session::SessionOutcome;
-    use crate::triage::BoxedSession;
+    use crate::session::{SessionOutcome, SessionRequest};
+    use crate::triage::{BoxedSession, SessionBoundary};
 
     type CallLog = Arc<Mutex<Vec<(String, String)>>>;
 
@@ -704,6 +738,8 @@ record_voucher = "approve"
         scheduler: Arc<Scheduler>,
         pusher: Arc<FakePusher>,
         sessions: Option<Arc<FakeSessions>>,
+        conversations: ConversationStore,
+        facts: FactStore,
     }
 
     impl Fixture {
@@ -741,20 +777,33 @@ record_voucher = "approve"
                 Ok(())
             }));
             let pusher = Arc::new(FakePusher::default());
+            let conversations = ConversationStore::new(Arc::clone(&conn));
+            let facts = FactStore::new(Arc::clone(&conn));
+            let chat = Arc::new(ChatService::new(
+                conversations.clone(),
+                facts.clone(),
+                sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
+                Budget::new(
+                    RunStore::new(Arc::clone(&conn)),
+                    budget,
+                    crate::notify::policy::DEFAULT_TIME_ZONE,
+                ),
+                crate::config::DEFAULT_CHAT_MODEL,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            ));
 
             let daemon = Daemon::build(Deps {
                 executor,
                 actions: ActionStore::new(Arc::clone(&conn)),
-                conversations: ConversationStore::new(Arc::clone(&conn)),
                 events: EventStore::new(Arc::clone(&conn)),
                 runs: RunStore::new(Arc::clone(&conn)),
                 scheduler: Arc::clone(&scheduler),
-                sessions: sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
+                schedules: ScheduleStore::new(Arc::clone(&conn)),
+                time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+                chat: Arc::clone(&chat),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
                 notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
                 connectors: vec!["canvas".to_string()],
-                daily_session_budget: budget,
-                chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
             });
 
             Self {
@@ -765,6 +814,8 @@ record_voucher = "approve"
                 scheduler,
                 pusher,
                 sessions,
+                conversations,
+                facts,
             }
         }
 
@@ -784,6 +835,9 @@ record_voucher = "approve"
                 "resume_job" => self.daemon.resume_job(params).await,
                 "chat" => self.daemon.chat(params).await,
                 "propose" => self.daemon.propose(params).await,
+                "remember" => self.daemon.remember(params).await,
+                "facts" => self.daemon.facts(params).await,
+                "forget" => self.daemon.forget(params).await,
                 other => panic!("no such method {other}"),
             }
         }
@@ -982,16 +1036,15 @@ record_voucher = "approve"
         let daemon = Daemon::build(Deps {
             executor: Arc::clone(&f2.daemon.executor),
             actions: f2.daemon.actions.clone(),
-            conversations: f2.daemon.conversations.clone(),
             events: f2.daemon.events.clone(),
             runs: f2.daemon.runs.clone(),
             scheduler: Arc::clone(&failing),
-            sessions: None,
+            schedules: ScheduleStore::new(Arc::clone(&f2.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+            chat: Arc::clone(&f2.daemon.chat),
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f2.conn))),
             connectors: vec!["canvas".to_string()],
-            daily_session_budget: 60,
-            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         });
         let status = daemon.status(Value::Null).await.unwrap();
         let canvas = &status["jobs"][0];
@@ -1087,16 +1140,15 @@ record_voucher = "approve"
         let daemon = Daemon::build(Deps {
             executor: Arc::clone(&f.daemon.executor),
             actions: f.daemon.actions.clone(),
-            conversations: f.daemon.conversations.clone(),
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
-            sessions: None,
+            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+            chat: Arc::clone(&f.daemon.chat),
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             connectors: vec!["canvas".to_string()],
-            daily_session_budget: 60,
-            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         });
         (f, scheduler, daemon)
     }
@@ -1125,6 +1177,52 @@ record_voucher = "approve"
 
     /// Answering "ok" to a typo would be exactly the silent failure this
     /// review is about: the owner would think they had fixed it.
+    /// `status` answers "when is the next briefing". A schedule that has
+    /// silently stopped and one that is simply not due yet are otherwise
+    /// indistinguishable from outside.
+    #[tokio::test]
+    async fn status_reports_every_schedule_and_when_it_next_runs() {
+        let f = Fixture::new();
+        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        crate::schedules::register_built_ins(&store, "2026-09-24T10:00:00Z".parse().unwrap())
+            .unwrap();
+
+        let status = f.call("status", Value::Null).await.unwrap();
+        let schedules = status["schedules"].as_array().expect("an array").clone();
+        assert_eq!(schedules.len(), 3);
+
+        let morning = schedules
+            .iter()
+            .find(|s| s["name"] == crate::schedules::MORNING_BRIEFING)
+            .expect("the morning briefing");
+        assert_eq!(morning["cron"], crate::schedules::MORNING_BRIEFING_CRON);
+        assert_eq!(morning["enabled"], true);
+        assert_eq!(morning["time_zone"], "Europe/Stockholm");
+        assert_eq!(morning["last_run_at"], "2026-09-24T10:00:00+00:00");
+        // Installed at noon Stockholm on the 24th, so the next 07:00 local is
+        // the 25th, which is 05:00 UTC.
+        assert_eq!(morning["next_run_at"], "2026-09-25T05:00:00+00:00");
+    }
+
+    /// A row whose expression has been edited into nonsense reports a `null`
+    /// next run rather than taking `status` down with it.
+    #[tokio::test]
+    async fn a_broken_schedule_row_does_not_break_status() {
+        let f = Fixture::new();
+        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        store
+            .ensure(
+                "wrong",
+                "not a cron",
+                "2026-09-24T10:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+
+        let status = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["schedules"][0]["next_run_at"], Value::Null);
+    }
+
     #[tokio::test]
     async fn resume_job_refuses_a_name_no_job_has() {
         let (_f, scheduler, daemon) = tripped_fixture().await;
@@ -1398,6 +1496,14 @@ record_voucher = "approve"
             .unwrap();
         let id = proposed["id"].as_i64().unwrap();
 
+        let fact = client
+            .call(
+                "remember",
+                json!({ "topic": "tenta", "body": "on the 14th" }),
+            )
+            .await
+            .unwrap();
+
         for (method, params) in [
             ("status", Value::Null),
             ("queue", Value::Null),
@@ -1406,6 +1512,8 @@ record_voucher = "approve"
             ("resume", Value::Null),
             ("resume_job", json!({ "job": "canvas" })),
             ("chat", json!({ "message": "hi" })),
+            ("facts", Value::Null),
+            ("forget", json!({ "id": fact["id"] })),
             ("reject", json!({ "id": id })),
         ] {
             client
@@ -1421,6 +1529,42 @@ record_voucher = "approve"
         assert!(format!("{err:#}").contains("connectors.call"), "{err:#}");
 
         handle.shutdown().await;
+    }
+
+    /// The IPC surface, by name. Ten methods since Phase 1; the chat surface
+    /// adds `remember`, `facts` and `forget`, which read and write the local
+    /// `facts` table and reach no connector — the test below proves the last
+    /// part by driving all three and asserting the spy caller saw nothing.
+    ///
+    /// A method appearing here that is not in the module docs' gating account
+    /// is exactly what this is for. `connectors.call` was on this socket once
+    /// and was removed; nothing of that shape may return.
+    #[tokio::test]
+    async fn the_ipc_surface_is_exactly_these_thirteen_methods() {
+        let f = Fixture::new();
+        let dir = TempDir::new().unwrap();
+        let mut server = ipc::Server::new(&dir.path().join("d.sock"));
+        f.daemon.register(&mut server);
+
+        assert_eq!(
+            server.methods(),
+            vec![
+                "approve",
+                "chat",
+                "facts",
+                "forget",
+                "log",
+                "pause",
+                "propose",
+                "queue",
+                "reject",
+                "remember",
+                "resume",
+                "resume_job",
+                "status",
+            ]
+        );
+        assert_eq!(server.methods().len(), 13);
     }
 
     #[tokio::test]
@@ -1463,32 +1607,82 @@ record_voucher = "approve"
         assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
     }
 
-    /// The budget is a ceiling on model spend, and it has to actually stop a
-    /// session rather than merely being reported.
+    /// **The owner's own message is never refused.**
+    ///
+    /// The budget stops the work the daemon decided to do on its own — triage
+    /// degrades to tier 0, the briefings wait for tomorrow — and neither of
+    /// those has a human sitting in front of it. A typed message does, it has
+    /// no cheaper tier to fall back to, and the moment the owner reaches for
+    /// chat is usually the moment they are asking why the daemon has gone
+    /// quiet. Refusing then leaves them editing a config file to get a
+    /// sentence out of it.
+    ///
+    /// What the budget does instead is say so on every turn past the ceiling,
+    /// while still counting the spend, so `ea status` stays honest and the
+    /// unattended work is what stops first.
     #[tokio::test]
-    async fn chat_stops_starting_sessions_once_the_daily_budget_is_spent() {
+    async fn chat_answers_the_owner_even_when_the_daily_budget_is_spent() {
         let f = Fixture::build(true, 2);
-        for _ in 0..2 {
-            let reply = f.call("chat", json!({ "message": "hi" })).await.unwrap();
-            assert_eq!(reply["reply"], "here is your answer");
-        }
+
+        let first = f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        assert_eq!(first["reply"], "here is your answer");
+        assert!(first["note"].is_null(), "under the ceiling: {first}");
+
+        // The turn that spends the last session says so on itself rather than
+        // waiting for the next one to be surprised.
+        let second = f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        assert_eq!(second["reply"], "here is your answer");
+        assert!(
+            second["note"].as_str().unwrap().contains("budget"),
+            "{second}"
+        );
+
         let third = f
             .call("chat", json!({ "message": "hi again" }))
             .await
             .unwrap();
-        assert!(third["reply"].is_null(), "{third}");
-        assert!(third["note"].as_str().unwrap().contains("budget"));
+        assert_eq!(
+            third["reply"], "here is your answer",
+            "the owner is answered: {third}"
+        );
+        let note = third["note"].as_str().unwrap();
+        assert!(note.contains("budget"), "{note}");
+        assert!(note.contains("Europe/Stockholm"), "{note}");
         assert_eq!(
             f.sessions.as_ref().unwrap().seen.lock().unwrap().len(),
-            2,
-            "no third session may be started"
+            3,
+            "the third session runs"
         );
-        // The message is still recorded, budget or no budget.
         assert!(third["message_id"].as_i64().unwrap() > 0);
+
+        // And the spend is visible rather than hidden: over the ceiling, and
+        // saying so.
+        let status = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(status["sessions_today"], "3/2");
+        assert_eq!(status["sessions_spent_today"], 3);
+    }
+
+    /// The two numbers `ea status` exists to put next to each other.
+    #[tokio::test]
+    async fn status_reports_the_sessions_spent_today_against_the_ceiling() {
+        let f = Fixture::build(true, 60);
+        let before = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(before["sessions_today"], "0/60");
+        assert_eq!(before["daily_session_budget"], 60);
+        assert_eq!(before["digest_pending"], 0);
+
+        f.call("chat", json!({ "message": "hi" })).await.unwrap();
+        f.daemon.notify_log.push_digest("held back").unwrap();
+
+        let after = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(after["sessions_today"], "1/60");
+        assert_eq!(after["sessions_spent_today"], 1);
+        assert_eq!(after["digest_pending"], 1);
     }
 
     /// A chat session must not be handed connector servers, and must reach the
-    /// world only through propose_action.
+    /// world only through propose_action. `remember` is the other tool on the
+    /// list and writes a local row; neither names a connector.
     #[tokio::test]
     async fn a_chat_session_is_scoped_to_no_connectors() {
         let f = Fixture::new();
@@ -1496,8 +1690,8 @@ record_voucher = "approve"
         let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
         assert!(seen[0].connectors.is_empty());
         assert_eq!(
-            crate::session::ALLOWED_TOOLS,
-            "mcp__ea-propose__propose_action"
+            seen[0].tools.allowed_tools(),
+            "mcp__ea-propose__propose_action,mcp__ea-propose__remember"
         );
     }
 
@@ -1535,19 +1729,30 @@ record_voucher = "approve"
     #[tokio::test]
     async fn a_configured_chat_model_is_the_one_used() {
         let f = Fixture::new();
+        let chat = Arc::new(ChatService::new(
+            f.conversations.clone(),
+            f.facts.clone(),
+            f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
+            Budget::new(
+                f.daemon.runs.clone(),
+                60,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            ),
+            "claude-opus-4-5",
+            crate::notify::policy::DEFAULT_TIME_ZONE,
+        ));
         let daemon = Daemon::build(Deps {
             executor: Arc::clone(&f.daemon.executor),
             actions: f.daemon.actions.clone(),
-            conversations: f.daemon.conversations.clone(),
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&f.scheduler),
-            sessions: f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
+            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+            chat,
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             connectors: Vec::new(),
-            daily_session_budget: 60,
-            chat_model: "claude-opus-4-5".to_string(),
         });
         daemon.chat(json!({ "message": "hi" })).await.unwrap();
 
@@ -1559,5 +1764,180 @@ record_voucher = "approve"
 
         let status = daemon.status(Value::Null).await.unwrap();
         assert_eq!(status["chat_model"], "claude-opus-4-5");
+    }
+
+    // -- memory --------------------------------------------------------------
+
+    /// The whole point of `remember`: a fact written by a session comes back
+    /// on the next conversation that mentions it.
+    #[tokio::test]
+    async fn a_remembered_fact_round_trips_through_the_socket_methods() {
+        let f = Fixture::new();
+        let stored = f
+            .call(
+                "remember",
+                json!({ "topic": "tenta", "body": "the databases tenta is on the 14th" }),
+            )
+            .await
+            .unwrap();
+        assert!(stored["id"].as_i64().unwrap() > 0);
+        assert_eq!(stored["topic"], "tenta");
+
+        let listed = f.call("facts", Value::Null).await.unwrap();
+        let rows = listed.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["body"], "the databases tenta is on the 14th");
+
+        let forgotten = f
+            .call("forget", json!({ "id": stored["id"] }))
+            .await
+            .unwrap();
+        assert_eq!(forgotten["forgotten"], true);
+        assert!(f
+            .call("facts", Value::Null)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn remembering_the_same_topic_twice_updates_rather_than_duplicating() {
+        let f = Fixture::new();
+        let first = f
+            .call(
+                "remember",
+                json!({ "topic": "tenta", "body": "on the 14th" }),
+            )
+            .await
+            .unwrap();
+        let second = f
+            .call(
+                "remember",
+                json!({ "topic": "tenta", "body": "moved to the 21st" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first["id"], second["id"]);
+        let rows = f.call("facts", Value::Null).await.unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["body"], "moved to the 21st");
+    }
+
+    #[tokio::test]
+    async fn remembering_an_empty_body_is_refused() {
+        let f = Fixture::new();
+        let err = f
+            .call("remember", json!({ "topic": "tenta", "body": "  " }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("body"), "{err:#}");
+        assert!(f
+            .call("facts", Value::Null)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_fact_that_is_not_there_says_so() {
+        let f = Fixture::new();
+        let answer = f.call("forget", json!({ "id": 9999 })).await.unwrap();
+        assert_eq!(answer["forgotten"], false);
+    }
+
+    /// The gate, restated for the three methods this task added: memory is
+    /// local state, and none of it may reach a connector.
+    #[tokio::test]
+    async fn the_memory_methods_reach_no_connector() {
+        let f = Fixture::new();
+        let stored = f
+            .call(
+                "remember",
+                json!({ "topic": "tenta", "body": "on the 14th" }),
+            )
+            .await
+            .unwrap();
+        f.call("facts", Value::Null).await.unwrap();
+        f.call("forget", json!({ "id": stored["id"] }))
+            .await
+            .unwrap();
+        f.call("chat", json!({ "message": "hello" })).await.unwrap();
+
+        assert!(
+            f.calls().is_empty(),
+            "memory and chat must reach no connector: {:?}",
+            f.calls()
+        );
+    }
+
+    /// A message from the phone and one from the terminal are two turns in one
+    /// thread, and the IPC surface is how the terminal joins it.
+    #[tokio::test]
+    async fn chat_records_the_surface_it_was_told() {
+        let f = Fixture::new();
+        f.call(
+            "chat",
+            json!({ "message": "from the phone", "surface": "telegram" }),
+        )
+        .await
+        .unwrap();
+        f.call("chat", json!({ "message": "from the terminal" }))
+            .await
+            .unwrap();
+
+        let id = f.conversations.current().unwrap();
+        let messages = f.conversations.recent(id, 10).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.surface.as_str())
+                .collect::<Vec<_>>(),
+            ["telegram", "telegram", "cli", "cli"],
+            "an absent surface defaults to the terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_refuses_a_surface_nobody_has() {
+        let f = Fixture::new();
+        let err = f
+            .call("chat", json!({ "message": "hi", "surface": "sms" }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("sms"), "{err:#}");
+    }
+
+    /// The prompt a chat session is given must carry the facts that match, and
+    /// only those.
+    #[tokio::test]
+    async fn a_chat_prompt_carries_the_matching_facts() {
+        let f = Fixture::new();
+        f.facts
+            .remember("tenta", "the databases tenta is on the 14th")
+            .unwrap();
+        f.facts
+            .remember("invoicing", "invoices go to Ekonomi AB")
+            .unwrap();
+
+        f.call("chat", json!({ "message": "when is the tenta?" }))
+            .await
+            .unwrap();
+
+        let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
+        assert!(
+            seen[0].system_prompt.contains("databases tenta"),
+            "{}",
+            seen[0].system_prompt
+        );
+        assert!(
+            !seen[0].system_prompt.contains("Ekonomi AB"),
+            "{}",
+            seen[0].system_prompt
+        );
     }
 }

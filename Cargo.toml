@@ -10,6 +10,8 @@ members = [
   "crates/ea-google",
   "crates/ea-fortnox",
   "crates/ea-fortnox-mcp",
+  "crates/ea-notion",
+  "crates/ea-kth",
 ]
 
 [workspace.package]
@@ -26,6 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "signal", "io-util", "sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+cron = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
@@ -41,3 +44,4 @@ base64 = "0.22"
 calamine = { version = "0.36", features = ["dates"] }
 rust_xlsxwriter = "0.99"
 sha1 = "0.11"
+sha2 = "0.11"

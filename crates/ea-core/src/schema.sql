@@ -57,7 +57,11 @@ CREATE TABLE IF NOT EXISTS facts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   topic      TEXT NOT NULL,
   body       TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- Set when `remember` overwrote the body of an existing topic; NULL on a
+  -- fact nobody has corrected. `created_at` keeps saying when it was first
+  -- learned, which is the more useful of the two when reading `ea facts`.
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (

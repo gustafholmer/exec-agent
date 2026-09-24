@@ -71,12 +71,17 @@ enum Command {
         /// The job, as `ea status` names it (a connector, or `triage`).
         job: Option<String>,
     },
-    /// Say something to the assistant.
+    /// Say something to the assistant. With no message, starts an
+    /// interactive loop; Ctrl-D (or `exit`) leaves it.
     Chat {
         /// The message. Quoting is optional: everything after `chat` is joined.
-        #[arg(required = true, num_args = 1..)]
+        #[arg(num_args = 1..)]
         message: Vec<String>,
     },
+    /// What the assistant has been told to remember.
+    Facts,
+    /// Delete one fact, by the id `ea facts` shows.
+    Forget { id: i64 },
 }
 
 #[tokio::main]
@@ -106,13 +111,118 @@ async fn main() -> anyhow::Result<()> {
             print_json(&answer)?
         }
         Command::Chat { message } => {
-            let message = message.join(" ");
             let client = Client::with_timeout(ea_core::paths::socket_path(), CHAT_TIMEOUT);
-            print_json(&client.call("chat", json!({ "message": message })).await?)?
+            if message.is_empty() {
+                converse(&client).await?;
+            } else {
+                let message = message.join(" ");
+                print_json(&client.call("chat", json!({ "message": message })).await?)?;
+            }
         }
+        Command::Facts => {
+            let data = client.call("facts", Value::Null).await?;
+            print!("{}", render_facts(&data));
+        }
+        Command::Forget { id } => print_json(&client.call("forget", json!({ "id": id })).await?)?,
     }
 
     Ok(())
+}
+
+/// `ea chat` with no argument: one thread, one line at a time.
+///
+/// Prints the reply rather than the JSON, because this is a conversation and
+/// nobody reads a conversation as `{"reply": ...}`. A failed turn prints the
+/// error and the loop continues: the daemon stored no assistant message for
+/// it, so trying again is the right move and exiting would throw away the
+/// thread.
+///
+/// The prompt is written only when stdin is a terminal, so that
+/// `echo "..." | ea chat` stays usable from a script.
+async fn converse(client: &Client) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        println!("Talking to the assistant. Ctrl-D to leave.");
+    }
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        if interactive {
+            print!("> ");
+            std::io::stdout().flush().ok();
+        }
+        line.clear();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let message = line.trim();
+        if message.is_empty() {
+            continue;
+        }
+        if matches!(message, "exit" | "quit") {
+            return Ok(());
+        }
+
+        match client.call("chat", json!({ "message": message })).await {
+            Ok(answer) => println!("{}", chat_answer(&answer)),
+            Err(err) => eprintln!("{err:#}"),
+        }
+    }
+}
+
+/// What to print for one turn: the reply, the daemon's note, or — when the
+/// turn carries both — the reply with the note under it.
+///
+/// A turn answered over the day's session budget is exactly that both case,
+/// and the note is the only place the owner is told background triage has
+/// stopped scoring and the next briefing will not be written. Returning early
+/// on the reply threw that away. Pure, so every case is testable without a
+/// daemon.
+fn chat_answer(value: &Value) -> String {
+    match (value["reply"].as_str(), value["note"].as_str()) {
+        (Some(reply), Some(note)) => format!("{reply}\n\n({note})"),
+        (Some(reply), None) => reply.to_string(),
+        (None, Some(note)) => format!("(no reply: {note})"),
+        (None, None) => format!("(no reply: {value})"),
+    }
+}
+
+/// `#3  tenta` with the body indented under it.
+///
+/// Rendered rather than dumped for the same reason `queue` is: this is the
+/// command someone runs to find the wrong thing the assistant believes, and a
+/// wall of JSON answers that badly.
+fn render_facts(data: &Value) -> String {
+    let Some(rows) = data.as_array() else {
+        return format!("{data}\n");
+    };
+    if rows.is_empty() {
+        return "Nothing remembered yet.\n".to_string();
+    }
+
+    let mut out = String::new();
+    for row in rows {
+        let id = row["id"].as_i64().unwrap_or_default();
+        let topic = row["topic"].as_str().unwrap_or("?");
+        out.push_str(&format!("#{id}  {topic}\n"));
+        for line in row["body"].as_str().unwrap_or("").lines() {
+            out.push_str(&format!("    {line}\n"));
+        }
+        // The date that answers "is this still true?": when it was last
+        // corrected, falling back to when it was first learned.
+        if let Some(when) = row["updated_at"].as_str().or(row["created_at"].as_str()) {
+            out.push_str(&format!("    ({when})\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "{} remembered. `ea forget <id>` to delete one.\n",
+        rows.len()
+    ));
+    out
 }
 
 fn print_json(value: &Value) -> anyhow::Result<()> {
@@ -214,5 +324,85 @@ mod tests {
     #[test]
     fn a_non_array_answer_is_printed_as_is() {
         assert_eq!(render_queue(&json!("nope")), "\"nope\"\n");
+    }
+
+    fn fact(id: i64, topic: &str, body: &str) -> Value {
+        json!({
+            "id": id,
+            "topic": topic,
+            "body": body,
+            "created_at": "2026-09-01T09:00:00+00:00",
+            "updated_at": null,
+        })
+    }
+
+    #[test]
+    fn facts_are_listed_with_the_id_you_forget_them_by() {
+        let rendered = render_facts(&json!([fact(3, "tenta", "on the 14th")]));
+        assert!(rendered.contains("#3  tenta\n"), "{rendered}");
+        assert!(rendered.contains("\n    on the 14th\n"), "{rendered}");
+        assert!(rendered.contains("2026-09-01"), "{rendered}");
+        assert!(rendered.contains("ea forget <id>"), "{rendered}");
+    }
+
+    #[test]
+    fn a_corrected_fact_shows_when_it_was_corrected() {
+        let mut row = fact(3, "tenta", "moved to the 21st");
+        row["updated_at"] = json!("2026-09-20T18:00:00+00:00");
+        let rendered = render_facts(&json!([row]));
+        assert!(rendered.contains("2026-09-20"), "{rendered}");
+        assert!(!rendered.contains("2026-09-01"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_memory_says_so_rather_than_printing_nothing() {
+        assert_eq!(render_facts(&json!([])), "Nothing remembered yet.\n");
+    }
+
+    #[test]
+    fn a_malformed_fact_row_still_prints() {
+        let rendered = render_facts(&json!([{ "id": "not a number" }]));
+        assert!(rendered.contains("#0  ?"), "{rendered}");
+    }
+
+    #[test]
+    fn a_turn_prints_the_reply_and_falls_back_to_the_note() {
+        assert_eq!(
+            chat_answer(&json!({ "reply": "the tenta is on the 14th", "note": null })),
+            "the tenta is on the 14th"
+        );
+        let no_runner = chat_answer(&json!({
+            "reply": null,
+            "note": "recorded, but this daemon has no session runner",
+        }));
+        assert!(no_runner.contains("no session runner"), "{no_runner}");
+        // Neither field: still a line, never a panic.
+        assert!(chat_answer(&json!({})).contains("no reply"));
+    }
+
+    /// The over-budget turn carries both: the answer the owner asked for and
+    /// the note that the day's session budget is spent, so background triage
+    /// has stopped scoring and no briefing will be written. Printing the reply
+    /// and dropping the note is what let the owner keep crossing a spending
+    /// bound without being told.
+    #[test]
+    fn an_over_budget_turn_prints_the_note_as_well_as_the_reply() {
+        let answered = chat_answer(&json!({
+            "reply": "the tenta is on the 14th",
+            "note": "answered anyway, but the daily session budget of 60 is spent",
+        }));
+
+        assert!(
+            answered.contains("the tenta is on the 14th"),
+            "the answer must still be there: {answered}"
+        );
+        assert!(
+            answered.contains("the daily session budget of 60 is spent"),
+            "the note must be printed too: {answered}"
+        );
+        assert!(
+            answered.find("the tenta").unwrap() < answered.find("answered anyway").unwrap(),
+            "the note comes after the answer, not interleaved: {answered}"
+        );
     }
 }

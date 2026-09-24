@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod db;
+pub mod html;
 pub mod ipc;
 pub mod paths;
 pub mod policy;

@@ -68,6 +68,18 @@ impl Server {
         self.handlers.insert(method.to_string(), Arc::new(handler));
     }
 
+    /// Every method registered, sorted.
+    ///
+    /// Exists so that "what can be asked of this daemon" is a list a test can
+    /// assert on by name rather than a claim in a comment. The gate argument
+    /// in `daemon`'s module docs is about this exact set: a method that
+    /// appears here without appearing there is the thing to catch.
+    pub fn methods(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.handlers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
     pub async fn spawn(self) -> anyhow::Result<ServerHandle> {
         if self.path.exists() {
             std::fs::remove_file(&self.path)

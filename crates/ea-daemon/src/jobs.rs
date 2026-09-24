@@ -31,9 +31,9 @@ use chrono::{DateTime, Utc};
 use ea_core::policy::{Mode, Policy};
 use ea_core::store::actions::ActionStore;
 use ea_core::store::events::{Event, EventStore, RecordInput};
-use ea_core::store::runs::RunStore;
 use serde::Deserialize;
 
+use crate::budget::Budget;
 use crate::executor::ToolCaller;
 use crate::notify::log::NotificationLog;
 use crate::notify::policy::NotificationPolicy;
@@ -219,7 +219,6 @@ impl<T: Transport + Send + Sync, C: ToolCaller + Send + Sync> Pusher for Notifie
 pub struct TriageDeps {
     pub events: EventStore,
     pub actions: ActionStore,
-    pub runs: RunStore,
     /// Absent when `claude` could not be resolved at startup: triage then does
     /// tier 0 and stops, rather than the daemon refusing to run at all.
     pub sessions: Option<Arc<dyn SessionBoundary>>,
@@ -229,11 +228,14 @@ pub struct TriageDeps {
     pub log: NotificationLog,
     pub notify: NotificationPolicy,
     pub rules: Tier0Rules,
-    pub daily_session_budget: u32,
+    /// The day's ceiling on model sessions. Triage is the highest-frequency
+    /// spender in the system and the one that degrades most gracefully: when
+    /// this is gone, tier 0 keeps running for free.
+    pub budget: Budget,
 }
 
 /// What one triage pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TriageSummary {
     /// Proposals that ran out of time and were expired.
     pub expired: usize,
@@ -257,6 +259,13 @@ pub struct TriageSummary {
     /// spent. Visible rather than silent: "triage stopped scoring" with no
     /// reason is indistinguishable from a bug.
     pub budget_exhausted: bool,
+    /// Why the pass did less than it could have, in a sentence for a human.
+    /// `None` when it did everything it was asked to.
+    ///
+    /// A pass that quietly stops scoring reads exactly like a pass that has
+    /// nothing to score, and the difference is the whole reason the budget is
+    /// allowed to stop anything at all.
+    pub note: Option<String>,
 }
 
 /// One triage pass, in the order the brief specifies: expire, tier 0, **one**
@@ -296,12 +305,20 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
         return Ok(summary);
     };
 
-    if self::session_budget_spent(&deps.runs, deps.daily_session_budget, now)? {
+    if !deps.budget.try_consume(now)? {
+        // Degraded, not stopped. Tier 0 has already run above: the mute list
+        // and the keyword rescue cost nothing and keep working. What stops is
+        // the Haiku scoring pass, so events stay unranked rather than unseen.
+        let note = format!(
+            "{}, so triage is running tier 0 only",
+            deps.budget.spent_note()
+        );
         tracing::warn!(
-            budget = deps.daily_session_budget,
+            budget = deps.budget.limit(),
             "daily session budget spent; tier 1 skipped this pass"
         );
         summary.budget_exhausted = true;
+        summary.note = Some(note);
         return Ok(summary);
     }
 
@@ -409,27 +426,6 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
     Ok(summary)
 }
 
-/// Has the day's session budget been spent?
-///
-/// Counted from midnight UTC over every `runs` row that is not the executor's
-/// own — see [`RunStore::count_since`](ea_core::store::runs::RunStore::count_since).
-pub fn session_budget_spent(
-    runs: &RunStore,
-    budget: u32,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    if budget == 0 {
-        return Ok(true);
-    }
-    let midnight = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a time")
-        .and_utc();
-    let spent = runs.count_since(midnight, Some(crate::executor::RUN_KIND))?;
-    Ok(spent >= i64::from(budget))
-}
-
 /// The one-line summary a human reads, on the phone or in the digest.
 fn describe(events: &[Event], score: &crate::triage::Salience) -> String {
     let event = events.iter().find(|event| event.id == score.event_id);
@@ -507,6 +503,8 @@ mod tests {
     use ea_core::store::kv::KvStore;
     use rusqlite::Connection;
     use tempfile::TempDir;
+
+    use ea_core::store::runs::RunStore;
 
     use super::*;
     use crate::notify::policy::NotifyConfig;
@@ -812,6 +810,7 @@ mod tests {
         _dir: TempDir,
         conn: Arc<Mutex<Connection>>,
         deps: TriageDeps,
+        runs: RunStore,
         events: EventStore,
         actions: ActionStore,
         log: NotificationLog,
@@ -841,19 +840,19 @@ mod tests {
         let deps = TriageDeps {
             events: events.clone(),
             actions: actions.clone(),
-            runs: runs.clone(),
             sessions: tier1.clone().map(|t| t as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
             log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
             notify: NotificationPolicy::new(NotifyConfig::default()),
             rules,
-            daily_session_budget: budget,
+            budget: Budget::new(runs.clone(), budget, chrono_tz::Europe::Stockholm),
         };
 
         TriageFixture {
             _dir: dir,
             conn,
             deps,
+            runs,
             events,
             actions,
             log,
@@ -1025,13 +1024,12 @@ mod tests {
         TriageDeps {
             events: f.deps.events.clone(),
             actions: f.deps.actions.clone(),
-            runs: f.deps.runs.clone(),
-            sessions: Some(FakeTier1::new(scores, f.deps.runs.clone()) as Arc<dyn SessionBoundary>),
+            sessions: Some(FakeTier1::new(scores, f.runs.clone()) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&f.pusher) as Arc<dyn Pusher>),
             log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
             notify: NotificationPolicy::new(NotifyConfig::default()),
             rules: Tier0Rules::default(),
-            daily_session_budget: 60,
+            budget: Budget::new(f.runs.clone(), 60, chrono_tz::Europe::Stockholm),
         }
     }
 
@@ -1089,12 +1087,123 @@ mod tests {
         assert_eq!(f.tier1.as_ref().unwrap().sessions(), 0);
     }
 
-    #[test]
-    fn a_zero_budget_stops_everything() {
+    /// A tier 1 that scores every event it is actually shown, by reading the
+    /// ids back out of the prompt.
+    ///
+    /// The canned [`FakeTier1`] answers with a fixed list, which is fine when
+    /// the batch is one event and wrong when the point of the test is that
+    /// each pass eats a different forty of them.
+    struct ScoringTier1 {
+        seen: Arc<Mutex<Vec<SessionRequest>>>,
+        runs: RunStore,
+    }
+
+    impl ScoringTier1 {
+        fn new(runs: RunStore) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                runs,
+            })
+        }
+
+        fn sessions(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    impl SessionBoundary for ScoringTier1 {
+        fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
+            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let scores: Vec<Salience> = req
+                .prompt
+                .lines()
+                .filter_map(|line| line.strip_prefix("event_id: "))
+                .filter_map(|id| id.trim().parse::<i64>().ok())
+                .map(|event_id| score(event_id, 50))
+                .collect();
+            self.seen.lock().unwrap().push(req);
+            let structured = serde_json::json!({ "scores": scores });
+            let runs = self.runs.clone();
+            Box::pin(async move {
+                runs.finish(run_id, "ok", None, &[], Some(0.002))?;
+                Ok(SessionOutcome {
+                    text: String::new(),
+                    structured: Some(structured),
+                    session_id: None,
+                    cost_usd: Some(0.002),
+                })
+            })
+        }
+    }
+
+    /// **The test this whole task exists for.**
+    ///
+    /// A budget that is checked, logged and then ignored is worse than no
+    /// budget at all, because `ea status` then reports protection that does
+    /// not exist. With a ceiling of two, three passes over three batches'
+    /// worth of events must run exactly two sessions — and the third must say
+    /// why it ran none, because a pass that quietly stops scoring reads
+    /// exactly like a pass with nothing to score.
+    #[tokio::test]
+    async fn triage_stops_running_tier_1_once_the_budget_is_spent() {
         let dir = TempDir::new().unwrap();
-        let runs = RunStore::new(db(&dir));
-        assert!(session_budget_spent(&runs, 0, daytime()).unwrap());
-        assert!(!session_budget_spent(&runs, 1, daytime()).unwrap());
+        let conn = db(&dir);
+        let events = EventStore::new(Arc::clone(&conn));
+        let runs = RunStore::new(Arc::clone(&conn));
+        let sessions = ScoringTier1::new(runs.clone());
+        let pusher = Arc::new(SpyPusher {
+            sent: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let deps = TriageDeps {
+            events: events.clone(),
+            actions: ActionStore::new(Arc::clone(&conn)),
+            sessions: Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
+            pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
+            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            notify: NotificationPolicy::new(NotifyConfig::default()),
+            rules: Tier0Rules::default(),
+            budget: Budget::new(runs, 2, chrono_tz::Europe::Stockholm),
+        };
+
+        // Three batches' worth: `tier1_batch` takes forty per pass.
+        for i in 0..120 {
+            record(&events, &format!("e{i}"), "canvas", "assignment", "Essay");
+        }
+
+        let first = run_triage(&deps, daytime()).await.unwrap();
+        let second = run_triage(&deps, daytime()).await.unwrap();
+        let third = run_triage(&deps, daytime()).await.unwrap();
+
+        assert_eq!(first.scored, 40);
+        assert_eq!(second.scored, 40);
+        assert_eq!(
+            sessions.sessions(),
+            2,
+            "the third pass must not start a session"
+        );
+        assert_eq!(third.scored, 0);
+        assert!(third.budget_exhausted);
+        let note = third.note.expect("the third pass must say why");
+        assert!(note.contains("budget"), "{note}");
+        assert!(note.contains("tier 0"), "{note}");
+
+        // And forty events are still waiting, rather than having been
+        // silently marked as looked at.
+        assert_eq!(events.untriaged(TRIAGE_SCAN_LIMIT).unwrap().len(), 40);
+    }
+
+    /// A ceiling of zero turns every unattended session off, and triage says
+    /// why rather than merely going quiet.
+    #[tokio::test]
+    async fn a_zero_budget_stops_tier_1_and_says_so() {
+        let f = build_triage(vec![score(1, 90)], Tier0Rules::default(), 0, true, false);
+        record(&f.events, "a1", "canvas", "assignment", "Essay");
+
+        let summary = run_triage(&f.deps, daytime()).await.unwrap();
+        assert!(summary.budget_exhausted);
+        assert_eq!(f.tier1.as_ref().unwrap().sessions(), 0);
+        assert!(summary.note.unwrap().contains("budget"));
     }
 
     // -- the triage wedge ---------------------------------------------------
@@ -1170,7 +1279,7 @@ mod tests {
     /// Build a triage fixture whose tier 1 is a [`PartialTier1`].
     fn build_partial_triage(scores_ids: Option<Vec<i64>>) -> (TriageFixture, Arc<PartialTier1>) {
         let mut f = build_triage(Vec::new(), Tier0Rules::default(), 1000, true, false);
-        let model = PartialTier1::new(scores_ids, f.deps.runs.clone());
+        let model = PartialTier1::new(scores_ids, f.runs.clone());
         f.deps.sessions = Some(Arc::clone(&model) as Arc<dyn SessionBoundary>);
         (f, model)
     }

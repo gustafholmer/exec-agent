@@ -22,13 +22,18 @@
 //!
 //! # Two identity mistakes this module is shaped to prevent
 //!
-//! 1. [`TelegramUserId`] is constructed in exactly one place in this crate's
-//!    production code — [`dispatch`], from `callback_query.from.id`. The
+//! 1. [`TelegramUserId`] is constructed in exactly two places in this crate's
+//!    production code, both in `dispatch`: from `callback_query.from.id` for a
+//!    button press, and from `message.from.id` for a free-text message. The
 //!    struct field is `pub`, so this is a convention rather than a wall, but
 //!    the convention is one grep away from being checkable.
 //! 2. `message.chat.id` is **not** an identity. It is checked separately,
-//!    against the configured chat, so that a tap delivered in some other chat
-//!    the bot was added to is refused even if it carries the owner's user id.
+//!    against the configured chat, so that a tap or a message delivered in
+//!    some other chat the bot was added to is refused even if it carries the
+//!    owner's user id. The two fields sit side by side in the same JSON object
+//!    and have the same type; using the chat as the person would authenticate
+//!    everyone in the chat, and in a DM it would authenticate whoever is
+//!    talking to the bot.
 //!
 //! Both refusals reply with
 //! [`UNRECOGNISED_REPLY`](crate::notify::telegram::UNRECOGNISED_REPLY) — the
@@ -99,6 +104,10 @@ pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub callback_query: Option<CallbackQuery>,
+    /// A free-text message. Requested since the chat surface exists; before
+    /// that `allowed_updates` asked for callback queries alone.
+    #[serde(default)]
+    pub message: Option<Message>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,11 +128,28 @@ pub struct CallbackQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct User {
     pub id: i64,
+    /// Telegram stamps this. A bot's own messages are not delivered back to
+    /// it by `getUpdates`, but another bot in the same group is, and a loop
+    /// between two bots answering each other is a cost bug with no ceiling.
+    #[serde(default)]
+    pub is_bot: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
-    pub chat: Chat,
+    /// Where it was sent. Optional only so that a message shaped in some way
+    /// this build has never seen cannot fail the *whole* poll batch: a missing
+    /// chat is treated as "not the configured chat" and ignored, never as
+    /// "check skipped".
+    #[serde(default)]
+    pub chat: Option<Chat>,
+    /// Who sent it. **The only identity in a message update.** Optional
+    /// because Telegram omits it for channel posts, which have no author.
+    #[serde(default)]
+    pub from: Option<User>,
+    /// Absent on a sticker, a photo, a location, or a service message.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +183,14 @@ pub trait UpdateSource {
         callback_id: &str,
         text: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Send a reply into `chat_id`. Used for free-text messages, which have no
+    /// callback query to answer.
+    fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// What a button press is handed to. Implemented by
@@ -164,6 +198,37 @@ pub trait UpdateSource {
 /// tests do not need an executor and a database behind them.
 pub trait CallbackHandler {
     fn handle(&self, from: TelegramUserId, data: &str) -> impl Future<Output = String> + Send;
+}
+
+/// What a free-text message is handed to. Implemented by
+/// [`Notifier`](crate::notify::telegram::Notifier), which checks the owner
+/// before it does anything at all.
+pub trait MessageHandler {
+    fn handle_message(
+        &self,
+        from: TelegramUserId,
+        text: &str,
+    ) -> impl Future<Output = String> + Send;
+}
+
+impl<H: MessageHandler + Send + Sync + ?Sized> MessageHandler for std::sync::Arc<H> {
+    fn handle_message(
+        &self,
+        from: TelegramUserId,
+        text: &str,
+    ) -> impl Future<Output = String> + Send {
+        H::handle_message(self, from, text)
+    }
+}
+
+impl<T: Transport + Send + Sync, C: ToolCaller + Send + Sync> MessageHandler for Notifier<T, C> {
+    fn handle_message(
+        &self,
+        from: TelegramUserId,
+        text: &str,
+    ) -> impl Future<Output = String> + Send {
+        Notifier::handle_message(self, from, text)
+    }
 }
 
 /// The notifier is shared — the triage job pushes through it, the daemon
@@ -214,7 +279,7 @@ impl OffsetStore {
 // --------------------------------------------------------------------------
 
 /// Long-polls Telegram and feeds callback queries to a handler.
-pub struct UpdateLoop<S: UpdateSource, H: CallbackHandler> {
+pub struct UpdateLoop<S: UpdateSource, H: CallbackHandler + MessageHandler> {
     source: S,
     handler: H,
     /// The chat the bot was configured to talk in. A callback from anywhere
@@ -232,13 +297,13 @@ pub struct UpdateLoop<S: UpdateSource, H: CallbackHandler> {
 pub struct PollSummary {
     /// Updates received, whatever their kind.
     pub received: usize,
-    /// Callback queries actually passed to the handler.
+    /// Callback queries and messages actually passed to a handler.
     pub handled: usize,
-    /// Callback queries refused before the handler: wrong chat, or no data.
+    /// Updates refused before the handler: wrong chat, or no callback data.
     pub refused: usize,
 }
 
-impl<S: UpdateSource, H: CallbackHandler> UpdateLoop<S, H> {
+impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
     pub fn new(source: S, handler: H, chat_id: i64, offsets: OffsetStore) -> Self {
         Self {
             source,
@@ -309,17 +374,21 @@ impl<S: UpdateSource, H: CallbackHandler> UpdateLoop<S, H> {
     /// Handle one update. The **only** place a [`TelegramUserId`] is built.
     async fn dispatch(&self, update: Update) -> Dispatched {
         let Some(query) = update.callback_query else {
-            // A message, an edited message, a channel post: not this daemon's
-            // business, but its offset still advances.
-            return Dispatched::Ignored;
+            return match update.message {
+                Some(message) => self.dispatch_message(message).await,
+                // An edited message, a channel post, an update kind this build
+                // has never heard of: not this daemon's business, but its
+                // offset still advances.
+                None => Dispatched::Ignored,
+            };
         };
 
         // `message.chat.id` is a place, not a person. It is checked as a
         // place, and it is never used as the identity.
-        if let Some(message) = &query.message {
-            if message.chat.id != self.chat_id {
+        if let Some(chat) = query.message.as_ref().and_then(|m| m.chat.as_ref()) {
+            if chat.id != self.chat_id {
                 tracing::warn!(
-                    chat = message.chat.id,
+                    chat = chat.id,
                     "refusing a telegram callback from an unconfigured chat"
                 );
                 self.answer(&query.id, UNRECOGNISED_REPLY).await;
@@ -339,6 +408,62 @@ impl<S: UpdateSource, H: CallbackHandler> UpdateLoop<S, H> {
         let reply = self.handler.handle(from, data).await;
         self.answer(&query.id, &reply).await;
         Dispatched::Handled
+    }
+
+    /// Handle one free-text message.
+    ///
+    /// Three checks, in this order and for three different reasons:
+    ///
+    /// 1. **The chat**, because `chat.id` is a place: a message in some other
+    ///    chat the bot was added to is not this daemon's business, and
+    ///    answering it would leak the assistant into that room.
+    /// 2. **The sender is not a bot**, because two bots in one group will
+    ///    otherwise answer each other forever at a model's price per turn.
+    ///    The bot's own outgoing messages are not delivered back to it by
+    ///    `getUpdates`, so this is about the other ones.
+    /// 3. **The sender**, `message.from.id` and never `chat.id` — done by the
+    ///    handler, which owns the configured owner id and answers a stranger
+    ///    with the same sentence a malformed callback gets.
+    async fn dispatch_message(&self, message: Message) -> Dispatched {
+        let Some(chat) = message.chat.as_ref().map(|chat| chat.id) else {
+            tracing::debug!("ignoring a telegram message with no chat");
+            return Dispatched::Ignored;
+        };
+        if chat != self.chat_id {
+            tracing::warn!(
+                chat,
+                "ignoring a telegram message from an unconfigured chat"
+            );
+            // No reply at all: this is a room the owner did not configure, and
+            // anything sent there is noise to people who did not ask for it.
+            return Dispatched::Refused;
+        }
+
+        let Some(from) = message.from.as_ref() else {
+            // A channel post has no author, so there is nobody to authorise.
+            return Dispatched::Ignored;
+        };
+        if from.is_bot {
+            tracing::debug!(from = from.id, "ignoring a telegram message from a bot");
+            return Dispatched::Ignored;
+        }
+
+        // `from.id`, and nothing else. `message.chat.id` is the field directly
+        // above it in the same object and would compile.
+        let sender = TelegramUserId(from.id);
+        let text = message.text.as_deref().unwrap_or_default();
+        let reply = self.handler.handle_message(sender, text).await;
+        self.reply(chat, &reply).await;
+        Dispatched::Handled
+    }
+
+    /// Send a reply to a message, logging rather than propagating a failure:
+    /// the turn is already recorded, and a failed send must not make the loop
+    /// replay the message and run a second session.
+    async fn reply(&self, chat_id: i64, text: &str) {
+        if let Err(err) = self.source.send_message(chat_id, text).await {
+            tracing::warn!(error = %format!("{err:#}"), "replying to a telegram message failed");
+        }
     }
 
     /// Answer the callback query, logging rather than propagating a failure:
@@ -440,6 +565,8 @@ mod tests_support {
         /// `(offset, timeout)` per call, in order.
         polls: Mutex<Vec<(Option<i64>, u64)>>,
         answers: Mutex<Vec<(String, String)>>,
+        /// `(chat_id, text)` per reply the loop sent to a message.
+        sent: Mutex<Vec<(i64, String)>>,
     }
 
     impl ScriptedSource {
@@ -456,6 +583,10 @@ mod tests_support {
 
         pub(super) fn answers(&self) -> Vec<(String, String)> {
             self.answers.lock().unwrap().clone()
+        }
+
+        pub(super) fn sent(&self) -> Vec<(i64, String)> {
+            self.sent.lock().unwrap().clone()
         }
     }
 
@@ -478,6 +609,11 @@ mod tests_support {
                 .lock()
                 .unwrap()
                 .push((callback_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push((chat_id, text.to_string()));
             Ok(())
         }
     }
@@ -533,15 +669,21 @@ mod tests {
     const OWNER_CHAT: i64 = 4242;
     const OWNER_USER: i64 = 555;
 
-    /// Records exactly who the loop said pressed the button.
+    /// Records exactly who the loop said pressed the button, and who it said
+    /// sent a message.
     #[derive(Default)]
     struct SpyHandler {
         seen: Mutex<Vec<(TelegramUserId, String)>>,
+        messages: Mutex<Vec<(TelegramUserId, String)>>,
     }
 
     impl SpyHandler {
         fn seen(&self) -> Vec<(TelegramUserId, String)> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn messages(&self) -> Vec<(TelegramUserId, String)> {
+            self.messages.lock().unwrap().clone()
         }
     }
 
@@ -549,6 +691,13 @@ mod tests {
         async fn handle(&self, from: TelegramUserId, data: &str) -> String {
             self.seen.lock().unwrap().push((from, data.to_string()));
             format!("handled {data}")
+        }
+    }
+
+    impl MessageHandler for Arc<SpyHandler> {
+        async fn handle_message(&self, from: TelegramUserId, text: &str) -> String {
+            self.messages.lock().unwrap().push((from, text.to_string()));
+            format!("answered {text}")
         }
     }
 
@@ -561,13 +710,27 @@ mod tests {
         }
     }
 
+    impl MessageHandler for LongWinded {
+        async fn handle_message(&self, _from: TelegramUserId, _text: &str) -> String {
+            "x".repeat(500)
+        }
+    }
+
     fn callback(update_id: i64, from: i64, chat: Option<i64>, data: Option<&str>) -> Update {
         Update {
             update_id,
+            message: None,
             callback_query: Some(CallbackQuery {
                 id: format!("cb-{update_id}"),
-                from: User { id: from },
-                message: chat.map(|id| Message { chat: Chat { id } }),
+                from: User {
+                    id: from,
+                    is_bot: false,
+                },
+                message: chat.map(|id| Message {
+                    chat: Some(Chat { id }),
+                    from: None,
+                    text: None,
+                }),
                 data: data.map(str::to_string),
             }),
         }
@@ -575,6 +738,27 @@ mod tests {
 
     fn tap(update_id: i64, data: &str) -> Update {
         callback(update_id, OWNER_USER, Some(OWNER_CHAT), Some(data))
+    }
+
+    /// A message update, built the way Telegram delivers one: the sender in
+    /// `message.from`, the place in `message.chat`.
+    fn message(update_id: i64, from: i64, chat: i64, text: Option<&str>) -> Update {
+        Update {
+            update_id,
+            callback_query: None,
+            message: Some(Message {
+                chat: Some(Chat { id: chat }),
+                from: Some(User {
+                    id: from,
+                    is_bot: false,
+                }),
+                text: text.map(str::to_string),
+            }),
+        }
+    }
+
+    fn says(update_id: i64, text: &str) -> Update {
+        message(update_id, OWNER_USER, OWNER_CHAT, Some(text))
     }
 
     struct Fixture {
@@ -706,6 +890,106 @@ mod tests {
         assert_eq!(f.build().poll_once().await.unwrap().handled, 1);
     }
 
+    // -- free-text messages -------------------------------------------------
+
+    /// The identity in a message update is `message.from.id`. `message.chat.id`
+    /// is in the same object, is also an `i64`, and would compile — and in the
+    /// owner's own DM it is *nearly* the right number, which is what makes the
+    /// mistake survivable long enough to ship.
+    #[tokio::test]
+    async fn a_message_reaches_the_handler_with_from_id_and_the_reply_goes_to_the_chat() {
+        let f = Fixture::new(vec![Ok(vec![says(12, "when is the tenta?")])]);
+        let summary = f.build().poll_once().await.unwrap();
+
+        assert_eq!(
+            (summary.received, summary.handled, summary.refused),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            f.handler.messages(),
+            vec![(TelegramUserId(OWNER_USER), "when is the tenta?".to_string())],
+            "the sender is message.from.id"
+        );
+        assert_ne!(
+            OWNER_USER, OWNER_CHAT,
+            "the fixture's chat and user ids must differ, or this proves nothing"
+        );
+        assert_eq!(
+            f.source.sent(),
+            vec![(OWNER_CHAT, "answered when is the tenta?".to_string())],
+            "the answer goes back to the chat it came from"
+        );
+        assert!(f.handler.seen().is_empty(), "no callback was involved");
+        assert_eq!(f.offsets().get().unwrap(), Some(13));
+    }
+
+    /// A message in some other chat the bot was added to is not this daemon's
+    /// business — and it gets no reply at all, so the assistant does not
+    /// announce itself in a room nobody configured.
+    #[tokio::test]
+    async fn a_message_from_an_unconfigured_chat_is_refused_silently() {
+        let f = Fixture::new(vec![Ok(vec![message(
+            13,
+            OWNER_USER,
+            OWNER_CHAT + 1,
+            Some("hello"),
+        )])]);
+        let summary = f.build().poll_once().await.unwrap();
+
+        assert_eq!((summary.handled, summary.refused), (0, 1));
+        assert!(f.handler.messages().is_empty());
+        assert!(f.source.sent().is_empty());
+        assert_eq!(
+            f.offsets().get().unwrap(),
+            Some(14),
+            "the offset still advances"
+        );
+    }
+
+    /// Two bots in one group answering each other is a cost bug with no
+    /// ceiling.
+    #[tokio::test]
+    async fn a_message_from_a_bot_is_ignored() {
+        let mut update = says(14, "beep");
+        if let Some(message) = update.message.as_mut() {
+            if let Some(from) = message.from.as_mut() {
+                from.is_bot = true;
+            }
+        }
+        let f = Fixture::new(vec![Ok(vec![update])]);
+        let summary = f.build().poll_once().await.unwrap();
+
+        assert_eq!((summary.handled, summary.refused), (0, 0));
+        assert!(f.handler.messages().is_empty());
+        assert!(f.source.sent().is_empty());
+    }
+
+    /// A message with no text — a sticker, a photo — still belongs to the
+    /// owner, so the handler decides what to say about it rather than the loop
+    /// dropping it.
+    #[tokio::test]
+    async fn a_message_with_no_text_still_reaches_the_handler() {
+        let f = Fixture::new(vec![Ok(vec![message(15, OWNER_USER, OWNER_CHAT, None)])]);
+        f.build().poll_once().await.unwrap();
+        assert_eq!(
+            f.handler.messages(),
+            vec![(TelegramUserId(OWNER_USER), String::new())]
+        );
+    }
+
+    /// A channel post has no author, so there is nobody to authorise.
+    #[tokio::test]
+    async fn a_message_with_no_sender_is_ignored() {
+        let mut update = says(16, "posted");
+        if let Some(message) = update.message.as_mut() {
+            message.from = None;
+        }
+        let f = Fixture::new(vec![Ok(vec![update])]);
+        let summary = f.build().poll_once().await.unwrap();
+        assert_eq!((summary.handled, summary.refused), (0, 0));
+        assert!(f.handler.messages().is_empty());
+    }
+
     /// An update kind this build has never heard of must advance the offset
     /// rather than wedging the loop on it forever.
     #[tokio::test]
@@ -713,6 +997,7 @@ mod tests {
         let f = Fixture::new(vec![Ok(vec![Update {
             update_id: 11,
             callback_query: None,
+            message: None,
         }])]);
         let summary = f.build().poll_once().await.unwrap();
         assert_eq!(
@@ -888,6 +1173,27 @@ mod end_to_end {
         calls: Arc<Mutex<Vec<(String, String)>>>,
         notifier: Arc<Notifier<RecordingTransport, SpyCaller>>,
         conn: Arc<Mutex<Connection>>,
+        conversations: ea_core::store::conversations::ConversationStore,
+    }
+
+    /// A session runner that answers without spawning anything. No test in the
+    /// default suite may start a real `claude`.
+    struct CannedSessions;
+
+    impl crate::triage::SessionBoundary for CannedSessions {
+        fn run_session(
+            &self,
+            _req: crate::session::SessionRequest,
+        ) -> crate::triage::BoxedSession<'_> {
+            Box::pin(async {
+                Ok(crate::session::SessionOutcome {
+                    text: "the tenta is on the 14th".to_string(),
+                    structured: None,
+                    session_id: Some("sess-1".to_string()),
+                    cost_usd: Some(0.001),
+                })
+            })
+        }
     }
 
     fn harness() -> Harness {
@@ -903,18 +1209,36 @@ mod end_to_end {
             Policy::parse("[fortnox]\nrecord_voucher = \"approve\"\n").unwrap(),
             caller,
         ));
-        let notifier = Arc::new(Notifier::new(
-            RecordingTransport::default(),
-            ActionStore::new(Arc::clone(&conn)),
-            executor,
-            OWNER,
+        let conversations =
+            ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn));
+        let chat = Arc::new(crate::chat::ChatService::new(
+            conversations.clone(),
+            ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
+            Some(Arc::new(CannedSessions) as Arc<dyn crate::triage::SessionBoundary>),
+            crate::budget::Budget::new(
+                RunStore::new(Arc::clone(&conn)),
+                60,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            ),
+            crate::config::DEFAULT_CHAT_MODEL,
+            crate::notify::policy::DEFAULT_TIME_ZONE,
         ));
+        let notifier = Arc::new(
+            Notifier::new(
+                RecordingTransport::default(),
+                ActionStore::new(Arc::clone(&conn)),
+                executor,
+                OWNER,
+            )
+            .with_chat(chat as Arc<dyn crate::chat::ChatResponder>),
+        );
         Harness {
             _dir: dir,
             actions: ActionStore::new(Arc::clone(&conn)),
             calls,
             notifier,
             conn,
+            conversations,
         }
     }
 
@@ -958,15 +1282,89 @@ mod end_to_end {
     fn press(update_id: i64, from: TelegramUserId, data: &str) -> Update {
         Update {
             update_id,
+            message: None,
             callback_query: Some(CallbackQuery {
                 id: format!("cb-{update_id}"),
-                from: User { id: from.0 },
+                from: User {
+                    id: from.0,
+                    is_bot: false,
+                },
                 message: Some(Message {
-                    chat: Chat { id: CHAT },
+                    chat: Some(Chat { id: CHAT }),
+                    from: None,
+                    text: None,
                 }),
                 data: Some(data.to_string()),
             }),
         }
+    }
+
+    /// A free-text message as Telegram delivers it: the sender in
+    /// `message.from`, never in `message.chat`.
+    fn writes(update_id: i64, from: TelegramUserId, text: &str) -> Update {
+        Update {
+            update_id,
+            callback_query: None,
+            message: Some(Message {
+                chat: Some(Chat { id: CHAT }),
+                from: Some(User {
+                    id: from.0,
+                    is_bot: false,
+                }),
+                text: Some(text.to_string()),
+            }),
+        }
+    }
+
+    /// End to end over the real notifier and a real conversation store: a
+    /// message on the phone becomes two rows in the thread and an answer sent
+    /// back to the chat it came from.
+    #[tokio::test]
+    async fn the_owners_message_becomes_a_turn_in_the_shared_conversation() {
+        let h = harness();
+        let (source, lp) = h.drive(vec![writes(1, OWNER, "when is the tenta?")]);
+
+        lp.poll_once().await.unwrap();
+
+        assert_eq!(
+            source.sent(),
+            vec![(CHAT, "the tenta is on the 14th".to_string())]
+        );
+        let id = h.conversations.current().unwrap();
+        let messages = h.conversations.recent(id, 10).unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].surface, "telegram");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].body, "the tenta is on the 14th");
+        assert!(
+            h.calls.lock().unwrap().is_empty(),
+            "a chat reaches no connector"
+        );
+    }
+
+    /// The whole point of the owner check, end to end: a stranger's message
+    /// must not start a session, must not touch the thread, and must get the
+    /// same sentence a stranger's button press gets.
+    #[tokio::test]
+    async fn a_strangers_message_starts_no_session_and_leaves_no_trace() {
+        let h = harness();
+        let (source, lp) = h.drive(vec![writes(1, STRANGER, "when is the tenta?")]);
+
+        lp.poll_once().await.unwrap();
+
+        assert_eq!(
+            source.sent(),
+            vec![(
+                CHAT,
+                crate::notify::telegram::UNRECOGNISED_REPLY.to_string()
+            )]
+        );
+        let id = h.conversations.current().unwrap();
+        assert!(
+            h.conversations.recent(id, 10).unwrap().is_empty(),
+            "a stranger must not write to the owner's conversation"
+        );
     }
 
     #[tokio::test]

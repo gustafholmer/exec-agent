@@ -17,15 +17,18 @@
 //! most likely to see, and an empty body reads as noise and gets discarded —
 //! see the `an_html_only_message_falls_back_to_stripped_html` test.
 //!
-//! The stripper is not a real HTML parser. It converts `<br>` and closing
-//! block-level tags (`</p>`, `</div>`, `</tr>`, `</li>`, `</table>`,
-//! `</h1>`–`</h6>`, `</blockquote>`) to newlines, drops every other tag,
-//! decodes the five entities common enough to matter (`&amp;`, `&lt;`,
-//! `&gt;`, `&quot;`, `&#39;`), and collapses runs of blank lines. It does not
-//! handle CDATA, HTML comments, or malformed/unclosed tags specially, and a
-//! literal `&amp;lt;` in the source (an already-escaped entity) will
-//! double-decode. None of that matters for the job this output does: making
-//! text scorable by a triage prompt, not reproducing the original document.
+//! The stripper is [`ea_core::html::strip_html`], shared with the KTH mail
+//! connector. It used to be a private copy here, and the copy in `ea_kth`
+//! — taken from this one — fixed four things this one never got:
+//! `&nbsp;` was missing from its five-entity `replace` chain (so a literal
+//! `&nbsp;` reached the triage prompt, and Gmail carries plenty of
+//! Outlook-authored mail), no numeric entity was decoded, `<style>` and
+//! `<script>` *contents* survived the tags being dropped, and a chain of
+//! `replace` calls double-decoded an already-escaped `&amp;lt;` into markup.
+//! Both connectors feed the same prompt through the same 2000-character cap,
+//! so one copy running with the other's bugs was a live defect rather than a
+//! difference of taste. See that module for the contract, which is
+//! deliberately not that of a real HTML parser.
 //!
 //! # Header handling
 //!
@@ -112,6 +115,7 @@ use anyhow::{bail, Context};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use ea_core::html::strip_html;
 use futures::stream::{StreamExt, TryStreamExt};
 use reqwest::Url;
 use serde::de::DeserializeOwned;
@@ -309,112 +313,6 @@ fn decode_base64url(data: &str) -> String {
         .decode(cleaned)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// A minimal, deliberately non-general HTML stripper
-// ---------------------------------------------------------------------------
-
-const NEWLINE_CLOSERS: [&str; 12] = [
-    "p",
-    "div",
-    "tr",
-    "li",
-    "table",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "blockquote",
-];
-
-/// Strip HTML down to plain-enough text: see the module docs for the exact
-/// (deliberately limited) contract.
-fn strip_html(html: &str) -> String {
-    let mut text = String::with_capacity(html.len());
-    let mut chars = html.chars();
-    let mut tag = String::new();
-
-    while let Some(c) = chars.next() {
-        if c != '<' {
-            text.push(c);
-            continue;
-        }
-        tag.clear();
-        let mut closed = false;
-        for t in chars.by_ref() {
-            if t == '>' {
-                closed = true;
-                break;
-            }
-            tag.push(t);
-        }
-        if !closed {
-            // An unterminated `<` at end of input: drop it silently rather
-            // than emit a stray angle bracket.
-            break;
-        }
-        if tag_is_newline(&tag) {
-            text.push('\n');
-        }
-    }
-
-    collapse_blank_lines(&decode_entities(&text))
-}
-
-fn tag_is_newline(raw_tag: &str) -> bool {
-    let trimmed = raw_tag.trim();
-    let is_closing = trimmed.starts_with('/');
-    let name_part = trimmed.trim_start_matches('/').trim_end_matches('/').trim();
-    let name = name_part
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if name == "br" {
-        return true;
-    }
-    is_closing && NEWLINE_CLOSERS.contains(&name.as_str())
-}
-
-/// The five entities common enough in real mail to bother with. `&amp;` is
-/// decoded last so a source string that already contains a literal `&lt;`
-/// (as `&amp;lt;`) does not get double-decoded into `<` in the common case.
-fn decode_entities(input: &str) -> String {
-    input
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
-}
-
-/// Trims each line and collapses two or more consecutive blank lines into
-/// one, so stripped markup (which tends to leave a blank line per removed
-/// tag) reads as paragraphs, not as a wall of blank lines.
-fn collapse_blank_lines(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut previous_blank = false;
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if previous_blank || out.is_empty() {
-                continue;
-            }
-            previous_blank = true;
-            out.push('\n');
-        } else {
-            previous_blank = false;
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(trimmed);
-        }
-    }
-    out.trim_end().to_string()
 }
 
 // ---------------------------------------------------------------------------

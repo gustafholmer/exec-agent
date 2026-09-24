@@ -3,8 +3,8 @@
 //!
 //! The unit tests in `lib.rs` pin the router and the handler. These pin the
 //! thing a `claude -p` subprocess actually sees: a process on the other end of
-//! a pipe that completes a handshake, advertises one tool, and answers a call
-//! without dying. Nothing short of spawning it proves that.
+//! a pipe that completes a handshake, advertises exactly its two tools, and
+//! answers a call without dying. Nothing short of spawning it proves that.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -28,20 +28,27 @@ async fn spawn(state_dir: &std::path::Path) -> RunningService<RoleClient, ()> {
 
 /// The guard rail, at the only level that finally counts: what a session is
 /// offered on the wire. This crate is the entire write path of the system, so a
-/// second tool turning up here has to be somebody's deliberate decision.
+/// tool turning up here has to be somebody's deliberate decision — the list is
+/// pinned by name, not by length, so a rename or a swap fails too.
+///
+/// These are also exactly the two entries in
+/// `ea_daemon::session::ToolScope::ProposeAndRemember`, the widest scope any
+/// session gets — narrower scopes take tools away, never add them. A tool
+/// advertised here and missing from the scope that should reach it is silently
+/// denied by the CLI, which looks like a model that never uses it rather than
+/// like a bug.
 #[tokio::test]
-async fn the_live_server_advertises_exactly_one_tool() {
+async fn the_live_server_advertises_exactly_the_two_tools() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = spawn(dir.path()).await;
 
     let tools = client.list_all_tools().await.expect("tools/list");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(
-        tools.len(),
-        1,
-        "ea-propose must expose exactly one tool, got {:?}",
-        tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
+        names,
+        vec!["propose_action", "remember"],
+        "ea-propose exposes exactly these two tools"
     );
-    assert_eq!(tools[0].name.as_ref(), "propose_action");
     assert!(
         tools[0]
             .description
@@ -49,6 +56,47 @@ async fn the_live_server_advertises_exactly_one_tool() {
             .is_some_and(|d| d.contains("policy gate")),
         "the tool description must tell the model what happens to its proposal"
     );
+    assert!(
+        tools[1]
+            .description
+            .as_deref()
+            .is_some_and(|d| d.contains("nothing in the outside world")),
+        "the memory tool must tell the model it is not an action"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The memory tool over a real pipe, with no daemon behind it: an error result
+/// the model can read, and a server still standing afterwards.
+#[tokio::test]
+async fn remember_with_no_daemon_is_an_error_result_and_the_server_survives() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = spawn(dir.path()).await;
+
+    let mut params = CallToolRequestParams::new(Cow::Borrowed("remember"));
+    params.arguments = Some(
+        serde_json::json!({ "topic": "tenta", "body": "the databases tenta is on the 14th" })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+
+    let result = client
+        .call_tool(params)
+        .await
+        .expect("a missing daemon must not be a protocol error");
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|t| t.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Nothing was stored"), "{text}");
+
+    let tools = client.list_all_tools().await.expect("still serving");
+    assert_eq!(tools.len(), 2);
 
     client.cancel().await.unwrap();
 }
@@ -97,7 +145,7 @@ async fn a_call_with_no_daemon_is_an_error_result_and_the_server_survives() {
     // Still up: the whole point of never panicking is that the session keeps
     // its tool after a failure.
     let tools = client.list_all_tools().await.expect("still serving");
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
     let again = client.call_tool(params).await.expect("still serving");
     assert_eq!(again.is_error, Some(true));
 
@@ -137,7 +185,7 @@ async fn malformed_arguments_do_not_take_the_server_down() {
     );
 
     let tools = client.list_all_tools().await.expect("still serving");
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
 
     client.cancel().await.unwrap();
 }

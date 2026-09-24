@@ -1,0 +1,45 @@
+# What a session may do with the KTH connector.
+#
+# A tool with no rule here falls through to the gate's `approve` default, so
+# the list is checked against the server's registered tools in both directions
+# by ea-kth's policy-coverage tests
+# (`tools::tests::every_registered_tool_has_a_policy_rule` and
+# `every_policy_rule_names_a_registered_tool_or_a_deliberate_placeholder`).
+#
+# The section name must be this directory's basename: `Policy::load_dirs`
+# rejects a connector that declares a foreign section, because a policy file
+# that could name another connector would be a privilege-escalation path.
+#
+# # This connector cannot write, and the policy is the third of three locks
+#
+# Every rule below is either `auto` or `deny`. There is no `approve` rule here
+# because there is nothing to approve: this connector has no tool that changes
+# anything. The three locks, in the order a request would meet them:
+#
+#   1. No write tool is registered (see `ea_kth::tools`).
+#   2. The OAuth grant holds `offline_access` and a read-only `Mail.Read` and
+#      nothing else, so Microsoft would refuse a write even if one were sent.
+#   3. These two `deny` rules, which the gate matches by name — so the door is
+#      already shut if anybody ever adds the tool.
+[kth]
+
+# Reads. Nothing posted, nothing changed, nothing even marked as read: this
+# connector reads unread mail and leaves it unread.
+list_mail = "auto"
+get_mail = "auto"
+
+# The daemon's timer calls this one, with no session involved.
+watch_poll = "auto"
+
+# No such tools exist, and none should while the grant stays read-only.
+#
+# `create_draft` is denied rather than implemented because implementing it
+# would mean asking KTH for `Mail.ReadWrite` — a write scope for a capability
+# nothing currently uses. Adding the tool later means adding the scope, this
+# connector's README paragraph, and flipping this line to `approve` (never
+# `auto`: a draft appears in the owner's mailbox with their name on it).
+create_draft = "deny"
+
+# `send_mail` is denied forever. Nothing in this project sends mail as the
+# owner. The Google connector holds the same line and for the same reason.
+send_mail = "deny"

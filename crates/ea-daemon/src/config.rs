@@ -69,6 +69,11 @@ pub const DEFAULT_CHAT_MODEL: &str = "claude-sonnet-4-5";
 pub struct DaemonConfig {
     pub notify: NotifyConfig,
     pub tier0: Tier0Rules,
+    /// Sessions a day, across triage, the briefings and chat. Counted from
+    /// the `runs` table over the owner's own day rather than held in memory
+    /// or measured against UTC; see [`crate::budget::Budget`] for what each
+    /// caller does when it runs out, and in particular why chat is told
+    /// rather than refused.
     pub daily_session_budget: u32,
     pub breaker_threshold: u32,
     /// How long a tripped job waits before its first half-open retry.

@@ -34,6 +34,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use ea_core::store::events::kinds;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
@@ -44,7 +45,10 @@ use crate::client::{Assignment, CanvasClient, Course};
 
 /// The `kind` every watch entry carries. Triage mutes and keywords match on
 /// it, so it is a stable name rather than something derived per assignment.
-pub const WATCH_KIND: &str = "assignment";
+///
+/// The name lives in [`ea_core::store::events::kinds`], shared with the daemon
+/// that reads these rows back out.
+pub const WATCH_KIND: &str = kinds::ASSIGNMENT;
 
 /// A tool named in `policy.toml` that this server deliberately does **not**
 /// implement.

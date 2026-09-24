@@ -599,11 +599,21 @@ impl Scheduler {
             false
         } else if count >= threshold {
             state.tripped.store(true, Ordering::SeqCst);
+            // The cooldown is a floor, not the wait itself (`wait_for`, by
+            // design): for any job whose own interval exceeds it -- Notion at
+            // 3600s, Fortnox daily -- the half-open retry lands on the next
+            // scheduled tick, not after `cooldown` seconds. Logging only
+            // `cooldown` here used to promise a retry time the job would not
+            // keep; `retry_in` is the value `ea status`'s `retry_in_secs`
+            // actually reports.
+            let retry_in = Self::wait_for(state, true);
             tracing::warn!(
                 job = %state.job.name,
                 failures = count,
                 cooldown = ?*lock(&state.cooldown),
-                "circuit breaker tripped; it will retry itself after the cooldown"
+                retry_in = ?retry_in,
+                "circuit breaker tripped; it will retry after retry_in (its own interval, or \
+                 the cooldown, whichever is longer)"
             );
             true
         } else {

@@ -12,8 +12,10 @@
 //!   a `propose_action` call on the `ea-propose` MCP server, which lands in the
 //!   approval queue rather than in the world.
 //! * **A session may call exactly the tools on the allowlist.** `--allowedTools`
-//!   is a closed list, today of one entry. See [`ALLOWED_TOOLS`] for why it is
-//!   written out rather than derived.
+//!   is a closed list, chosen by the session's kind rather than shared by all
+//!   of them: triage gets nothing, a briefing gets `propose_action`, chat gets
+//!   `propose_action` and `remember`. See [`ToolScope`] for why the kind
+//!   decides, and why the list is written out rather than derived.
 //! * **A session sees exactly the connectors it was scoped to.** The MCP config
 //!   is built by [`McpConfig::for_session`] from an explicit request list, and
 //!   `--strict-mcp-config` stops the CLI adding any of the user's own. A
@@ -70,38 +72,111 @@ pub const PROPOSE_SERVER: &str = "ea-propose";
 /// act. See the module docs.
 pub const DISALLOWED_TOOLS: &str = "Write,Edit,Bash,NotebookEdit";
 
-/// The one tool [`PROPOSE_SERVER`] exposes.
+/// The tool [`PROPOSE_SERVER`] exposes for changing the world.
 pub const PROPOSE_TOOL: &str = "propose_action";
 
-/// The complete list of MCP tools a session may call, as `--allowedTools`.
+/// The tool [`PROPOSE_SERVER`] exposes for changing what the assistant knows.
+///
+/// Separate from [`PROPOSE_TOOL`] because it is a different kind of thing: it
+/// writes a row to `facts` and reaches no connector, which is why policy does
+/// not gate it. Both are named here so that [`ToolScope`] can be checked
+/// against the server's advertised list rather than against a literal -- and
+/// so that only one scope has to name this one.
+pub const REMEMBER_TOOL: &str = "remember";
+
+/// Which of [`PROPOSE_SERVER`]'s tools one session may call, as
+/// `--allowedTools`.
+///
+/// **Per session kind, not global.** It was one global constant until a review
+/// found what that costs: a briefing or a triage session renders
+/// connector-derived text -- an email body, a calendar title, a Notion page --
+/// into its prompt, and a global list that contains [`REMEMBER_TOOL`] lets
+/// attacker-authored text write a durable fact, which the chat prompt later
+/// reads back. Untrusted input would be landing in a trusted position, one
+/// session removed. So the tool that writes durable memory is reachable only
+/// from the one session kind whose prompt is the owner's own words.
 ///
 /// Measured against the real CLI (2.1.267): under `--permission-prompts none`
 /// an MCP tool that is *absent* from `--allowedTools` is denied, and with no
 /// `--allowedTools` at all **every** MCP tool is denied -- including
 /// `propose_action`, the one tool the whole system routes writes through. So
-/// this flag is not a hardening extra; without it a session cannot propose
-/// anything.
+/// the flag is not a hardening extra: for [`ToolScope::Propose`] and
+/// [`ToolScope::ProposeAndRemember`] it is what makes the session able to act
+/// at all, and for [`ToolScope::Nothing`] its *absence* is the denial, which
+/// is the measured behaviour rather than the guessed behaviour of an empty
+/// value.
 ///
 /// Three properties of the CLI's matching are load-bearing here:
 ///
 /// * the name is `mcp__<server>__<tool>`, double underscores at both joins,
 ///   with the server named exactly as it is keyed in `--mcp-config`;
 /// * a bare `mcp__<server>` is a **whole-server wildcard** -- it allows every
-///   tool that server exposes, now and after the server gains more -- so this
-///   list never contains one;
+///   tool that server exposes, now and after the server gains more -- so no
+///   scope ever emits one ([`ToolScope::allowed_tools`] builds every entry
+///   from a tool name, and a test walks the argv);
 /// * `--disallowedTools` still wins over `--allowedTools`.
 ///
-/// It is written out rather than derived from the policy's `Mode::Auto`.
+/// The list is written out rather than derived from the policy's `Mode::Auto`.
 /// `auto` means "the gate executes this without a human tap", not "read-only":
 /// deriving the allowlist from it would hand a session direct access to every
 /// auto *write* tool, bypassing both the gate and the `actions` ledger. The
 /// only way a session touches the world is by proposing.
 ///
-/// Connector read tools are deliberately absent. They arrive in a later task
-/// through an explicit `session_tools` declaration in `connector.toml`, which
-/// is a decision a connector author makes on purpose -- not a side effect of a
-/// session being scoped to that connector.
-pub const ALLOWED_TOOLS: &str = "mcp__ea-propose__propose_action";
+/// Connector read tools are deliberately absent from every scope. They arrive
+/// in a later task through an explicit `session_tools` declaration in
+/// `connector.toml`, which is a decision a connector author makes on purpose
+/// -- not a side effect of a session being scoped to that connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolScope {
+    /// No MCP tool at all. For a session that is handed untrusted text and
+    /// answers in structured output: tier-1 triage reads a batch of event
+    /// payloads and returns scores, and its own system prompt says it does not
+    /// act. A session that cannot call a tool cannot be talked into calling
+    /// one.
+    Nothing,
+    /// [`PROPOSE_TOOL`] only, and the default for a new session kind.
+    ///
+    /// The default is the narrow one on purpose: a kind added later gets a
+    /// session that can propose (which goes through `Policy::decide` and the
+    /// approval queue) and cannot write durable memory, unless somebody names
+    /// the wider scope and has to justify it in review.
+    #[default]
+    Propose,
+    /// [`PROPOSE_TOOL`] and [`REMEMBER_TOOL`]. **Chat only.**
+    ///
+    /// The prompt of a chat session is the owner talking. A fact written from
+    /// here is something the owner said, which is the only provenance that
+    /// makes it safe to splice -- delimited, and labelled as data -- back into
+    /// a later system prompt.
+    ProposeAndRemember,
+}
+
+impl ToolScope {
+    /// The bare tool names this scope allows, in flag order.
+    pub fn tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Nothing => &[],
+            Self::Propose => &[PROPOSE_TOOL],
+            Self::ProposeAndRemember => &[PROPOSE_TOOL, REMEMBER_TOOL],
+        }
+    }
+
+    /// The `--allowedTools` value, or an empty string when the scope allows
+    /// nothing -- in which case [`build_argv`] omits the flag entirely.
+    pub fn allowed_tools(self) -> String {
+        self.tools()
+            .iter()
+            .map(|tool| format!("mcp__{PROPOSE_SERVER}__{tool}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Whether this scope can write durable memory. One place to ask, so the
+    /// tests that guard the injection channel read as the sentence they are.
+    pub fn can_remember(self) -> bool {
+        self.tools().contains(&REMEMBER_TOOL)
+    }
+}
 
 /// How long a session may run before the daemon takes it apart. Generous: a
 /// triage session that reads a calendar and a mailbox can legitimately take
@@ -133,6 +208,10 @@ pub struct SessionRequest {
     /// Connector names this session is scoped to. Anything not named here is
     /// not reachable from the session, by construction.
     pub connectors: Vec<String>,
+    /// Which `ea-propose` tools this session may call. See [`ToolScope`]: it
+    /// is per session kind because only one kind's prompt is the owner's own
+    /// words, and only that kind may write durable memory.
+    pub tools: ToolScope,
     /// When set, the CLI validates the answer against this schema and returns
     /// it in `structured_output`.
     pub json_schema: Option<Value>,
@@ -157,6 +236,7 @@ impl SessionRequest {
             prompt: prompt.into(),
             system_prompt: system_prompt.into(),
             connectors: Vec::new(),
+            tools: ToolScope::default(),
             json_schema: None,
             resume: None,
             max_turns: None,
@@ -170,6 +250,14 @@ impl SessionRequest {
         S: Into<String>,
     {
         self.connectors = connectors.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Name the tools this session may call. Stated at every call site, even
+    /// where it matches the default, so that the question "can this prompt
+    /// write to memory?" is answered in the file that builds the prompt.
+    pub fn with_tools(mut self, tools: ToolScope) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -303,12 +391,19 @@ pub fn build_argv(req: &SessionRequest, mcp: &McpConfig) -> Vec<String> {
         // propose_action tool on the ea-propose MCP server.
         "--disallowedTools".into(),
         DISALLOWED_TOOLS.into(),
-        // A closed allowlist. Absent this flag the CLI denies every MCP tool
-        // under `--permission-prompts none`, propose_action included, and the
-        // session has no way to act at all. See ALLOWED_TOOLS.
-        "--allowedTools".into(),
-        ALLOWED_TOOLS.into(),
-        "--append-system-prompt".into(),
+    ];
+    // A closed allowlist, chosen by this session's kind. Absent the flag the
+    // CLI denies every MCP tool under `--permission-prompts none`, which is
+    // exactly what `ToolScope::Nothing` means -- so an empty scope omits the
+    // flag rather than passing an empty value whose handling nobody measured.
+    // See ToolScope.
+    let allowed = req.tools.allowed_tools();
+    if !allowed.is_empty() {
+        argv.push("--allowedTools".into());
+        argv.push(allowed);
+    }
+    argv.extend([
+        "--append-system-prompt".to_string(),
         req.system_prompt.clone(),
         "--mcp-config".into(),
         mcp.to_value().to_string(),
@@ -325,7 +420,7 @@ pub fn build_argv(req: &SessionRequest, mcp: &McpConfig) -> Vec<String> {
         // ask is denied instead of hanging until the timeout.
         "--permission-prompts".into(),
         "none".into(),
-    ];
+    ]);
     if let Some(model) = &req.model {
         argv.push("--model".into());
         argv.push(model.clone());
@@ -747,7 +842,9 @@ mod tests {
         }
     }
 
-    /// The `--allowedTools` value, split into entries.
+    /// The `--allowedTools` value, split into entries. Only for scopes that
+    /// allow something: [`ToolScope::Nothing`] omits the flag, and the test
+    /// for that asserts its absence directly.
     fn allowlist(argv: &[String]) -> Vec<&str> {
         flag_value(argv, "--allowedTools")
             .expect("--allowedTools is required: without it the CLI denies every MCP tool")
@@ -758,13 +855,89 @@ mod tests {
     }
 
     #[test]
-    fn the_allowlist_is_exactly_the_propose_tool() {
+    fn the_allowlist_is_the_scope_the_session_asked_for() {
         // Measured against the real CLI (2.1.267): with no --allowedTools,
         // every MCP tool -- propose_action included -- is denied under
         // --permission-prompts none. The flag is what makes a session able to
         // do the one thing it exists for.
+        //
+        // By name, per scope. `ea-propose` advertises exactly these two tools
+        // (see its `the_server_exposes_exactly_the_two_tools`), and a third
+        // arriving on either side must fail a test rather than quietly become
+        // reachable -- or quietly stay denied.
+        let proposing = build_argv(&request().with_tools(ToolScope::Propose), &config(&[]));
+        assert_eq!(
+            allowlist(&proposing),
+            vec!["mcp__ea-propose__propose_action"]
+        );
+
+        let conversing = build_argv(
+            &request().with_tools(ToolScope::ProposeAndRemember),
+            &config(&[]),
+        );
+        assert_eq!(
+            allowlist(&conversing),
+            vec![
+                "mcp__ea-propose__propose_action",
+                "mcp__ea-propose__remember"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_allowed_nothing_carries_no_allowlist_flag_at_all() {
+        // `ToolScope::Nothing` means "no MCP tool", and the measured way to say
+        // that to this CLI is to leave the flag off: with no --allowedTools,
+        // every MCP tool is denied under --permission-prompts none. An empty
+        // --allowedTools value would be a guess about unmeasured behaviour in
+        // the one place a guess must not be made.
+        let argv = build_argv(&request().with_tools(ToolScope::Nothing), &config(&[]));
+        assert!(
+            flag_value(&argv, "--allowedTools").is_none(),
+            "an empty scope must omit the flag, not pass an empty value: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("mcp__")),
+            "a session allowed nothing named a tool anyway: {argv:?}"
+        );
+    }
+
+    /// The injection channel this split exists to close.
+    ///
+    /// A briefing and a triage session render connector-derived text — an
+    /// email body, a calendar title, a Notion page — into their prompts. A
+    /// fact written from one of those would be spliced back into the *chat*
+    /// system prompt later, which is untrusted input reaching a trusted
+    /// position. So `remember` is reachable from exactly one scope, the one
+    /// chat uses, whose prompt is the owner's own words.
+    ///
+    /// Do not widen this. If a new session kind needs memory, the question to
+    /// answer first is whose text is in its prompt.
+    #[test]
+    fn only_the_chat_scope_can_write_durable_memory() {
+        assert!(!ToolScope::Nothing.can_remember());
+        assert!(!ToolScope::Propose.can_remember());
+        assert!(ToolScope::ProposeAndRemember.can_remember());
+
+        for scope in [ToolScope::Nothing, ToolScope::Propose] {
+            let argv = build_argv(&request().with_tools(scope), &config(&[]));
+            assert!(
+                !argv.iter().any(|arg| arg.contains(REMEMBER_TOOL)),
+                "{scope:?} can reach `{REMEMBER_TOOL}`: {argv:?}"
+            );
+        }
+    }
+
+    /// A kind added later gets the narrow scope unless somebody says otherwise
+    /// in the file that builds the prompt.
+    #[test]
+    fn a_session_that_names_no_scope_cannot_remember() {
         let argv = build_argv(&request(), &config(&[]));
-        assert_eq!(allowlist(&argv), vec!["mcp__ea-propose__propose_action"]);
+        assert_eq!(ToolScope::default(), ToolScope::Propose);
+        assert!(
+            !argv.iter().any(|arg| arg.contains(REMEMBER_TOOL)),
+            "the default scope must not include `{REMEMBER_TOOL}`: {argv:?}"
+        );
     }
 
     #[test]
@@ -773,9 +946,14 @@ mod tests {
         // server spelled as it is keyed in --mcp-config. A typo here is a
         // silent denial, not an error.
         assert_eq!(
-            ALLOWED_TOOLS,
+            ToolScope::ProposeAndRemember.allowed_tools(),
+            format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL},mcp__{PROPOSE_SERVER}__{REMEMBER_TOOL}")
+        );
+        assert_eq!(
+            ToolScope::Propose.allowed_tools(),
             format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL}")
         );
+        assert_eq!(ToolScope::Nothing.allowed_tools(), "");
         let argv = build_argv(&request(), &config(&[]));
         let raw = flag_value(&argv, "--mcp-config").unwrap();
         let value: Value = serde_json::from_str(raw).unwrap();
@@ -793,15 +971,30 @@ mod tests {
         // Measured: `--allowedTools mcp__probe` let a tool the probe had never
         // been allowed run. A bare server name is a whole-server wildcard --
         // every tool that server has now, and every tool it gains later.
-        let argv = build_argv(&request(), &config(&["calendar", "mail", "fortnox"]));
-        for entry in allowlist(&argv) {
-            let Some(rest) = entry.strip_prefix("mcp__") else {
+        //
+        // Every scope, not just the widest: narrowing the list per session kind
+        // must not have introduced a scope that names a server and stops.
+        for scope in [
+            ToolScope::Nothing,
+            ToolScope::Propose,
+            ToolScope::ProposeAndRemember,
+        ] {
+            let argv = build_argv(
+                &request().with_tools(scope),
+                &config(&["calendar", "mail", "fortnox"]),
+            );
+            let Some(value) = flag_value(&argv, "--allowedTools") else {
                 continue;
             };
-            assert!(
-                rest.contains("__"),
-                "`{entry}` is a whole-server wildcard, not a single tool"
-            );
+            for entry in value.split(',') {
+                let Some(rest) = entry.trim().strip_prefix("mcp__") else {
+                    continue;
+                };
+                assert!(
+                    rest.contains("__"),
+                    "`{entry}` is a whole-server wildcard, not a single tool ({scope:?})"
+                );
+            }
         }
     }
 
@@ -822,7 +1015,13 @@ mod tests {
             allowlist(&many),
             "connectors must not add anything to the allowlist"
         );
-        assert_eq!(allowlist(&many), vec![ALLOWED_TOOLS]);
+        assert_eq!(
+            allowlist(&many),
+            ToolScope::default()
+                .allowed_tools()
+                .split(',')
+                .collect::<Vec<_>>()
+        );
         for connector in ["calendar", "mail", "fortnox"] {
             assert!(
                 !flag_value(&many, "--allowedTools")
@@ -1362,18 +1561,28 @@ mod tests {
         crate::daemon::Daemon::build(crate::daemon::Deps {
             executor: Arc::new(executor),
             actions: ActionStore::new(Arc::clone(&conn)),
-            conversations: ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
             events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
             runs: RunStore::new(Arc::clone(&conn)),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
-            sessions: None,
+            schedules: ea_core::store::schedules::ScheduleStore::new(Arc::clone(&conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
+            chat: Arc::new(crate::chat::ChatService::new(
+                ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
+                ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
+                None,
+                crate::budget::Budget::new(
+                    RunStore::new(Arc::clone(&conn)),
+                    60,
+                    crate::notify::policy::DEFAULT_TIME_ZONE,
+                ),
+                crate::config::DEFAULT_CHAT_MODEL,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            )),
             pusher: None,
             notify_log: crate::notify::log::NotificationLog::new(ea_core::store::kv::KvStore::new(
                 Arc::clone(&conn),
             )),
             connectors: Vec::new(),
-            daily_session_budget: 60,
-            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         })
         .register(&mut server);
         let daemon = server.spawn().await.expect("binding the daemon socket");
