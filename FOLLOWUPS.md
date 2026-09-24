@@ -18,7 +18,7 @@ Two constraints on any fix:
   first step of the shutdown drain, so every clean shutdown would write
   `paused = true`, and under `KeepAlive` the daemon would never run again.
   Persist in `Daemon::pause`/`resume` instead — that needs a `KvStore` in
-  `Deps`, and the wiring already builds one at `main.rs:290` — then read it
+  `Deps`, and the wiring already builds one at `main.rs:291` — then read it
   before `scheduler.start()` at `main.rs:302`. Roughly 40 lines.
 - **Decide the trade-off deliberately.** Today a reboot accidentally rescues a
   forgotten pause. Persist it and a forgotten pause instead runs the Fortnox
@@ -68,3 +68,16 @@ backlog is retained for a year and retention never prunes it.
 `ea-canvas` calls `Credentials::load()` once before serving, unlike the other
 four connectors, which re-read. Rare operation; one `launchctl kickstart` works
 around it.
+
+## 8. A long chat reply can truncate the over-budget note off the end
+
+`notify/telegram.rs:908` truncates outgoing text at `MAX_MESSAGE_BYTES` (3800).
+The over-budget note is appended *after* the reply, so a reply close to that
+size would push the note off the end — the one case where the note matters
+most is also the one where it can vanish.
+
+Narrow: it needs a near-4 KB reply and an over-budget day at the same time.
+Left alone at merge because the fix changes truncation semantics on the path
+every notification shares, and that deserves its own review. The right shape
+is to reserve the note's length before truncating the reply, not to truncate
+the concatenation.
