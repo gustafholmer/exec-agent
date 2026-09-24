@@ -26,6 +26,11 @@
 //!   configured origin. The header is server-controlled; without the check, a
 //!   compromised or misconfigured Canvas could walk the client onto another
 //!   host with the `Authorization` header still attached.
+//! * The HTTP client follows no redirects at all. `reqwest`'s default policy
+//!   strips the `Authorization` header only when the host or port changes,
+//!   never when the scheme does, so a same-host redirect from `https` to
+//!   `http` would carry the bearer token onto the wire in clear text. This
+//!   API has no reason to redirect, so the policy is simply "don't".
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -285,6 +290,13 @@ impl CanvasClient {
 
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            // Redirects are never followed. reqwest's default policy strips
+            // `Authorization` when the host or port changes but not when the
+            // scheme does (reqwest 0.12.28, src/redirect.rs), so a same-host
+            // `https` -> `http` redirect would otherwise carry the account's
+            // bearer token onto an unencrypted connection. This API has no
+            // legitimate redirect to follow.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the HTTPS client for Canvas")?;
 
@@ -778,6 +790,38 @@ mod tests {
             .expect_err("a cross-origin next link must be refused");
         let text = format!("{err:#}");
         assert!(text.contains("refusing to follow"), "{text}");
+        assert!(!text.contains(TOKEN), "the error leaked the token: {text}");
+    }
+
+    /// reqwest's default redirect policy strips `Authorization` only when the
+    /// host or port changes, never the scheme — so a same-host `https` ->
+    /// `http` redirect would otherwise carry the token onto the wire in
+    /// clear text. The client must follow no redirects at all.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_token_is_not_sent_to_the_target() {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(serde_json::json!([])))
+            .expect(0) // a followed redirect would land here with the token
+            .mount(&elsewhere)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/courses"))
+            .respond_with(ResponseTemplate::new(301).insert_header(
+                "location",
+                format!("{}/api/v1/courses", elsewhere.uri()).as_str(),
+            ))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .list_courses()
+            .await
+            .expect_err("a 301 must not be followed transparently");
+        let text = format!("{err:#}");
+        assert!(text.contains("301"), "{text}");
         assert!(!text.contains(TOKEN), "the error leaked the token: {text}");
     }
 

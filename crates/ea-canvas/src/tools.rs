@@ -17,10 +17,23 @@
 //! teacher never dated. Emitting them as events would put items with nothing to
 //! be late for in front of triage, and triage's whole job is to decide what is
 //! urgent.
+//!
+//! # Why stale deadlines are skipped
+//!
+//! Canvas routinely reports an enrolment as `enrollment_state=active` long
+//! after its term has ended, so `list_courses` cannot be trusted to mean
+//! "courses I am taking now". On a connector's first poll, dedup by
+//! `external_id` does not help — every assignment from every such course is
+//! genuinely new — so without a date floor the very first run can dump years
+//! of finished coursework into triage as if it were fresh. That spends this
+//! system's whole premise (it earns the right to notify by not being noisy)
+//! in one poll. [`STALE_DEADLINE_WINDOW`] bounds how far into the past a
+//! `due_at` may be and still be emitted; there is deliberately no forward
+//! bound (see its doc comment).
 
 use std::sync::Arc;
 
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
@@ -41,6 +54,29 @@ pub const WATCH_KIND: &str = "assignment";
 /// the moment such a tool appears, rather than after somebody remembers to
 /// review the policy. A session must never be able to hand in coursework.
 pub const DELIBERATE_PLACEHOLDERS: &[&str] = &["submit_assignment"];
+
+/// How far into the past a `due_at` may be and still be reported by
+/// [`CanvasServer::poll`].
+///
+/// Canvas's `enrollment_state=active` filter does not reliably mean "current
+/// term" — a finished course's enrolment routinely stays active — so a fresh
+/// poll can otherwise turn up years of past deadlines, each one genuinely new
+/// to dedup. Fourteen days is generous for "a deadline I might still care
+/// about" (a due date missed over a long weekend, during an outage, or before
+/// the daemon was first run) while excluding a stale term's worth of old
+/// coursework. The window is inclusive: an assignment due exactly fourteen
+/// days ago still counts, so the boundary favors emitting over hiding.
+///
+/// There is deliberately no forward bound. A future `due_at` in a course the
+/// token's owner is actively enrolled in is exactly the deadline this
+/// connector exists to surface, however far out it sits (a syllabus posted at
+/// the start of term, say); hiding it would defeat the connector's purpose,
+/// not protect triage from noise. And because this floor is evaluated fresh
+/// against the current time on every poll rather than latched at first sight,
+/// nothing needs a matching forward cutoff to "eventually surface": every
+/// dated assignment is emitted the first time it is polled for, whether that
+/// is today or six months from now.
+pub const STALE_DEADLINE_WINDOW: chrono::Duration = chrono::Duration::days(14);
 
 /// One change, in the shape the daemon's event store records:
 /// `(source, external_id)` is the idempotency key, `source` being the
@@ -105,21 +141,34 @@ impl CanvasServer {
         }
     }
 
-    /// Every dated assignment in every active course, as watch entries.
+    /// [`poll_since`](Self::poll_since) against the wall clock.
+    pub async fn poll(&self) -> Result<Vec<WatchEntry>, String> {
+        self.poll_since(Utc::now()).await
+    }
+
+    /// Every dated assignment in every active course, as watch entries, whose
+    /// due date is not more than [`STALE_DEADLINE_WINDOW`] in the past as of
+    /// `now`.
     ///
     /// Not built on `list_upcoming`: a deadline that has just passed is still a
     /// change worth recording, and triage — not the connector — decides what is
-    /// still interesting.
-    pub async fn poll(&self) -> Result<Vec<WatchEntry>, String> {
+    /// still interesting. The clock is a parameter, not `Utc::now()`, so the
+    /// staleness floor is deterministic to test.
+    pub async fn poll_since(&self, now: DateTime<Utc>) -> Result<Vec<WatchEntry>, String> {
         let client = self.client()?;
         let courses = client.list_courses().await.map_err(render)?;
+        let floor = now - STALE_DEADLINE_WINDOW;
 
         let mut entries = Vec::new();
         for course in &courses {
             let assignments = client.list_assignments(course.id).await.map_err(render)?;
             for assignment in assignments {
                 // The skip that matters: no due date, no deadline, no event.
-                if assignment.due_at.is_none() {
+                let Some(due_at) = assignment.due_at else {
+                    continue;
+                };
+                // The staleness floor: see `STALE_DEADLINE_WINDOW`.
+                if due_at < floor {
                     continue;
                 }
                 entries.push(entry(course, &assignment));
@@ -204,9 +253,10 @@ impl CanvasServer {
     #[tool(
         description = "Poll Canvas for coursework deadlines. Returns a JSON array of \
                        { external_id, kind, payload }, one entry per assignment that has a \
-                       due date; assignments with no due date are not deadlines and are \
-                       omitted. Called by the daemon on a timer; errors are reported rather \
-                       than swallowed, so a broken connector is visible."
+                       due date; assignments with no due date, or whose due date is more than \
+                       14 days in the past, are omitted. Called by the daemon on a timer; \
+                       errors are reported rather than swallowed, so a broken connector is \
+                       visible."
     )]
     pub async fn watch_poll(&self) -> Result<String, String> {
         let entries = self.poll().await?;
@@ -320,6 +370,92 @@ mod tests {
             ids,
             vec!["assignment:500"],
             "an undated assignment is not a deadline and must not become an event"
+        );
+    }
+
+    // --- the stale-deadline floor ------------------------------------------
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().expect("a timestamp")
+    }
+
+    #[tokio::test]
+    async fn an_assignment_due_yesterday_is_emitted() {
+        let now = at("2026-09-24T00:00:00Z");
+        let mock = canvas_with(
+            one_course(),
+            serde_json::json!([
+                { "id": 1, "course_id": 7, "name": "Due yesterday", "due_at": "2026-09-23T00:00:00Z" },
+            ]),
+        )
+        .await;
+
+        let entries = server_for(&mock).poll_since(now).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a deadline missed yesterday still matters: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assignment_due_two_years_ago_is_not_emitted() {
+        let now = at("2026-09-24T00:00:00Z");
+        let mock = canvas_with(
+            one_course(),
+            serde_json::json!([
+                { "id": 1, "course_id": 7, "name": "Ancient", "due_at": "2024-09-24T00:00:00Z" },
+            ]),
+        )
+        .await;
+
+        let entries = server_for(&mock).poll_since(now).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            0,
+            "a finished term's stale-but-active enrolment must not flood the first poll: {entries:?}"
+        );
+    }
+
+    /// The window is documented as inclusive: an assignment due exactly
+    /// `STALE_DEADLINE_WINDOW` in the past still counts, so the boundary
+    /// favors emitting over hiding.
+    #[tokio::test]
+    async fn an_assignment_exactly_at_the_stale_boundary_is_still_emitted() {
+        let now = at("2026-09-24T00:00:00Z");
+        let boundary = now - STALE_DEADLINE_WINDOW;
+        let mock = canvas_with(
+            one_course(),
+            serde_json::json!([
+                { "id": 1, "course_id": 7, "name": "On the line", "due_at": boundary.to_rfc3339() },
+            ]),
+        )
+        .await;
+
+        let entries = server_for(&mock).poll_since(now).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly on the boundary must still be emitted: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_future_assignment_is_emitted() {
+        let now = at("2026-09-24T00:00:00Z");
+        let mock = canvas_with(
+            one_course(),
+            serde_json::json!([
+                { "id": 1, "course_id": 7, "name": "Six months out", "due_at": "2027-03-24T00:00:00Z" },
+            ]),
+        )
+        .await;
+
+        let entries = server_for(&mock).poll_since(now).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "there is no forward bound: a far-future deadline is still a deadline: {entries:?}"
         );
     }
 
