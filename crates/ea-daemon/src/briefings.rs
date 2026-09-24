@@ -537,9 +537,12 @@ const MORNING_SYSTEM_PROMPT: &str = concat!(
     "Answer with the briefing itself and nothing else: no preamble, no ",
     "restating of these instructions. Plain text for a phone screen, at most ",
     "twelve lines. Lead with anything time-critical today. Group the rest. Say ",
-    "plainly when a section is empty rather than padding it. You cannot act: ",
-    "the only tool you have records a proposal for the user to approve, and a ",
-    "briefing rarely needs one."
+    "plainly when a section is empty rather than padding it. You cannot act ",
+    "directly: the only tool you have records a proposal. Most proposals wait ",
+    "for the user to approve them, but some are graded to run as soon as they ",
+    "are made -- the policy decides which, and you cannot tell from here -- so ",
+    "treat every proposal as something that may happen without anyone looking ",
+    "at it first. A briefing rarely needs one."
 );
 
 const BOOKKEEPING_SYSTEM_PROMPT: &str = concat!(
