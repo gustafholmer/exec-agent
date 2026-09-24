@@ -117,7 +117,7 @@ fn write_sample(path: &Path) -> Result<(), XlsxError> {
         // reason the fixture is not just four numbers.
         s.write_datetime_with_format(2, 0, ExcelDateTime::from_ymd(2026, 6, 2)?, &date_fmt)?;
         s.write_string(2, 1, "SPOTIFY AB STOCKHOLM")?;
-        s.write_string(2, 2, &format!("-1{NBSP}234,56"))?;
+        s.write_string(2, 2, format!("-1{NBSP}234,56"))?;
         s.write_number(2, 3, 8765.44)?;
 
         // Row 4 — a decimal comma with no thousands separator.

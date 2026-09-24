@@ -136,9 +136,7 @@ const FORSLAG_WIDTHS: [f64; 13] = [
     14.0, 12.0, 40.0, 12.0, 10.0, 12.0, 10.0, 10.0, 24.0, 10.0, 44.0, 28.0, 10.0,
 ];
 const SEB_WIDTHS: [f64; 4] = [14.0, 40.0, 12.0, 12.0];
-const KVITTON_WIDTHS: [f64; 10] = [
-    14.0, 16.0, 24.0, 28.0, 10.0, 10.0, 18.0, 12.0, 12.0, 10.0,
-];
+const KVITTON_WIDTHS: [f64; 10] = [14.0, 16.0, 24.0, 28.0, 10.0, 10.0, 18.0, 12.0, 12.0, 10.0];
 
 // ---- reading ---------------------------------------------------------------
 
@@ -158,8 +156,7 @@ impl Workbook {
         let path = path.as_ref();
         let reader: Xlsx<_> = calamine::open_workbook(path)
             .with_context(|| format!("opening workbook {}", path.display()))?;
-        Self::from_reader(reader)
-            .with_context(|| format!("reading workbook {}", path.display()))
+        Self::from_reader(reader).with_context(|| format!("reading workbook {}", path.display()))
     }
 
     /// Open an `.xlsx` workbook already in memory — an HTTP upload, or a file
@@ -191,10 +188,7 @@ impl Workbook {
     }
 
     fn sheet(&self, name: &str) -> Option<&Range<Data>> {
-        self.sheets
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, r)| r)
+        self.sheets.iter().find(|(n, _)| n == name).map(|(_, r)| r)
     }
 }
 
@@ -213,7 +207,10 @@ impl Headers {
 
     fn require(&self, sheet: &str, name: &str) -> Result<usize> {
         self.get(name).ok_or_else(|| {
-            anyhow!("sheet {sheet:?} has no {name:?} column in its header row (row {})", self.header_row)
+            anyhow!(
+                "sheet {sheet:?} has no {name:?} column in its header row (row {})",
+                self.header_row
+            )
         })
     }
 }
@@ -454,10 +451,8 @@ pub fn read_forslag(wb: &Workbook) -> Result<Vec<ForslagRow>> {
 /// "Has a value" is a non-empty cell: a blank the user cleared falls back to
 /// the proposal, which is upstream's `e.basKonto !== ''` exactly.
 pub fn merge_forslag(proposed: &[ForslagRow], existing: &[ForslagRow]) -> Vec<ForslagRow> {
-    let prev: HashMap<&str, &ForslagRow> = existing
-        .iter()
-        .map(|r| (r.rad_id.as_str(), r))
-        .collect();
+    let prev: HashMap<&str, &ForslagRow> =
+        existing.iter().map(|r| (r.rad_id.as_str(), r)).collect();
 
     proposed
         .iter()
@@ -861,8 +856,14 @@ mod tests {
         // U+00A0, the character a Swedish bank export actually writes. A naive
         // `trim()` leaves it in the middle of the string and the parse fails.
         let nbsp = "1\u{00A0}234,56";
-        assert!(nbsp.trim().contains('\u{00A0}'), "the test string must still contain the NBSP after trim()");
-        assert_eq!(cell_number(&Data::String(nbsp.to_string())), Some(dec("1234.56")));
+        assert!(
+            nbsp.trim().contains('\u{00A0}'),
+            "the test string must still contain the NBSP after trim()"
+        );
+        assert_eq!(
+            cell_number(&Data::String(nbsp.to_string())),
+            Some(dec("1234.56"))
+        );
 
         // And the ordinary space and the narrow no-break space U+202F, which
         // Excel substitutes on some locales.
@@ -920,7 +921,10 @@ mod tests {
         let err = read_seb(&wb).unwrap_err().to_string();
         // Header is row 1, the good row is 2, the broken one is row 3.
         assert!(err.contains("row 3"), "message should name the row: {err}");
-        assert!(err.contains("Bokföringsdatum"), "message should name the column: {err}");
+        assert!(
+            err.contains("Bokföringsdatum"),
+            "message should name the column: {err}"
+        );
     }
 
     #[test]
@@ -942,7 +946,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("row 2"), "message should name the row: {err}");
-        assert!(err.contains("Belopp"), "message should name the column: {err}");
+        assert!(
+            err.contains("Belopp"),
+            "message should name the column: {err}"
+        );
     }
 
     #[test]
@@ -958,7 +965,10 @@ mod tests {
         let bytes = other.save_to_buffer().unwrap();
         let wb = Workbook::from_bytes(&bytes).unwrap();
         assert!(read_seb(&wb).unwrap_err().to_string().contains("SEB"));
-        assert!(read_kvitton(&wb).unwrap_err().to_string().contains("Kvitton"));
+        assert!(read_kvitton(&wb)
+            .unwrap_err()
+            .to_string()
+            .contains("Kvitton"));
     }
 
     #[test]

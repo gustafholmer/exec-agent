@@ -123,10 +123,7 @@ pub fn extract_markers(description: Option<&str>) -> Vec<String> {
     let mut rest = description;
     while let Some(at) = rest.find(OPEN) {
         let after = &rest[at + OPEN.len()..];
-        let hex_len = after
-            .bytes()
-            .take_while(u8::is_ascii_hexdigit)
-            .count();
+        let hex_len = after.bytes().take_while(u8::is_ascii_hexdigit).count();
         // `+` in the pattern: at least one hex digit, then the closing bracket.
         if hex_len > 0 && after.as_bytes().get(hex_len) == Some(&b']') {
             out.push(after[..hex_len].to_ascii_lowercase());
@@ -563,7 +560,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("BAS_konto"), "{err}");
-        assert!(err.contains("abc123"), "the error should name the row: {err}");
+        assert!(
+            err.contains("abc123"),
+            "the error should name the row: {err}"
+        );
     }
 
     #[test]
@@ -642,7 +642,10 @@ mod tests {
         .unwrap_err();
         let chain = format!("{err:#}");
         assert!(chain.contains("output-VAT account"), "{chain}");
-        assert!(chain.contains("abc123"), "the error should name the row: {chain}");
+        assert!(
+            chain.contains("abc123"),
+            "the error should name the row: {chain}"
+        );
     }
 
     // ---- options and payload -----------------------------------------------

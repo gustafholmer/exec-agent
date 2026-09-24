@@ -119,10 +119,7 @@ pub fn candidates_for(seb: &SebRow, kvitton: &[KvittoRow]) -> Vec<usize> {
 /// Match every bank line against the receipts, consuming each receipt at most
 /// once. One [`MatchResult`] per bank line, in input order.
 pub fn match_all(seb: &[SebRow], kvitton: &[KvittoRow]) -> Vec<MatchResult> {
-    let candidates: Vec<Vec<usize>> = seb
-        .iter()
-        .map(|s| candidates_for(s, kvitton))
-        .collect();
+    let candidates: Vec<Vec<usize>> = seb.iter().map(|s| candidates_for(s, kvitton)).collect();
 
     // Every (bank line, receipt) pair that is possible at all, nearest first.
     // Ties break on the bank line's own order and then the receipt's, so the
@@ -456,16 +453,8 @@ mod tests {
 
         let mut outcomes = 0usize;
         for (n, case) in cases.iter().enumerate() {
-            let sebs: Vec<SebRow> = case
-                .s
-                .iter()
-                .map(|(d, b)| seb(d, &b.to_string()))
-                .collect();
-            let kvs: Vec<KvittoRow> = case
-                .k
-                .iter()
-                .map(|(d, b)| kv(d, &b.to_string()))
-                .collect();
+            let sebs: Vec<SebRow> = case.s.iter().map(|(d, b)| seb(d, &b.to_string())).collect();
+            let kvs: Vec<KvittoRow> = case.k.iter().map(|(d, b)| kv(d, &b.to_string())).collect();
 
             let got = match_all(&sebs, &kvs);
             assert_eq!(got.len(), case.r.len(), "case {n}: wrong number of results");
@@ -478,14 +467,27 @@ mod tests {
                     other => panic!("case {n}: unknown upstream outcome {other:?}"),
                 };
                 assert_eq!(got[i].outcome, want, "case {n} line {i}: outcome");
-                assert_eq!(got[i].kvitto_index, *index, "case {n} line {i}: assigned receipt");
-                assert_eq!(&got[i].candidate_indices, candidates, "case {n} line {i}: candidates");
+                assert_eq!(
+                    got[i].kvitto_index, *index,
+                    "case {n} line {i}: assigned receipt"
+                );
+                assert_eq!(
+                    &got[i].candidate_indices, candidates,
+                    "case {n} line {i}: candidates"
+                );
                 outcomes += 1;
             }
 
-            assert_eq!(unmatched_receipts(&kvs, &got), case.u, "case {n}: unmatched receipts");
+            assert_eq!(
+                unmatched_receipts(&kvs, &got),
+                case.u,
+                "case {n}: unmatched receipts"
+            );
         }
-        assert_eq!(outcomes, 2706, "the differential should cover 2706 outcomes, covered {outcomes}");
+        assert_eq!(
+            outcomes, 2706,
+            "the differential should cover 2706 outcomes, covered {outcomes}"
+        );
     }
 
     #[test]
@@ -504,7 +506,11 @@ mod tests {
         let before = claimed.len();
         claimed.sort_unstable();
         claimed.dedup();
-        assert_eq!(claimed.len(), before, "a receipt was claimed more than once");
+        assert_eq!(
+            claimed.len(),
+            before,
+            "a receipt was claimed more than once"
+        );
         assert_eq!(r.len(), s.len());
     }
 }

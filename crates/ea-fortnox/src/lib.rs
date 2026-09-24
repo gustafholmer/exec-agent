@@ -20,6 +20,13 @@
 //! [`auth`] holds the OAuth flow and the rotating-refresh-token store,
 //! [`client`] the hardened HTTP client, and [`errors`] the one error type
 //! both return.
+//!
+//! [`bank_import`] is the pipeline that turns an `.xlsx` bank export into
+//! reviewed, approved, once-only vouchers. It is the one part of the crate
+//! that reaches outside the Fortnox API, and the one whose translation was not
+//! mechanical: upstream's `exceljs` is a read/write library and Rust has no
+//! equivalent, so reading is `calamine` and writing is `rust_xlsxwriter`. What
+//! that costs is set out in [`bank_import::workbook`].
 
 pub mod auth;
 pub mod bank_import;

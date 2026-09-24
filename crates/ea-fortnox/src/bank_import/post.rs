@@ -96,7 +96,12 @@ impl PostClient for FortnoxClient {
         Ok(FortnoxClient::get(self, path, &[]).await?)
     }
 
-    async fn get_all(&self, path: &str, list_key: &str, query: &[(&str, &str)]) -> Result<Vec<Value>> {
+    async fn get_all(
+        &self,
+        path: &str,
+        list_key: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<Value>> {
         Ok(FortnoxClient::get_all(self, path, list_key, query).await?)
     }
 
@@ -355,10 +360,13 @@ mod tests {
         json!({ "FinancialYears": [{ "Id": 7, "FromDate": "2025-07-01", "ToDate": "2026-06-30" }] })
     }
 
+    /// One recorded `get_all`: path, list key, and the query it was given.
+    type GetAllCall = (String, String, Vec<(String, String)>);
+
     #[derive(Default)]
     struct Calls {
         get: Vec<String>,
-        get_all: Vec<(String, String, Vec<(String, String)>)>,
+        get_all: Vec<GetAllCall>,
         post: Vec<(String, Value)>,
     }
 
@@ -396,7 +404,7 @@ mod tests {
         fn posts(&self) -> Vec<(String, Value)> {
             self.calls.lock().unwrap().post.clone()
         }
-        fn get_all_calls(&self) -> Vec<(String, String, Vec<(String, String)>)> {
+        fn get_all_calls(&self) -> Vec<GetAllCall> {
             self.calls.lock().unwrap().get_all.clone()
         }
     }
@@ -452,9 +460,16 @@ mod tests {
         let client = Mock::new().with_years(
             json!({ "FinancialYears": [{ "Id": 1, "FromDate": "2024-07-01", "ToDate": "2025-06-30" }] }),
         );
-        let err = run_post(&client, &[row("a")], PostOptions { commit: true, ..Default::default() })
-            .await
-            .unwrap_err();
+        let err = run_post(
+            &client,
+            &[row("a")],
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.downcast_ref::<FiscalYearMissing>().is_some(),
             "expected FiscalYearMissing, got {err:#}"
@@ -557,7 +572,10 @@ mod tests {
         let wet = run_post(
             &Mock::new(),
             &[row("a")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -572,14 +590,19 @@ mod tests {
         let r = run_post(
             &client,
             &[row("a"), row("b")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         let posts = client.posts();
         assert_eq!(posts.len(), 2);
-        assert!(posts.iter().all(|(path, body)| path == "vouchers"
-            && body.get("Voucher").is_some_and(Value::is_object)));
+        assert!(posts
+            .iter()
+            .all(|(path, body)| path == "vouchers"
+                && body.get("Voucher").is_some_and(Value::is_object)));
         assert_eq!(r.posted.len(), 2);
         assert!(r.committed);
     }
@@ -588,27 +611,57 @@ mod tests {
     async fn rows_that_are_not_approved_are_skipped() {
         let client = Mock::new();
         let rows = [
-            ForslagRow { godkann: String::new(), ..row("a") },
-            ForslagRow { godkann: "N".to_string(), ..row("b") },
+            ForslagRow {
+                godkann: String::new(),
+                ..row("a")
+            },
+            ForslagRow {
+                godkann: "N".to_string(),
+                ..row("b")
+            },
         ];
-        let r = run_post(&client, &rows, PostOptions { commit: true, ..Default::default() })
-            .await
-            .unwrap();
+        let r = run_post(
+            &client,
+            &rows,
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(client.posts().is_empty());
         assert_eq!(r.skipped.len(), 2);
-        assert!(r.skipped[0].reason.contains("Godkänn"), "{}", r.skipped[0].reason);
+        assert!(
+            r.skipped[0].reason.contains("Godkänn"),
+            "{}",
+            r.skipped[0].reason
+        );
     }
 
     #[tokio::test]
     async fn approval_tolerates_whitespace_and_case() {
         let client = Mock::new();
         let rows = [
-            ForslagRow { godkann: " j ".to_string(), ..row("a") },
-            ForslagRow { godkann: "J".to_string(), ..row("b") },
+            ForslagRow {
+                godkann: " j ".to_string(),
+                ..row("a")
+            },
+            ForslagRow {
+                godkann: "J".to_string(),
+                ..row("b")
+            },
         ];
-        let r = run_post(&client, &rows, PostOptions { commit: true, ..Default::default() })
-            .await
-            .unwrap();
+        let r = run_post(
+            &client,
+            &rows,
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(r.posted.len(), 2, "skipped: {:?}", r.skipped);
     }
 
@@ -617,15 +670,28 @@ mod tests {
         let client = Mock::new();
         let r = run_post(
             &client,
-            &[ForslagRow { bas_konto: String::new(), ..row("a") }],
-            PostOptions { commit: true, ..Default::default() },
+            &[ForslagRow {
+                bas_konto: String::new(),
+                ..row("a")
+            }],
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         assert!(client.posts().is_empty());
         assert_eq!(r.skipped.len(), 1);
-        assert!(r.skipped[0].reason.contains("BAS_konto"), "{}", r.skipped[0].reason);
-        assert!(r.failures.is_empty(), "an unfilled row is expected, not a failure");
+        assert!(
+            r.skipped[0].reason.contains("BAS_konto"),
+            "{}",
+            r.skipped[0].reason
+        );
+        assert!(
+            r.failures.is_empty(),
+            "an unfilled row is expected, not a failure"
+        );
     }
 
     #[tokio::test]
@@ -636,10 +702,16 @@ mod tests {
         let r = run_post(
             &client,
             &[
-                ForslagRow { datum: "10/08/2025".to_string(), ..row("a") },
+                ForslagRow {
+                    datum: "10/08/2025".to_string(),
+                    ..row("a")
+                },
                 row("b"),
             ],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -656,7 +728,10 @@ mod tests {
         let r = run_post(
             &client,
             &[row("a"), row("b")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -684,7 +759,9 @@ mod tests {
         .unwrap();
         let (_, body) = &client.posts()[0];
         assert_eq!(body["Voucher"]["VoucherSeries"], "C");
-        let rows = body["Voucher"]["VoucherRows"]["VoucherRow"].as_array().unwrap();
+        let rows = body["Voucher"]["VoucherRows"]["VoucherRow"]
+            .as_array()
+            .unwrap();
         assert!(rows.iter().any(|r| r["Account"] == "1932"));
     }
 
@@ -695,9 +772,16 @@ mod tests {
         // The pinned detail: a plain `get` sees page one only, and a marker on
         // page two would be missed — re-posting a row already booked.
         let client = Mock::new();
-        run_post(&client, &[row("a")], PostOptions { commit: true, ..Default::default() })
-            .await
-            .unwrap();
+        run_post(
+            &client,
+            &[row("a")],
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             client.get_all_calls(),
             vec![(
@@ -716,7 +800,10 @@ mod tests {
         run_post(&client, &[row("a")], PostOptions::default())
             .await
             .unwrap();
-        assert_eq!(client.get_all_calls()[0].2, vec![("financialyear".to_string(), "7".to_string())]);
+        assert_eq!(
+            client.get_all_calls()[0].2,
+            vec![("financialyear".to_string(), "7".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -738,13 +825,20 @@ mod tests {
         let r = run_post(
             &client,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         assert!(client.posts().is_empty());
         assert_eq!(r.skipped.len(), 1);
-        assert!(r.skipped[0].reason.contains("redan bokförd"), "{}", r.skipped[0].reason);
+        assert!(
+            r.skipped[0].reason.contains("redan bokförd"),
+            "{}",
+            r.skipped[0].reason
+        );
     }
 
     #[tokio::test]
@@ -755,7 +849,10 @@ mod tests {
         let r = run_post(
             &client,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -771,11 +868,17 @@ mod tests {
         let r = run_post(
             &client,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-        assert!(client.posts().is_empty(), "an uppercase marker must still match");
+        assert!(
+            client.posts().is_empty(),
+            "an uppercase marker must still match"
+        );
         assert_eq!(r.skipped.len(), 1);
 
         // Direction 2: an uppercase Rad_id in the sheet, against a lowercase
@@ -786,7 +889,10 @@ mod tests {
         let r = run_post(
             &client,
             &[row("AAA111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -807,7 +913,10 @@ mod tests {
         let r = run_post(
             &client,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -822,7 +931,10 @@ mod tests {
         let r1 = run_post(
             &first,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -835,7 +947,10 @@ mod tests {
         let r2 = run_post(
             &second,
             &[row("aaa111")],
-            PostOptions { commit: true, ..Default::default() },
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -847,10 +962,23 @@ mod tests {
     #[tokio::test]
     async fn no_rows_is_an_empty_result_rather_than_an_error() {
         let client = Mock::new();
-        let r = run_post(&client, &[], PostOptions { commit: true, ..Default::default() })
-            .await
-            .unwrap();
-        assert_eq!(r, PostResult { committed: true, ..PostResult::default() });
+        let r = run_post(
+            &client,
+            &[],
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            PostResult {
+                committed: true,
+                ..PostResult::default()
+            }
+        );
         assert!(client.posts().is_empty());
     }
 }

@@ -548,7 +548,11 @@ mod tests {
                 kategori: Some(label.to_string()),
                 ..kvitto("1000")
             };
-            assert_eq!(code(&seb("-1000", "X"), Some(&kv)).bas_konto, "5420", "{label:?}");
+            assert_eq!(
+                code(&seb("-1000", "X"), Some(&kv)).bas_konto,
+                "5420",
+                "{label:?}"
+            );
         }
     }
 
@@ -660,8 +664,12 @@ mod tests {
             if got.bas_konto != case.bas_konto || got.confidence.as_str() != case.konfidens {
                 diffs.push(format!(
                     "{} {:?}: upstream {}/{} vs rust {}/{}",
-                    case.kind, case.text, case.bas_konto, case.konfidens,
-                    got.bas_konto, got.confidence
+                    case.kind,
+                    case.text,
+                    case.bas_konto,
+                    case.konfidens,
+                    got.bas_konto,
+                    got.confidence
                 ));
             }
         }
@@ -695,7 +703,10 @@ mod tests {
         // Moving `LON` did not cost it its own matches.
         let c = code(&seb("-30000", "LONEUTBETALNING JUNI"), None);
         assert_eq!(c.bas_konto, "7010");
-        assert_eq!(code(&seb("-30000", "LÖNEUTBETALNING"), None).bas_konto, "7010");
+        assert_eq!(
+            code(&seb("-30000", "LÖNEUTBETALNING"), None).bas_konto,
+            "7010"
+        );
     }
 
     #[test]
@@ -807,7 +818,10 @@ mod tests {
     #[test]
     fn a_rate_written_with_trailing_zeros_is_still_a_whole_percent() {
         // A spreadsheet cell holding 25 often arrives as 25.00.
-        assert_eq!(resolve_vat(dec("1250"), dec("25.00"), None).unwrap(), dec("250"));
+        assert_eq!(
+            resolve_vat(dec("1250"), dec("25.00"), None).unwrap(),
+            dec("250")
+        );
     }
 
     // ---- accounts and defaults ---------------------------------------------
