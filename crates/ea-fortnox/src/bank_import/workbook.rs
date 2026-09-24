@@ -48,6 +48,14 @@
 //! three known sheets does not. This is the one behaviour in the module that
 //! could not be reproduced, and it is a real difference in what the user sees.
 //!
+//! Because the loss would be silent, the write **refuses** rather than
+//! performing it: if the file already on disk has a sheet the write would not
+//! put back, [`write_workbook`] and [`write_input_workbook`] return an error
+//! naming the sheet instead of overwriting it. Cell comments, conditional
+//! formats and charts *inside* the three known sheets are still lost and
+//! cannot be detected — the guard covers whole sheets, which is the loss a
+//! user would actually notice.
+//!
 //! **2. A malformed date or amount is an error, not a silently dropped row.**
 //! Upstream's `readSeb` ends with `if (belopp === undefined || !datum) return;`
 //! — a row whose amount will not parse vanishes without a word, and a row whose
@@ -492,9 +500,54 @@ pub fn write_workbook(
     kvitton: &[KvittoRow],
     forslag: &[ForslagRow],
 ) -> Result<()> {
+    let path = path.as_ref();
+    refuse_to_drop_sheets(path, &[SHEET_SEB, SHEET_KVITTON, SHEET_FORSLAG])?;
     let bytes = build_workbook(seb, kvitton, Some(forslag))?;
-    std::fs::write(path.as_ref(), bytes)
-        .with_context(|| format!("writing workbook {}", path.as_ref().display()))
+    std::fs::write(path, bytes).with_context(|| format!("writing workbook {}", path.display()))
+}
+
+/// Sheets an existing file at `path` has that a write of `writing` would not
+/// put back.
+///
+/// Divergence 1 means a write rebuilds the file from three sheets' worth of
+/// cell values, so a fourth sheet the user added — notes, a pivot, a working
+/// column — is simply gone. `exceljs` edited the package in place and kept it.
+/// There is no read-modify-write path here to restore that behaviour, so the
+/// next best thing is to refuse: destroying a user's sheet without a word is
+/// strictly worse than declining to write and saying why.
+///
+/// A file that is not there yet, or that cannot be parsed as a workbook at
+/// all, does not block the write. The guard can only protect sheets it can
+/// see, and claiming otherwise would be a guard that fails closed on a
+/// corrupt byte.
+fn refuse_to_drop_sheets(path: &Path, writing: &[&str]) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(existing) = Workbook::open(path) else {
+        return Ok(());
+    };
+    let lost: Vec<&str> = existing
+        .sheet_names()
+        .into_iter()
+        .filter(|name| !writing.contains(name))
+        .collect();
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to overwrite {}: it has {} this write does not produce ({}), \
+         and writing rebuilds the file from the {} sheet{} rather than editing \
+         it in place — {} would be lost. Move or rename the extra sheet{}, or \
+         write to a different path.",
+        path.display(),
+        if lost.len() == 1 { "a sheet" } else { "sheets" },
+        lost.join(", "),
+        writing.join(", "),
+        if writing.len() == 1 { "" } else { "s" },
+        if lost.len() == 1 { "it" } else { "they" },
+        if lost.len() == 1 { "" } else { "s" },
+    ))
 }
 
 /// [`write_workbook`], to memory.
@@ -515,9 +568,12 @@ pub fn write_input_workbook(
     seb: &[SebRow],
     kvitton: &[KvittoRow],
 ) -> Result<()> {
+    let path = path.as_ref();
+    // Same guard, and here it also catches overwriting a reviewed workbook
+    // with a blank sample: `Förslag` is not among the sheets this writes.
+    refuse_to_drop_sheets(path, &[SHEET_SEB, SHEET_KVITTON])?;
     let bytes = build_workbook(seb, kvitton, None)?;
-    std::fs::write(path.as_ref(), bytes)
-        .with_context(|| format!("writing workbook {}", path.as_ref().display()))
+    std::fs::write(path, bytes).with_context(|| format!("writing workbook {}", path.display()))
 }
 
 fn build_workbook(
@@ -1038,6 +1094,83 @@ mod tests {
             wb.sheet_names(),
             vec![SHEET_SEB, SHEET_KVITTON, SHEET_FORSLAG]
         );
+    }
+
+    // ---- the extra-sheet guard ---------------------------------------------
+
+    /// A workbook with a sheet this module does not know about, written the
+    /// way a user would get one: they added it in Excel.
+    fn workbook_with_an_extra_sheet(path: &Path, extra: &str) {
+        let mut wb = XlsxWorkbook::new();
+        for name in [SHEET_SEB, SHEET_KVITTON, extra] {
+            let s = wb.add_worksheet();
+            s.set_name(name).unwrap();
+            s.write_string(0, 0, "x").unwrap();
+        }
+        wb.save(path).unwrap();
+    }
+
+    #[test]
+    fn writing_refuses_to_destroy_a_sheet_the_user_added() {
+        // Upstream edited the package in place, so a user's own sheet
+        // survived a `propose`. Here the file is rebuilt from three sheets of
+        // cell values, so it would not — and it would not say so either.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bokforing.xlsx");
+        workbook_with_an_extra_sheet(&path, "Mina anteckningar");
+        let before = std::fs::read(&path).unwrap();
+
+        let err = write_workbook(&path, &[], &[], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Mina anteckningar"), "{msg}");
+        assert!(msg.contains("refusing to overwrite"), "{msg}");
+
+        // And the file on disk is untouched, which is the whole point.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            Workbook::open(&path)
+                .unwrap()
+                .sheet_names()
+                .contains(&"Mina anteckningar"),
+            "the user's sheet must still be there"
+        );
+    }
+
+    #[test]
+    fn writing_an_input_workbook_refuses_to_drop_a_reviewed_forslag() {
+        // `sample` over a file that has already been reviewed: `Förslag` is
+        // not among the sheets an input workbook writes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bokforing.xlsx");
+        write_workbook(&path, &[], &[], &[]).unwrap();
+
+        let err = write_input_workbook(&path, &[], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains(SHEET_FORSLAG), "{err:#}");
+    }
+
+    #[test]
+    fn writing_over_a_file_with_only_the_known_sheets_is_allowed() {
+        // The ordinary re-run: `propose` twice over the same file. The guard
+        // must not turn that into an error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bokforing.xlsx");
+        write_workbook(&path, &[], &[], &[]).unwrap();
+        write_workbook(&path, &[], &[], &[]).unwrap();
+        // A file with a *subset* of the sheets is fine too — nothing is lost.
+        let input = dir.path().join("sample.xlsx");
+        write_input_workbook(&input, &[], &[]).unwrap();
+        write_workbook(&input, &[], &[], &[]).unwrap();
+    }
+
+    #[test]
+    fn a_new_path_and_an_unparseable_file_do_not_block_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workbook(dir.path().join("new.xlsx"), &[], &[], &[]).unwrap();
+        // The guard protects sheets it can see; a file that is not a workbook
+        // has none, and failing closed on a stray byte would be worse.
+        let junk = dir.path().join("junk.xlsx");
+        std::fs::write(&junk, b"not a workbook").unwrap();
+        write_workbook(&junk, &[], &[], &[]).unwrap();
     }
 
     #[test]
