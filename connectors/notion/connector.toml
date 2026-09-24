@@ -1,0 +1,23 @@
+# Discovered by the daemon: a directory holding both connector.toml and
+# policy.toml is a connector. `command` is resolved against the running
+# executable's directory first, then $PATH, so a release build next to
+# ea-daemon needs no install step.
+#
+# `name` must equal this directory's basename, and no two connectors may claim
+# the same name — both are hard startup errors. See `ea_daemon::connectors`.
+name = "notion"
+command = "ea-notion"
+args = []
+
+# An hour. Notion is where plans are written down, not where they arrive: a
+# due date in a Notion database was typed by a human who already knew about it,
+# and the work this connector surfaces moves on the scale of days. Polling
+# harder would re-read every shared table sixty times an hour to learn the same
+# thing once, and each poll costs one `search` plus one query per shared data
+# source against a rate limit of roughly three requests a second that a
+# session's own tool calls share.
+#
+# The cost of the long interval is bounded: the worst case is that a deadline
+# typed into Notion is reported up to an hour late, and `watch::HORIZON` looks
+# a fortnight ahead, so nothing is ever first seen on the day it falls due.
+watch_interval_secs = 3600

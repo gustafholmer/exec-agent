@@ -30,15 +30,31 @@
 //!
 //! The connector directory this crate serves is `connectors/notion` and its
 //! name is `notion` — the daemon requires a connector's name to equal its
-//! directory's basename. Nothing in this task builds that manifest; the
-//! constant [`auth::CONNECTOR`] is here so the two cannot drift when the next
-//! task does.
+//! directory's basename, and [`auth::CONNECTOR`] is the single spelling both
+//! the credential path and `connectors/notion/connector.toml` are checked
+//! against (`tools::tests::the_connector_manifest_is_named_for_its_directory`).
+//!
+//! On top of that sit the MCP server and the poll:
+//!
+//! * [`tools`] is the surface the daemon and a session see — `search`,
+//!   `get_page`, `query_database`, `create_page`, `append_to_page`, and
+//!   `watch_poll`. Every tool but `watch_poll` takes a required `workspace`,
+//!   because one integration token can only ever see one workspace and there
+//!   is no default one.
+//! * [`watch`] is what the daemon's timer calls: one row per database item
+//!   with a date inside the horizon, across every configured workspace, with
+//!   an error from any one of them failing the whole poll rather than looking
+//!   like a quiet week.
 #![forbid(unsafe_code)]
 
 pub mod auth;
 pub mod client;
+pub mod tools;
+pub mod watch;
 
 pub use auth::{Credentials, TokenStore};
 pub use client::{
     page_title, DataSourceRef, NotionClient, NotionError, Parent, RetryPolicy, NOTION_VERSION,
 };
+pub use tools::NotionServer;
+pub use watch::WatchEntry;

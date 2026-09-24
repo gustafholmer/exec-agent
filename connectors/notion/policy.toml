@@ -1,0 +1,54 @@
+# What a session may do with the Notion connector.
+#
+# A tool with no rule here falls through to the gate's `approve` default, so
+# the list is checked against the server's registered tools in both directions
+# by ea-notion's policy-coverage tests
+# (`tools::tests::every_registered_tool_has_a_policy_rule` and
+# `every_policy_rule_names_a_registered_tool_or_a_deliberate_placeholder`).
+#
+# The section name must be this directory's basename: `Policy::load_dirs`
+# rejects a connector that declares a foreign section, because a policy file
+# that could name another connector would be a privilege-escalation path.
+#
+# # The line this file exists to argue
+#
+# `create_page` is the first write in this project that runs without a human
+# tap. Every other connector's writes are `approve`, and the difference is not
+# carelessness — it is that creating a page is the one write here that cannot
+# damage anything that already exists.
+#
+# A new page is *additive*. It touches no existing content, it appears in the
+# owner's sidebar where they will see it, and undoing it is one click. Against
+# that, an assistant that must ask permission before filing a note is an
+# assistant that never files notes — and filing notes is the point of putting
+# Notion in front of it at all. The tap would be paid dozens of times to
+# prevent a harm that is "there is an extra page I did not want".
+#
+# `append_to_page` is `approve` for the mirror reason. It edits a page the
+# owner already maintains: their meeting notes, their project doc, the thing
+# they will read next week and trust. The API call is no more dangerous, but
+# whose work is at stake is different, and that is what the gate is for.
+[notion]
+
+# Reads. Nothing posted, nothing changed.
+search = "auto"
+get_page = "auto"
+query_database = "auto"
+
+# The daemon's timer calls this one, with no session involved.
+watch_poll = "auto"
+
+# The deliberate departure. See the argument above; a bare "auto" here would
+# read as an oversight.
+create_page = { mode = "auto", note = "a new page is reversible and costs nothing; the assistant filing notes is the point" }
+
+# Additive too, but to someone else's page. See above.
+append_to_page = "approve"
+
+# No such tools exist, and none should. The gate matches a rule by name, so
+# declaring the denial now means it is already in force if anybody ever adds
+# one. This connector may add to the owner's Notion; it may never remove from
+# it — and `create_page` being `auto` rests entirely on that asymmetry, so
+# these two lines are what makes the line above safe.
+delete_page = "deny"
+archive_page = "deny"
