@@ -14,7 +14,7 @@
 //! through `ea_core::policy`. Nothing here weakens it:
 //!
 //! * `session::ALLOWED_TOOLS` is untouched. A briefing session, like every
-//!   other, may call exactly `mcp__ea-propose__propose_action` and nothing
+//!   other, may call exactly the two `ea-propose` tools and nothing
 //!   else. It is given no connector servers at all
 //!   ([`SessionRequest::with_connectors`] with an empty list), so there is not
 //!   even a server for a tool call to land on.

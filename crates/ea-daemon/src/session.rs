@@ -12,8 +12,8 @@
 //!   a `propose_action` call on the `ea-propose` MCP server, which lands in the
 //!   approval queue rather than in the world.
 //! * **A session may call exactly the tools on the allowlist.** `--allowedTools`
-//!   is a closed list, today of one entry. See [`ALLOWED_TOOLS`] for why it is
-//!   written out rather than derived.
+//!   is a closed list, today of two entries, both on `ea-propose`. See
+//!   [`ALLOWED_TOOLS`] for why it is written out rather than derived.
 //! * **A session sees exactly the connectors it was scoped to.** The MCP config
 //!   is built by [`McpConfig::for_session`] from an explicit request list, and
 //!   `--strict-mcp-config` stops the CLI adding any of the user's own. A
@@ -70,8 +70,16 @@ pub const PROPOSE_SERVER: &str = "ea-propose";
 /// act. See the module docs.
 pub const DISALLOWED_TOOLS: &str = "Write,Edit,Bash,NotebookEdit";
 
-/// The one tool [`PROPOSE_SERVER`] exposes.
+/// The tool [`PROPOSE_SERVER`] exposes for changing the world.
 pub const PROPOSE_TOOL: &str = "propose_action";
+
+/// The tool [`PROPOSE_SERVER`] exposes for changing what the assistant knows.
+///
+/// Separate from [`PROPOSE_TOOL`] because it is a different kind of thing: it
+/// writes a row to `facts` and reaches no connector, which is why policy does
+/// not gate it. Both are named here so that [`ALLOWED_TOOLS`] can be checked
+/// against the server's advertised list rather than against a literal.
+pub const REMEMBER_TOOL: &str = "remember";
 
 /// The complete list of MCP tools a session may call, as `--allowedTools`.
 ///
@@ -91,6 +99,14 @@ pub const PROPOSE_TOOL: &str = "propose_action";
 ///   list never contains one;
 /// * `--disallowedTools` still wins over `--allowedTools`.
 ///
+/// The second entry is `remember`. It was added with the chat surface, and it
+/// is here for the reason the first one is: a tool absent from this flag is
+/// *denied*, silently, so a `remember` the server advertises but this list
+/// omits would look like a model that never chooses to use it. It is not a
+/// widening of the write surface in the sense that matters — it writes a row
+/// to the local `facts` table and reaches no connector — but it is a second
+/// tool, and the list is exact so that a third cannot arrive unnoticed.
+///
 /// It is written out rather than derived from the policy's `Mode::Auto`.
 /// `auto` means "the gate executes this without a human tap", not "read-only":
 /// deriving the allowlist from it would hand a session direct access to every
@@ -101,7 +117,7 @@ pub const PROPOSE_TOOL: &str = "propose_action";
 /// through an explicit `session_tools` declaration in `connector.toml`, which
 /// is a decision a connector author makes on purpose -- not a side effect of a
 /// session being scoped to that connector.
-pub const ALLOWED_TOOLS: &str = "mcp__ea-propose__propose_action";
+pub const ALLOWED_TOOLS: &str = "mcp__ea-propose__propose_action,mcp__ea-propose__remember";
 
 /// How long a session may run before the daemon takes it apart. Generous: a
 /// triage session that reads a calendar and a mailbox can legitimately take
@@ -758,13 +774,24 @@ mod tests {
     }
 
     #[test]
-    fn the_allowlist_is_exactly_the_propose_tool() {
+    fn the_allowlist_is_exactly_the_two_propose_server_tools() {
         // Measured against the real CLI (2.1.267): with no --allowedTools,
         // every MCP tool -- propose_action included -- is denied under
         // --permission-prompts none. The flag is what makes a session able to
         // do the one thing it exists for.
+        //
+        // Exactly two, by name. `ea-propose` advertises these two and nothing
+        // else (see its `the_server_exposes_exactly_the_two_tools`), and a
+        // third arriving on either side must fail a test rather than quietly
+        // become reachable -- or quietly stay denied.
         let argv = build_argv(&request(), &config(&[]));
-        assert_eq!(allowlist(&argv), vec!["mcp__ea-propose__propose_action"]);
+        assert_eq!(
+            allowlist(&argv),
+            vec![
+                "mcp__ea-propose__propose_action",
+                "mcp__ea-propose__remember"
+            ]
+        );
     }
 
     #[test]
@@ -774,7 +801,7 @@ mod tests {
         // silent denial, not an error.
         assert_eq!(
             ALLOWED_TOOLS,
-            format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL}")
+            format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL},mcp__{PROPOSE_SERVER}__{REMEMBER_TOOL}")
         );
         let argv = build_argv(&request(), &config(&[]));
         let raw = flag_value(&argv, "--mcp-config").unwrap();
@@ -822,7 +849,10 @@ mod tests {
             allowlist(&many),
             "connectors must not add anything to the allowlist"
         );
-        assert_eq!(allowlist(&many), vec![ALLOWED_TOOLS]);
+        assert_eq!(
+            allowlist(&many),
+            ALLOWED_TOOLS.split(',').collect::<Vec<_>>()
+        );
         for connector in ["calendar", "mail", "fortnox"] {
             assert!(
                 !flag_value(&many, "--allowedTools")
@@ -1362,20 +1392,25 @@ mod tests {
         crate::daemon::Daemon::build(crate::daemon::Deps {
             executor: Arc::new(executor),
             actions: ActionStore::new(Arc::clone(&conn)),
-            conversations: ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
             events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
             runs: RunStore::new(Arc::clone(&conn)),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
             schedules: ea_core::store::schedules::ScheduleStore::new(Arc::clone(&conn)),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
-            sessions: None,
+            chat: Arc::new(crate::chat::ChatService::new(
+                ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
+                ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
+                RunStore::new(Arc::clone(&conn)),
+                None,
+                60,
+                crate::config::DEFAULT_CHAT_MODEL,
+                crate::notify::policy::DEFAULT_TIME_ZONE,
+            )),
             pusher: None,
             notify_log: crate::notify::log::NotificationLog::new(ea_core::store::kv::KvStore::new(
                 Arc::clone(&conn),
             )),
             connectors: Vec::new(),
-            daily_session_budget: 60,
-            chat_model: crate::config::DEFAULT_CHAT_MODEL.to_string(),
         })
         .register(&mut server);
         let daemon = server.spawn().await.expect("binding the daemon socket");

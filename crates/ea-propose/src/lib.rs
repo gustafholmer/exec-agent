@@ -14,11 +14,21 @@
 //!
 //! Two properties matter more than anything else here.
 //!
-//! **Exactly one tool.** This crate is what stands between a language model and
-//! the ability to post a voucher to company accounting or send mail. A second
-//! tool appearing in this server is a widening of that surface, and
-//! [`tests::the_server_exposes_exactly_one_tool`] exists to make that a
-//! deliberate act rather than an accident.
+//! **Exactly two tools, and only one of them touches the world.** This crate is
+//! what stands between a language model and the ability to post a voucher to
+//! company accounting or send mail. Any tool appearing in this server is a
+//! widening of that surface, and
+//! [`tests::the_server_exposes_exactly_the_two_tools`] pins the list by name so
+//! that a third is a deliberate act rather than an accident.
+//!
+//! The second tool is [`ProposeServer::remember`], added with the chat surface.
+//! It is a different kind of thing from `propose_action` and the difference is
+//! the whole reason it is not gated: it writes one row to the daemon's local
+//! `facts` table, reaches no connector, and is reversible with `ea forget`.
+//! Putting a fact behind a human tap would mean the assistant never learns
+//! anything, because nobody taps Approve on "remember that the tenta moved".
+//! What it must never become is a general write path — it takes a topic and a
+//! body, and the daemon's `remember` method touches `facts` and nothing else.
 //!
 //! **Never panic.** A panicking stdio MCP server takes the whole agent session
 //! down with it — the model loses its tools mid-task and the run dies. Every
@@ -36,8 +46,11 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
 
-/// The IPC method the daemon exposes for this.
+/// The IPC method the daemon exposes for proposals.
 pub const PROPOSE_METHOD: &str = "propose";
+
+/// The IPC method the daemon exposes for facts.
+pub const REMEMBER_METHOD: &str = "remember";
 
 /// How long to wait for the daemon's answer before giving up.
 ///
@@ -141,7 +154,49 @@ pub struct ProposeArgs {
     pub rationale: String,
 }
 
-/// The stdio MCP server. One tool, and no state beyond where the daemon lives.
+/// The arguments of the memory tool.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RememberArgs {
+    /// A short handle for what this is about, e.g. "tenta" or "invoicing
+    /// address". Storing the same topic twice replaces what was there, so use
+    /// the same words when correcting something.
+    pub topic: String,
+    /// The fact itself, in one or two sentences.
+    pub body: String,
+}
+
+/// What the daemon said it stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remembered {
+    pub id: i64,
+    pub topic: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// Turn a stored fact into the text the model reads.
+///
+/// Says plainly whether this replaced something, because the two cases call
+/// for different behaviour: a correction that silently looked like a new fact
+/// would invite the model to "also" store the old version again.
+pub fn render_remembered(fact: &Remembered) -> String {
+    if fact.updated_at.is_some() {
+        format!(
+            "Updated what I remember about \"{}\" (fact {}). The previous note under \
+             that topic is gone, replaced by this one.",
+            fact.topic, fact.id
+        )
+    } else {
+        format!(
+            "Remembered, under the topic \"{}\" (fact {}). It will be available in \
+             future conversations that mention it. Nothing else changed: this is a \
+             note, not an action.",
+            fact.topic, fact.id
+        )
+    }
+}
+
+/// The stdio MCP server. Two tools, and no state beyond where the daemon lives.
 #[derive(Clone)]
 pub struct ProposeServer {
     socket_path: Arc<PathBuf>,
@@ -193,6 +248,54 @@ impl ProposeServer {
             Err(message) => Err(message),
         }
     }
+
+    /// The memory tool. Writes one row to the daemon's `facts` table and
+    /// reaches nothing else; see the module docs for why it is not gated.
+    ///
+    /// Fails, rather than silently storing nothing, on an empty body: an empty
+    /// fact would erase whatever was under that topic.
+    #[tool(
+        description = "Remember something the user told you, so that it is available in \
+                       later conversations. Storing the same topic again replaces what was \
+                       there, so use the same topic when correcting yourself. This changes \
+                       nothing in the outside world — it is a private note, not an action, \
+                       and the user can list it with `ea facts` and delete it with \
+                       `ea forget`."
+    )]
+    pub async fn remember(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<String, String> {
+        let params = serde_json::json!({ "topic": args.topic, "body": args.body });
+        match call_daemon(&self.socket_path, self.timeout, REMEMBER_METHOD, params).await {
+            Ok(value) => match serde_json::from_value::<Remembered>(value.clone()) {
+                Ok(fact) => Ok(render_remembered(&fact)),
+                Err(err) => Err(format!(
+                    "remember: the exec-agent daemon answered with something this build \
+                     does not understand ({err}). The fact MAY have been stored; say so \
+                     rather than storing it again under a new topic. Raw reply: {}",
+                    truncate(&value.to_string(), 500)
+                )),
+            },
+            Err(CallFailure::Timeout) => Err(format!(
+                "remember: the exec-agent daemon did not answer within {}s. The fact MAY \
+                 have been stored. Do not retry it; carry on and mention that memory is \
+                 not responding.",
+                self.timeout.as_secs()
+            )),
+            Err(CallFailure::Unreachable(detail)) => Err(format!(
+                "remember: the exec-agent daemon is not reachable — there is no socket at \
+                 {}. Nothing was stored. Do not try to record it any other way: say in \
+                 your answer that you could not remember it. Underlying error: {detail}",
+                self.socket_path.display()
+            )),
+            Err(CallFailure::Refused(detail)) => Err(format!(
+                "remember: the exec-agent daemon refused this fact: {detail}. Nothing was \
+                 stored. An empty body is refused on purpose — a fact that says nothing \
+                 would erase the one it replaces."
+            )),
+        }
+    }
 }
 
 #[tool_handler]
@@ -229,11 +332,9 @@ async fn ask_daemon(
         "rationale": args.rationale,
     });
 
-    let client = ea_core::ipc::Client::new(socket_path);
-    let call = client.call(PROPOSE_METHOD, params);
-
-    let response = match tokio::time::timeout(timeout, call).await {
-        Err(_elapsed) => {
+    let value = match call_daemon(socket_path, timeout, PROPOSE_METHOD, params).await {
+        Ok(value) => value,
+        Err(CallFailure::Timeout) => {
             return Err(format!(
                 "propose_action: the exec-agent daemon did not answer within {}s \
                  (socket: {}). The action MAY have been recorded, and if policy \
@@ -243,36 +344,24 @@ async fn ask_daemon(
                 socket_path.display()
             ));
         }
-        Ok(response) => response,
-    };
-
-    let value = match response {
-        Ok(value) => value,
-        Err(err) => {
-            // `Client::call` folds two very different things into one error:
-            // a transport failure (no socket, connection refused, the daemon
-            // hung up) and an `ok: false` reply, which is the daemon having
-            // considered the request and declined it. Only the first means
-            // "nothing was recorded", so they get different text.
-            let detail = format!("{err:#}");
-            return Err(if socket_path.exists() {
-                format!(
-                    "propose_action: the exec-agent daemon refused or could not \
-                     complete this proposal: {detail}. Nothing was executed. If the \
-                     message points at your arguments, fix them and try once more; \
-                     otherwise report it and move on."
-                )
-            } else {
-                format!(
-                    "propose_action: the exec-agent daemon is not reachable — there is \
-                     no socket at {}. Nothing was proposed, nothing was recorded and \
-                     nothing ran. The daemon is not running (start it with `ea-daemon`, \
-                     or check that $EA_STATE_DIR matches the one it uses). Do not try to \
-                     perform this action any other way: say clearly in your answer that \
-                     it could not be proposed. Underlying error: {detail}",
-                    socket_path.display()
-                )
-            });
+        Err(CallFailure::Refused(detail)) => {
+            return Err(format!(
+                "propose_action: the exec-agent daemon refused or could not \
+                 complete this proposal: {detail}. Nothing was executed. If the \
+                 message points at your arguments, fix them and try once more; \
+                 otherwise report it and move on."
+            ));
+        }
+        Err(CallFailure::Unreachable(detail)) => {
+            return Err(format!(
+                "propose_action: the exec-agent daemon is not reachable — there is \
+                 no socket at {}. Nothing was proposed, nothing was recorded and \
+                 nothing ran. The daemon is not running (start it with `ea-daemon`, \
+                 or check that $EA_STATE_DIR matches the one it uses). Do not try to \
+                 perform this action any other way: say clearly in your answer that \
+                 it could not be proposed. Underlying error: {detail}",
+                socket_path.display()
+            ));
         }
     };
 
@@ -285,6 +374,54 @@ async fn ask_daemon(
             truncate(&value.to_string(), 500)
         )
     })
+}
+
+/// How a daemon round trip failed, so each tool can say what it means for
+/// *that* tool.
+///
+/// The distinction is not cosmetic: "the daemon is not running, nothing was
+/// recorded" and "the daemon answered something I could not parse, it may
+/// exist" call for opposite responses from the model, and the wording that
+/// produces the right one differs between proposing an action and storing a
+/// note. The plumbing is shared; the sentences are not.
+#[derive(Debug)]
+enum CallFailure {
+    /// No answer inside the deadline. The request may have been acted on.
+    Timeout,
+    /// There is no socket: the daemon is not running, and nothing happened.
+    Unreachable(String),
+    /// The daemon answered `ok: false`, or the connection failed with a socket
+    /// present. It considered the request and declined it.
+    Refused(String),
+}
+
+/// One request to the daemon, with the failure modes separated.
+async fn call_daemon(
+    socket_path: &Path,
+    timeout: Duration,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, CallFailure> {
+    let client = ea_core::ipc::Client::new(socket_path);
+    let call = client.call(method, params);
+
+    match tokio::time::timeout(timeout, call).await {
+        Err(_elapsed) => Err(CallFailure::Timeout),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            // `Client::call` folds two very different things into one error: a
+            // transport failure (no socket, connection refused, the daemon
+            // hung up) and an `ok: false` reply, which is the daemon having
+            // considered the request and declined it. Only the first means
+            // "nothing was recorded".
+            let detail = format!("{err:#}");
+            if socket_path.exists() {
+                Err(CallFailure::Refused(detail))
+            } else {
+                Err(CallFailure::Unreachable(detail))
+            }
+        }
+    }
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -402,25 +539,38 @@ mod tests {
     /// The guard rail. `#[tool_handler]` answers `tools/list` with exactly
     /// `tool_router().list_all()`, so this is the list a session sees.
     ///
-    /// This crate is the entire write path of the system. If a second tool ever
-    /// turns up here, that must be a decision somebody made on purpose, with
-    /// this test in front of them — not a line that slipped in.
+    /// This crate is the entire write path of the system. Until the chat
+    /// surface it advertised one tool and this test pinned the *count* at one;
+    /// `remember` is the deliberate second, so the pin is now by **name**,
+    /// which is strictly stronger: a third tool fails it, and so does a
+    /// rename or a swap that keeps the count at two.
+    ///
+    /// Anything added here must also be added to
+    /// `ea_daemon::session::ALLOWED_TOOLS`, or the CLI denies it silently and
+    /// the tool looks like one the model simply never chooses.
     #[test]
-    fn the_server_exposes_exactly_one_tool() {
+    fn the_server_exposes_exactly_the_two_tools() {
         let tools = ProposeServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
-            tools.len(),
-            1,
-            "ea-propose must expose exactly one tool, found: {:?}",
-            tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
+            names,
+            vec!["propose_action", "remember"],
+            "ea-propose exposes exactly these two tools, in this order"
         );
-        assert_eq!(tools[0].name.as_ref(), "propose_action");
+    }
+
+    fn tool_named(name: &str) -> rmcp::model::Tool {
+        ProposeServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("no tool named {name}"))
     }
 
     #[test]
     fn the_tool_schema_requires_the_five_fields() {
-        let tools = ProposeServer::tool_router().list_all();
-        let schema = serde_json::to_value(&*tools[0].input_schema).unwrap();
+        let propose = tool_named("propose_action");
+        let schema = serde_json::to_value(&*propose.input_schema).unwrap();
         let required: Vec<&str> = schema["required"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
@@ -435,6 +585,161 @@ mod tests {
             schema["properties"].get("args").is_some(),
             "args must be in the schema: {schema}"
         );
+    }
+
+    #[test]
+    fn the_remember_schema_requires_a_topic_and_a_body() {
+        let remember = tool_named("remember");
+        let schema = serde_json::to_value(&*remember.input_schema).unwrap();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for field in ["topic", "body"] {
+            assert!(
+                required.contains(&field),
+                "{field} must be required: {schema}"
+            );
+        }
+    }
+
+    /// The description is what tells the model this is not an action. A
+    /// `remember` the model believes changes something in the world would be
+    /// proposed instead, and never used.
+    #[test]
+    fn the_remember_description_says_it_changes_nothing_outside() {
+        let remember = tool_named("remember");
+        let description = remember.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("nothing in the outside world"),
+            "{description}"
+        );
+        assert!(description.contains("ea forget"), "{description}");
+    }
+
+    #[test]
+    fn a_new_fact_and_a_correction_render_differently() {
+        let fresh = render_remembered(&Remembered {
+            id: 3,
+            topic: "tenta".into(),
+            updated_at: None,
+        });
+        assert!(fresh.contains("Remembered"), "{fresh}");
+        assert!(fresh.contains("tenta"), "{fresh}");
+        assert!(fresh.contains('3'), "{fresh}");
+
+        let corrected = render_remembered(&Remembered {
+            id: 3,
+            topic: "tenta".into(),
+            updated_at: Some("2026-09-24T09:00:00Z".into()),
+        });
+        assert!(corrected.contains("Updated"), "{corrected}");
+        assert!(
+            corrected.contains("replaced"),
+            "the model must know the old note is gone: {corrected}"
+        );
+    }
+
+    /// The failure a session hits first, on the memory tool too: it must be a
+    /// readable error result, and it must say nothing was stored.
+    #[tokio::test]
+    async fn remember_with_no_daemon_is_an_error_result_not_a_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nothing-here.sock");
+        let error = ProposeServer::new(&missing)
+            .remember(Parameters(RememberArgs {
+                topic: "tenta".into(),
+                body: "on the 14th".into(),
+            }))
+            .await
+            .expect_err("a missing socket must be reported, not succeed");
+        assert!(error.contains("remember"), "{error}");
+        assert!(error.contains("Nothing was stored"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+    }
+
+    /// A daemon that refuses the fact — an empty body, say — must come back as
+    /// a tool error that does not claim the fact exists.
+    #[tokio::test]
+    async fn a_refused_fact_says_nothing_was_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: ea_core::ipc::Request = serde_json::from_str(&line).unwrap();
+            let reply = ea_core::ipc::Response::err(
+                request.id,
+                "remember: `body` must not be empty".to_string(),
+            );
+            let _ = write_half
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await;
+        });
+
+        let error = ProposeServer::new(&path)
+            .remember(Parameters(RememberArgs {
+                topic: "tenta".into(),
+                body: " ".into(),
+            }))
+            .await
+            .expect_err("a refused fact must be reported");
+        assert!(error.contains("Nothing was stored"), "{error}");
+        assert!(error.contains("must not be empty"), "{error}");
+    }
+
+    /// The happy path, over a real socket: the daemon's row comes back as a
+    /// sentence, and the request is the documented shape.
+    #[tokio::test]
+    async fn a_stored_fact_is_rendered_and_the_request_names_the_method() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let served = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: ea_core::ipc::Request = serde_json::from_str(&line).unwrap();
+            let reply = ea_core::ipc::Response::ok(
+                request.id.clone(),
+                serde_json::json!({
+                    "id": 4,
+                    "topic": "tenta",
+                    "body": "on the 14th",
+                    "created_at": "2026-09-24T09:00:00Z",
+                    "updated_at": null,
+                }),
+            );
+            let _ = write_half
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await;
+            request
+        });
+
+        let text = ProposeServer::new(&path)
+            .remember(Parameters(RememberArgs {
+                topic: "tenta".into(),
+                body: "on the 14th".into(),
+            }))
+            .await
+            .expect("a stored fact must render");
+        assert!(text.contains("Remembered"), "{text}");
+        assert!(text.contains("tenta"), "{text}");
+
+        let request = served.await.unwrap();
+        assert_eq!(request.method, REMEMBER_METHOD);
+        assert_eq!(request.params["topic"], "tenta");
+        assert_eq!(request.params["body"], "on the 14th");
     }
 
     // --- the handler never panics ----------------------------------------

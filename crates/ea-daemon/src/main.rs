@@ -30,11 +30,13 @@ use ea_core::policy::Policy;
 use ea_core::store::actions::ActionStore;
 use ea_core::store::conversations::ConversationStore;
 use ea_core::store::events::EventStore;
+use ea_core::store::facts::FactStore;
 use ea_core::store::kv::KvStore;
 use ea_core::store::retention::RetentionStore;
 use ea_core::store::runs::RunStore;
 use ea_core::store::schedules::ScheduleStore;
 use ea_daemon::briefings::BriefingDeps;
+use ea_daemon::chat::{ChatResponder, ChatService};
 use ea_daemon::config::DaemonConfig;
 use ea_daemon::connectors::{self, Registry};
 use ea_daemon::daemon::{Daemon, Deps, SHUTDOWN_DRAIN};
@@ -130,17 +132,38 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // --- the conversation --------------------------------------------------
+    //
+    // Built before Telegram, because the notifier is handed it: a free-text
+    // message on the phone and `ea chat` in the terminal are two clients of
+    // this one object, which is what makes a thread started on one continue on
+    // the other — and what stops two messages running two sessions at once.
+    let chat = Arc::new(ChatService::new(
+        ConversationStore::new(Arc::clone(&conn)),
+        FactStore::new(Arc::clone(&conn)),
+        RunStore::new(Arc::clone(&conn)),
+        sessions.clone(),
+        config.daily_session_budget,
+        config.chat_model.clone(),
+        config.notify.time_zone,
+    ));
+
     // --- telegram ----------------------------------------------------------
     let telegram = load_telegram(&config, &config_dir)?;
     let mut pusher: Option<Arc<dyn Pusher>> = None;
     let mut update_loop = None;
     if let Some(credentials) = telegram {
-        let notifier = Arc::new(Notifier::new(
-            TelegramTransport::from_config(&credentials)?,
-            ActionStore::new(Arc::clone(&conn)),
-            Arc::clone(&executor),
-            credentials.owner_id,
-        ));
+        let notifier = Arc::new(
+            Notifier::new(
+                TelegramTransport::from_config(&credentials)?,
+                ActionStore::new(Arc::clone(&conn)),
+                Arc::clone(&executor),
+                credentials.owner_id,
+            )
+            // Free-text messages from the owner answer out of the same
+            // conversation `ea chat` talks to.
+            .with_chat(Arc::clone(&chat) as Arc<dyn ChatResponder>),
+        );
         // A second transport for the polling half. It is the same credentials
         // and a different HTTP client: a 25-second long poll must not sit in
         // the same connection pool slot as an outgoing notification.
@@ -251,18 +274,15 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Daemon::build(Deps {
         executor,
         actions: ActionStore::new(Arc::clone(&conn)),
-        conversations: ConversationStore::new(Arc::clone(&conn)),
         events: EventStore::new(Arc::clone(&conn)),
         runs: RunStore::new(Arc::clone(&conn)),
         scheduler: Arc::clone(&scheduler),
         schedules: schedule_store,
         time_zone: config.notify.time_zone,
-        sessions,
+        chat,
         pusher,
         notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
         connectors: connector_names,
-        daily_session_budget: config.daily_session_budget,
-        chat_model: config.chat_model.clone(),
     });
 
     let socket_path = ea_core::paths::socket_path();

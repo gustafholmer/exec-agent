@@ -13,6 +13,7 @@
 //! every client of the socket arbitrary tool calls with the gate bypassed.
 
 pub mod briefings;
+pub mod chat;
 pub mod config;
 pub mod connectors;
 pub mod daemon;

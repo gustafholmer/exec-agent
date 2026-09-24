@@ -60,7 +60,7 @@
 //! read back and the reply describes the state it is actually in. See
 //! [`Notifier::already_handled`].
 //!
-//! # Who may press the buttons
+//! # Who may press the buttons, and who may talk
 //!
 //! Exactly one person: the [`TelegramUserId`] handed to [`Notifier::new`],
 //! which is required rather than optional so that there is no "unconfigured,
@@ -70,6 +70,16 @@
 //! See [`Notifier::handle_callback`] for what a bot token does and does not
 //! let an attacker forge — required reading for whoever writes the update
 //! loop.
+//!
+//! [`Notifier::handle_message`] — free text rather than a button — is held to
+//! the identical standard, and deliberately shares
+//! [`UNRECOGNISED_REPLY`] with the callback path. The identity in a message
+//! update is **`message.from.id`**, which is a different field from
+//! `message.chat.id`: the chat is a place, the `from` is a person, and in a
+//! group they are not even the same number. A message routed to the chat
+//! surface without that check would let anyone who found the bot hold a
+//! conversation with the owner's assistant — and that assistant can propose
+//! actions.
 //!
 //! # The token, and data arriving from the network
 //!
@@ -95,6 +105,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use ea_core::store::actions::{ActionStatus, ActionStore};
 
+use crate::chat::{ChatResponder, SURFACE_TELEGRAM};
 use crate::executor::{Executor, ToolCaller};
 use crate::notify::updates::{Update, UpdateSource};
 
@@ -162,12 +173,13 @@ pub trait Transport {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// A Telegram **user** id: `callback_query.from.id`, the person who tapped.
+/// A Telegram **user** id: `callback_query.from.id` for a button press,
+/// `message.from.id` for a free-text message — the person, either way.
 ///
 /// A newtype rather than a bare `i64` because the wrong `i64` is right there
 /// in the same update. `message.chat.id` would compile just as happily in the
 /// place of `from.id` and authenticate nothing, and in a group the two are not
-/// even the same number. Construct it only where `from.id` is read.
+/// even the same number. Construct it only where a `from.id` is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TelegramUserId(pub i64);
 
@@ -182,11 +194,25 @@ pub struct Notifier<T: Transport, C: ToolCaller> {
     transport: T,
     actions: ActionStore,
     executor: Arc<Executor<C>>,
-    /// The only user whose button presses are acted on. Not an `Option`: an
-    /// "unconfigured" variant is a branch that allows everyone, and this is
-    /// the gate in front of posting real vouchers.
+    /// The only user whose button presses and messages are acted on. Not an
+    /// `Option`: an "unconfigured" variant is a branch that allows everyone,
+    /// and this is the gate in front of posting real vouchers.
     owner: TelegramUserId,
+    /// Where a free-text message goes. `None` on a daemon built without a
+    /// chat service, which answers messages by saying so rather than by
+    /// silently ignoring them.
+    chat: Option<Arc<dyn ChatResponder>>,
 }
+
+/// What the owner is told when a message arrives at a daemon with no chat
+/// service wired to it. Never shown to anyone else — a non-owner gets
+/// [`UNRECOGNISED_REPLY`] and learns nothing.
+pub const NO_CHAT_REPLY: &str =
+    "I cannot hold a conversation right now: this daemon has no chat service.";
+
+/// The reply to a message from the owner that carries no text to answer — a
+/// sticker, a photo, a location.
+pub const NO_TEXT_REPLY: &str = "I can only read text messages.";
 
 /// A parsed button press. Constructed only by [`parse_callback`], so an
 /// unparseable payload cannot reach the store at all.
@@ -249,7 +275,18 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
             actions,
             executor,
             owner,
+            chat: None,
         }
+    }
+
+    /// Route the owner's free-text messages to the shared conversation.
+    ///
+    /// Separate from [`Notifier::new`] because the chat service is optional
+    /// and because the owner check must not depend on it: a daemon with no
+    /// chat service still refuses a stranger with exactly the same sentence.
+    pub fn with_chat(mut self, chat: Arc<dyn ChatResponder>) -> Self {
+        self.chat = Some(chat);
+        self
     }
 
     /// Send a plain message with no buttons.
@@ -348,6 +385,54 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
                 // poking the bot. Deliberately does not echo `data` back.
                 tracing::debug!("ignoring unrecognised telegram callback data");
                 UNRECOGNISED_REPLY.to_string()
+            }
+        }
+    }
+
+    /// Handle one free-text message and return what to say back.
+    ///
+    /// `from` is **`message.from.id`** — the sender — and never
+    /// `message.chat.id`, which is the place the message was sent in. The
+    /// update loop checks the chat separately, as a place; this checks the
+    /// person. Both refusals are [`UNRECOGNISED_REPLY`], byte-identical to the
+    /// one a malformed callback gets, so nobody can learn anything by diffing
+    /// replies — not that the bot has an owner, not that a given id is the
+    /// owner, and not that a conversation exists at all.
+    ///
+    /// Infallible for the same reason as [`Notifier::handle_callback`]: every
+    /// outcome has to be something displayable, including a session that
+    /// failed.
+    pub async fn handle_message(&self, from: TelegramUserId, text: &str) -> String {
+        if from != self.owner {
+            tracing::warn!(
+                from = from.0,
+                "refusing a telegram message from a non-owner"
+            );
+            return UNRECOGNISED_REPLY.to_string();
+        }
+
+        let text = text.trim();
+        if text.is_empty() {
+            return NO_TEXT_REPLY.to_string();
+        }
+
+        let Some(chat) = self.chat.as_ref() else {
+            return NO_CHAT_REPLY.to_string();
+        };
+
+        match chat.respond(SURFACE_TELEGRAM, text).await {
+            Ok(turn) => turn
+                .reply
+                .or(turn.note)
+                .unwrap_or_else(|| "I had nothing to say.".to_string()),
+            Err(err) => {
+                // The detail goes to the log; the phone gets a sentence. A
+                // failed turn stored no reply, so saying "it failed" is the
+                // truth about the transcript as well as about the session.
+                tracing::warn!(error = %format!("{err:#}"), "a telegram chat turn failed");
+                "Something went wrong answering that. It was not recorded as an answer — \
+                 try again, or check `ea log`."
+                    .to_string()
             }
         }
     }
@@ -736,9 +821,11 @@ impl UpdateSource for TelegramTransport {
         let url = format!("{}/bot{}/getUpdates", self.base, self.token);
         let mut body = serde_json::json!({
             "timeout": timeout_secs,
-            // Nothing else is acted on, and asking for less means Telegram's
-            // reply cannot carry the text of the owner's private messages.
-            "allowed_updates": ["callback_query"],
+            // Exactly the two kinds this daemon acts on: a button press and a
+            // message. Nothing else is asked for, so Telegram's reply cannot
+            // carry edited messages, channel posts or reactions — and the
+            // update loop cannot start acting on a kind nobody reviewed.
+            "allowed_updates": ["callback_query", "message"],
         });
         if let Some(offset) = offset {
             body["offset"] = serde_json::json!(offset);
@@ -785,6 +872,51 @@ impl UpdateSource for TelegramTransport {
                 );
             }
             Ok(envelope.result)
+        }
+    }
+
+    /// Reply into a specific chat.
+    ///
+    /// Takes `chat_id` rather than using [`Transport::send`]'s configured one
+    /// because it answers a message that arrived somewhere, and the caller —
+    /// which has already refused every chat but the configured one — is the
+    /// authority on where that was.
+    fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        let url = format!("{}/bot{}/sendMessage", self.base, self.token);
+        let request = self.http.post(url).json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": truncate(text, MAX_MESSAGE_BYTES),
+        }));
+
+        async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|err| err.without_url())
+                .context("sending a Telegram reply")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| err.without_url())
+                .context("reading Telegram's reply")?;
+            let envelope: Option<ApiReply> = serde_json::from_str(&body).ok();
+            let detail = envelope
+                .as_ref()
+                .and_then(|reply| reply.description.as_deref())
+                .map_or_else(|| truncate(&body, 300), |d| truncate(d, 300));
+            match envelope {
+                Some(reply) if reply.ok => Ok(()),
+                Some(_) => bail!("Telegram rejected the reply (HTTP {status}): {detail}"),
+                None => bail!(
+                    "Telegram's reply was not the JSON envelope the Bot API \
+                     documents (HTTP {status}): {detail}"
+                ),
+            }
         }
     }
 
@@ -965,6 +1097,72 @@ record_voucher = "approve"
 
     fn fixture() -> Fixture {
         fixture_with_delay(Duration::ZERO)
+    }
+
+    /// A chat service that records what it was asked and answers a canned
+    /// line. No database, no session runner: what these tests are about is who
+    /// is allowed to reach it at all.
+    #[derive(Default)]
+    struct FakeChat {
+        seen: Mutex<Vec<(String, String)>>,
+        reply: Option<String>,
+        note: Option<String>,
+        fail: bool,
+    }
+
+    impl FakeChat {
+        fn answering(reply: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Some(reply.to_string()),
+                ..Default::default()
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                fail: true,
+                ..Default::default()
+            })
+        }
+
+        fn seen(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::chat::ChatResponder for FakeChat {
+        fn respond<'a>(
+            &'a self,
+            surface: &'a str,
+            message: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = anyhow::Result<crate::chat::ChatTurn>> + Send + 'a>,
+        > {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((surface.to_string(), message.to_string()));
+            Box::pin(async move {
+                if self.fail {
+                    anyhow::bail!("claude exited with status 1");
+                }
+                Ok(crate::chat::ChatTurn {
+                    conversation_id: 1,
+                    message_id: 1,
+                    reply: self.reply.clone(),
+                    note: self.note.clone(),
+                })
+            })
+        }
+    }
+
+    /// A fixture whose notifier also answers free text.
+    fn chat_fixture(chat: Arc<FakeChat>) -> (Fixture, Arc<FakeChat>) {
+        let mut f = fixture();
+        f.notifier = f
+            .notifier
+            .with_chat(Arc::clone(&chat) as Arc<dyn crate::chat::ChatResponder>);
+        (f, chat)
     }
 
     fn propose(actions: &ActionStore) -> i64 {
@@ -1724,7 +1922,10 @@ record_voucher = "approve"
         let query = updates[0].callback_query.as_ref().unwrap();
         assert_eq!(updates[0].update_id, 41);
         assert_eq!(query.from.id, 10_000_001, "the identity is from.id");
-        assert_eq!(query.message.as_ref().unwrap().chat.id, -42);
+        assert_eq!(
+            query.message.as_ref().unwrap().chat.as_ref().unwrap().id,
+            -42
+        );
         assert_eq!(query.data.as_deref(), Some("approve:7"));
 
         let requests: Vec<Request> = server.received_requests().await.unwrap();
@@ -1733,8 +1934,8 @@ record_voucher = "approve"
         assert_eq!(body["timeout"], 25);
         assert_eq!(
             body["allowed_updates"],
-            serde_json::json!(["callback_query"]),
-            "asking for less means the reply cannot carry private message text"
+            serde_json::json!(["callback_query", "message"]),
+            "exactly the two kinds the daemon acts on, and no more"
         );
     }
 
@@ -1782,6 +1983,63 @@ record_voucher = "approve"
         assert_eq!(updates.len(), 2);
         assert!(updates.iter().all(|u| u.callback_query.is_none()));
         assert_eq!(updates[1].update_id, 8);
+    }
+
+    /// The reply to a message goes to the chat the message came from, via
+    /// `sendMessage` — not to the configured chat by way of `Transport::send`,
+    /// which would answer the wrong room if the two ever differed.
+    #[tokio::test]
+    async fn send_message_posts_to_the_chat_it_was_given() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:TOKEN/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .mount(&server)
+            .await;
+
+        // The transport is configured for chat -42; the reply is addressed to
+        // 4242, and that is where it must go.
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        transport
+            .send_message(4242, "the tenta is on the 14th")
+            .await
+            .unwrap();
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["chat_id"], 4242);
+        assert_eq!(body["text"], "the tenta is on the 14th");
+        assert!(
+            body.get("reply_markup").is_none(),
+            "a chat reply carries no buttons: {body}"
+        );
+    }
+
+    /// A model can write more than Telegram accepts, and a rejected
+    /// `sendMessage` means the owner sees nothing at all.
+    #[tokio::test]
+    async fn a_long_reply_is_truncated_before_it_is_sent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .mount(&server)
+            .await;
+
+        let transport =
+            TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42).unwrap();
+        transport.send_message(1, &"x".repeat(9_000)).await.unwrap();
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.len() <= MAX_MESSAGE_BYTES + 8, "{} bytes", text.len());
     }
 
     /// HTTP 200 with `ok: false` is how Telegram reports "your token is
@@ -1860,5 +2118,108 @@ record_voucher = "approve"
         let text = format!("{err:#}");
         assert!(text.contains("too old"), "{text}");
         assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    // -- free text ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_owners_message_reaches_the_conversation_and_comes_back_answered() {
+        let (f, chat) = chat_fixture(FakeChat::answering("the tenta is on the 14th"));
+
+        let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
+
+        assert_eq!(reply, "the tenta is on the 14th");
+        assert_eq!(
+            chat.seen(),
+            vec![("telegram".to_string(), "when is the tenta?".to_string())],
+            "a message is tagged with the surface it arrived on"
+        );
+    }
+
+    /// The other half of the identity check, and the reason `handle_message`
+    /// exists rather than the update loop calling the chat service directly.
+    /// `message.from.id` is the person; `message.chat.id` is the room. A
+    /// stranger must get the *same* sentence a stranger's button press gets,
+    /// byte for byte, or the two replies become an oracle for probing.
+    #[tokio::test]
+    async fn a_message_from_anyone_but_the_owner_is_refused_identically_to_a_callback() {
+        let (f, chat) = chat_fixture(FakeChat::answering("secret answer"));
+
+        let to_a_message = f.notifier.handle_message(STRANGER, "hello?").await;
+        let to_a_callback = f.notifier.handle_callback(STRANGER, "approve:1").await;
+
+        assert_eq!(
+            to_a_message, UNRECOGNISED_REPLY,
+            "a stranger's message gets the generic reply: {to_a_message}"
+        );
+        assert_eq!(
+            to_a_message, to_a_callback,
+            "the two refusals must be byte-identical, or they are an oracle"
+        );
+        assert!(
+            chat.seen().is_empty(),
+            "a stranger must not reach the conversation at all: {:?}",
+            chat.seen()
+        );
+        let lower = to_a_message.to_lowercase();
+        for leak in ["owner", "allowed", "permission", "conversation", "chat"] {
+            assert!(!lower.contains(leak), "the reply leaked {leak:?}");
+        }
+    }
+
+    /// An off-by-one neighbour of the owner's id is the bug this guards; so is
+    /// the *chat* id being used as the person. The configured chat in these
+    /// tests is not the owner's user id, and a notifier handed it must refuse.
+    #[tokio::test]
+    async fn the_chat_id_is_not_an_identity() {
+        let (f, chat) = chat_fixture(FakeChat::answering("secret answer"));
+        // What `message.chat.id` would be in the owner's own DM with a group
+        // bot: a different number entirely.
+        let as_if_chat_were_the_person = TelegramUserId(-1_001_234_567_890);
+
+        let reply = f
+            .notifier
+            .handle_message(as_if_chat_were_the_person, "hello?")
+            .await;
+
+        assert_eq!(reply, UNRECOGNISED_REPLY);
+        assert!(chat.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_to_a_daemon_with_no_chat_service_says_so_to_the_owner_only() {
+        let f = fixture();
+        assert_eq!(
+            f.notifier.handle_message(OWNER, "hello").await,
+            NO_CHAT_REPLY
+        );
+        // And a stranger still learns nothing, chat service or not.
+        assert_eq!(
+            f.notifier.handle_message(STRANGER, "hello").await,
+            UNRECOGNISED_REPLY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_text_is_answered_rather_than_ignored() {
+        let (f, chat) = chat_fixture(FakeChat::answering("hi"));
+        assert_eq!(f.notifier.handle_message(OWNER, "   ").await, NO_TEXT_REPLY);
+        assert!(
+            chat.seen().is_empty(),
+            "nothing to answer, nothing recorded"
+        );
+    }
+
+    /// A session that failed stored no assistant message, so the phone is told
+    /// the turn failed rather than being handed a plausible-looking answer.
+    #[tokio::test]
+    async fn a_failed_turn_is_a_sentence_not_a_panic() {
+        let (f, _chat) = chat_fixture(FakeChat::failing());
+        let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
+        assert!(reply.contains("Something went wrong"), "{reply}");
+        assert!(
+            !reply.contains("status 1"),
+            "the detail belongs in the log, not on the phone: {reply}"
+        );
     }
 }
