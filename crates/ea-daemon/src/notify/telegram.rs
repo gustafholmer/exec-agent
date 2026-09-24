@@ -105,7 +105,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use ea_core::store::actions::{ActionStatus, ActionStore};
 
-use crate::chat::{ChatResponder, SURFACE_TELEGRAM};
+use crate::chat::{ChatResponder, ChatTurn, SURFACE_TELEGRAM};
 use crate::executor::{Executor, ToolCaller};
 use crate::notify::updates::{Update, UpdateSource};
 
@@ -213,6 +213,25 @@ pub const NO_CHAT_REPLY: &str =
 /// The reply to a message from the owner that carries no text to answer — a
 /// sticker, a photo, a location.
 pub const NO_TEXT_REPLY: &str = "I can only read text messages.";
+
+/// One finished turn as the single message the phone gets.
+///
+/// A [`ChatTurn`] can carry both an answer and a note, and the note is the
+/// only place the owner is told that the day's session budget is spent — that
+/// triage has stopped scoring and the next briefing will not be written. Taking
+/// one field and discarding the other (`reply.or(note)`) silently drops that,
+/// on the surface the owner is most likely to be reading from and least likely
+/// to run `ea status` from. So both are shown: the answer first, then the note
+/// under it, separated by a blank line and marked with a dash so it reads as
+/// the daemon's aside rather than part of the answer.
+fn rendered_turn(turn: ChatTurn) -> String {
+    match (turn.reply, turn.note) {
+        (Some(reply), Some(note)) => format!("{reply}\n\n— {note}"),
+        (Some(reply), None) => reply,
+        (None, Some(note)) => note,
+        (None, None) => "I had nothing to say.".to_string(),
+    }
+}
 
 /// A parsed button press. Constructed only by [`parse_callback`], so an
 /// unparseable payload cannot reach the store at all.
@@ -421,10 +440,7 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
         };
 
         match chat.respond(SURFACE_TELEGRAM, text).await {
-            Ok(turn) => turn
-                .reply
-                .or(turn.note)
-                .unwrap_or_else(|| "I had nothing to say.".to_string()),
+            Ok(turn) => rendered_turn(turn),
             Err(err) => {
                 // The detail goes to the log; the phone gets a sentence. A
                 // failed turn stored no reply, so saying "it failed" is the
@@ -1114,6 +1130,23 @@ record_voucher = "approve"
         fn answering(reply: &str) -> Arc<Self> {
             Arc::new(Self {
                 reply: Some(reply.to_string()),
+                ..Default::default()
+            })
+        }
+
+        /// A turn that answered *and* has something the owner needs told —
+        /// the over-budget turn.
+        fn answering_with_note(reply: &str, note: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Some(reply.to_string()),
+                note: Some(note.to_string()),
+                ..Default::default()
+            })
+        }
+
+        fn noting(note: &str) -> Arc<Self> {
+            Arc::new(Self {
+                note: Some(note.to_string()),
                 ..Default::default()
             })
         }
@@ -2226,6 +2259,48 @@ record_voucher = "approve"
             chat.seen().is_empty(),
             "nothing to answer, nothing recorded"
         );
+    }
+
+    /// The over-budget turn: `ChatService::say` answers the owner *and*
+    /// attaches the note saying the day's session budget is spent, so triage
+    /// has stopped scoring and no briefing will be written. The phone is the
+    /// surface the owner is most likely to be on and least likely to run `ea
+    /// status` from, so it must show both. Taking the reply and dropping the
+    /// note leaves the owner crossing a spending bound they were never told
+    /// about.
+    #[tokio::test]
+    async fn an_over_budget_turn_shows_the_owner_the_note_as_well_as_the_reply() {
+        let (f, _chat) = chat_fixture(FakeChat::answering_with_note(
+            "the tenta is on the 14th",
+            "answered anyway, but the daily session budget of 60 is spent",
+        ));
+
+        let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
+
+        assert!(
+            reply.contains("the tenta is on the 14th"),
+            "the answer must still be there: {reply}"
+        );
+        assert!(
+            reply.contains("the daily session budget of 60 is spent"),
+            "the note must reach the phone too: {reply}"
+        );
+        assert!(
+            reply.find("the tenta").unwrap() < reply.find("answered anyway").unwrap(),
+            "the note is appended after the answer, not interleaved: {reply}"
+        );
+    }
+
+    /// And a turn with only a note still shows it: that is the no-reply case.
+    #[tokio::test]
+    async fn a_turn_with_only_a_note_still_shows_the_note() {
+        let (f, _chat) = chat_fixture(FakeChat::noting(
+            "recorded, but this daemon has no session runner",
+        ));
+
+        let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
+
+        assert!(reply.contains("no session runner"), "{reply}");
     }
 
     /// A session that failed stored no assistant message, so the phone is told

@@ -173,15 +173,20 @@ async fn converse(client: &Client) -> anyhow::Result<()> {
     }
 }
 
-/// The line to print for one turn: the reply, or the daemon's note about why
-/// there is not one. Pure, so both cases are testable without a daemon.
+/// What to print for one turn: the reply, the daemon's note, or — when the
+/// turn carries both — the reply with the note under it.
+///
+/// A turn answered over the day's session budget is exactly that both case,
+/// and the note is the only place the owner is told background triage has
+/// stopped scoring and the next briefing will not be written. Returning early
+/// on the reply threw that away. Pure, so every case is testable without a
+/// daemon.
 fn chat_answer(value: &Value) -> String {
-    if let Some(reply) = value["reply"].as_str() {
-        return reply.to_string();
-    }
-    match value["note"].as_str() {
-        Some(note) => format!("(no reply: {note})"),
-        None => format!("(no reply: {value})"),
+    match (value["reply"].as_str(), value["note"].as_str()) {
+        (Some(reply), Some(note)) => format!("{reply}\n\n({note})"),
+        (Some(reply), None) => reply.to_string(),
+        (None, Some(note)) => format!("(no reply: {note})"),
+        (None, None) => format!("(no reply: {value})"),
     }
 }
 
@@ -373,5 +378,31 @@ mod tests {
         assert!(no_runner.contains("no session runner"), "{no_runner}");
         // Neither field: still a line, never a panic.
         assert!(chat_answer(&json!({})).contains("no reply"));
+    }
+
+    /// The over-budget turn carries both: the answer the owner asked for and
+    /// the note that the day's session budget is spent, so background triage
+    /// has stopped scoring and no briefing will be written. Printing the reply
+    /// and dropping the note is what let the owner keep crossing a spending
+    /// bound without being told.
+    #[test]
+    fn an_over_budget_turn_prints_the_note_as_well_as_the_reply() {
+        let answered = chat_answer(&json!({
+            "reply": "the tenta is on the 14th",
+            "note": "answered anyway, but the daily session budget of 60 is spent",
+        }));
+
+        assert!(
+            answered.contains("the tenta is on the 14th"),
+            "the answer must still be there: {answered}"
+        );
+        assert!(
+            answered.contains("the daily session budget of 60 is spent"),
+            "the note must be printed too: {answered}"
+        );
+        assert!(
+            answered.find("the tenta").unwrap() < answered.find("answered anyway").unwrap(),
+            "the note comes after the answer, not interleaved: {answered}"
+        );
     }
 }
