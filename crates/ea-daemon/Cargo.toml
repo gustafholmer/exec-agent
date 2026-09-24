@@ -25,7 +25,9 @@ rmcp.workspace = true
 toml.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true
+wiremock.workspace = true

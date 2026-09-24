@@ -1,0 +1,1061 @@
+//! Telegram: the daemon's one channel to the human, and the human's one way
+//! back.
+//!
+//! Two things happen here and they are deliberately separated.
+//!
+//! * **The decision logic** — [`Notifier`] — turns an action id into a message
+//!   with two buttons, and turns a button press back into a store transition,
+//!   possibly an execution, and a sentence a person can read. It never touches
+//!   the network: it talks to a [`Transport`].
+//! * **The wire** — [`TelegramTransport`] — is the only thing in this file that
+//!   opens a socket, and it is the only thing that holds the bot token.
+//!
+//! That split is the point. Everything worth getting wrong is in the first
+//! part, and the first part is testable against a fake with no network.
+//!
+//! # Why a direct Bot API call and not `teloxide`
+//!
+//! The workspace originally pinned `teloxide = "0.13"`. That version exists,
+//! but it is four minor releases stale (0.17.0 is current), and 0.17 does not
+//! build on this toolchain at all: it pulls `takecell 0.1.2`, which requires
+//! rustc 1.96, and ours is 1.93. Making it build needs a `--precise` downgrade
+//! of a transitive dependency recorded in `Cargo.lock` — a pin that the next
+//! `cargo update` quietly undoes.
+//!
+//! The weight is the other half of it. `teloxide` with default features locks
+//! 210 packages and brings `native-tls`/`openssl-sys` with it. This workspace
+//! deliberately uses `reqwest` with `default-features = false` and `rustls-tls`
+//! so that a daemon holding OAuth tokens for accounting and mail links no C
+//! TLS stack; Cargo's feature unification would have applied `teloxide`'s
+//! choice to our `reqwest` too.
+//!
+//! And none of what `teloxide` is actually *for* is used here. Its value is the
+//! dispatcher, `dptree`, the update listener and the command macros. This
+//! module sends one message with two inline buttons and is handed callback data
+//! as a `&str` by whatever owns the update loop. That is one HTTP POST, and it
+//! is written below in about forty lines against `reqwest`, which is already a
+//! workspace dependency.
+//!
+//! # Exactly-once, when the human taps twice
+//!
+//! A Telegram inline button is trivially double-tappable, and the actions
+//! behind it post real vouchers. Two concurrent `approve:<id>` callbacks must
+//! produce exactly one connector call.
+//!
+//! This module adds **no** new lock for that, on purpose. Two layers already
+//! stand behind it, and a third in front would only be a fourth thing to get
+//! out of step:
+//!
+//! 1. [`ActionStore::approve`] is a single conditional `UPDATE ... WHERE
+//!    status = 'proposed'`. Exactly one of two concurrent callbacks changes a
+//!    row; the other gets an error. That is the claim, and it survives a
+//!    restart between the two taps in a way an in-memory set cannot.
+//! 2. [`Executor`] then takes its own in-flight claim and, immediately before
+//!    the connector call, the durable [`ActionStore::claim_for_execution`].
+//!
+//! What this module owes is the *reply*. The loser of the race must not be
+//! shown a raw `anyhow` string — "action 7 is approved, not proposed; cannot
+//! move to approved" is a sentence for a log, not for a person holding a phone.
+//! So a failed transition is never reported as a failure directly: the row is
+//! read back and the reply describes the state it is actually in. See
+//! [`Notifier::already_handled`].
+//!
+//! # The token, and data arriving from the network
+//!
+//! The bot token is a bearer credential for the entire bot: anyone holding it
+//! can read every message sent to it and send as it. It is read from
+//! `~/.config/exec-agent/telegram.token`, which must be mode `0600`; it is
+//! never in the repo, never logged, and never in an error message. The last one
+//! is not free — the token sits in the Bot API *URL path*, and `reqwest`'s
+//! errors carry the URL, so every error path here goes through
+//! [`reqwest::Error::without_url`].
+//!
+//! Callback data arrives from Telegram, which means it arrives from the
+//! network. [`parse_callback`] contains no `unwrap`, no slicing, and no
+//! `parse` whose failure is not handled; anything unrecognised is a no-op with
+//! a polite reply.
+
+use std::fmt;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{anyhow, bail, Context};
+use ea_core::store::actions::{ActionStatus, ActionStore};
+
+use crate::executor::{Executor, ToolCaller};
+
+/// Callback-data verb for the approve button.
+pub const APPROVE: &str = "approve";
+
+/// Callback-data verb for the reject button.
+pub const REJECT: &str = "reject";
+
+/// Telegram rejects a `sendMessage` whose text exceeds 4096 UTF-16 code units.
+/// Budgeted conservatively in bytes, which is never an over-estimate.
+const MAX_MESSAGE_BYTES: usize = 3800;
+
+/// The filename under the config directory holding the bot token.
+pub const TOKEN_FILE: &str = "telegram.token";
+
+/// The filename under the config directory holding the owner's chat id.
+pub const CHAT_ID_FILE: &str = "telegram.chat_id";
+
+/// The public Bot API.
+pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
+/// Somewhere a message with buttons can be sent.
+///
+/// `buttons` is `(label, callback_data)` in display order; an empty slice is a
+/// plain message. The lifetime-free `-> impl Future + Send` spelling rather
+/// than `async fn` is deliberate: a bare `async fn` in a public trait trips
+/// `async_fn_in_trait`, which this workspace builds with `-D warnings`, and the
+/// explicit `Send` bound is what lets a `Notifier` be driven from a spawned
+/// task. Same shape as [`crate::executor::ToolCaller`].
+pub trait Transport {
+    fn send(
+        &self,
+        text: &str,
+        buttons: &[(String, String)],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Turns actions into messages and button presses back into decisions.
+pub struct Notifier<T: Transport, C: ToolCaller> {
+    transport: T,
+    actions: ActionStore,
+    executor: Arc<Executor<C>>,
+}
+
+/// A parsed button press. Constructed only by [`parse_callback`], so an
+/// unparseable payload cannot reach the store at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Callback {
+    Approve(i64),
+    Reject(i64),
+}
+
+/// Parse `approve:<id>` / `reject:<id>`, or `None`.
+///
+/// Everything here is total. `split_once` returns an `Option` rather than
+/// indexing; the id goes through `i64::from_str`, whose overflow and
+/// non-numeric cases are `Err` and not a panic; and an id is required to be
+/// positive because SQLite rowids are, so `0` and negatives are refused before
+/// they reach a query. Anything else — an unknown verb, no colon, an empty
+/// payload, a second colon — is `None`, which the caller answers politely.
+fn parse_callback(data: &str) -> Option<Callback> {
+    let (verb, rest) = data.split_once(':')?;
+    let id: i64 = rest.parse().ok()?;
+    if id <= 0 {
+        return None;
+    }
+    match verb {
+        APPROVE => Some(Callback::Approve(id)),
+        REJECT => Some(Callback::Reject(id)),
+        _ => None,
+    }
+}
+
+/// Cut `s` to at most `max` bytes without splitting a character.
+///
+/// `&s[..max]` panics when `max` lands inside a multi-byte character, and a
+/// preview containing a name with an accent in the wrong column is exactly how
+/// that ships.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= max)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &s[..end])
+}
+
+impl<T: Transport, C: ToolCaller> Notifier<T, C> {
+    pub fn new(transport: T, actions: ActionStore, executor: Arc<Executor<C>>) -> Self {
+        Self {
+            transport,
+            actions,
+            executor,
+        }
+    }
+
+    /// Send a plain message with no buttons.
+    pub async fn notify(&self, text: &str) -> anyhow::Result<()> {
+        self.transport
+            .send(&truncate(text, MAX_MESSAGE_BYTES), &[])
+            .await
+    }
+
+    /// Put a proposed action in front of the human with Approve and Reject.
+    ///
+    /// Refuses anything not currently `proposed`: buttons on an action that has
+    /// already been decided are an invitation to a confusing second decision,
+    /// and the only honest thing to show is nothing.
+    pub async fn push_action(&self, id: i64) -> anyhow::Result<()> {
+        let action = self
+            .actions
+            .get(id)?
+            .ok_or_else(|| anyhow!("action {id} does not exist"))?;
+        if action.status != ActionStatus::Proposed {
+            bail!(
+                "action {id} is {}, not proposed; it has already been decided",
+                action.status.as_str()
+            );
+        }
+
+        let text = truncate(
+            &format!(
+                "Approve this action?\n\n#{id} · {}.{}\n\n{}\n\nWhy: {}\n\nExpires: {}",
+                action.connector, action.tool, action.preview, action.rationale, action.expires_at,
+            ),
+            MAX_MESSAGE_BYTES,
+        );
+        let buttons = vec![
+            ("Approve".to_string(), format!("{APPROVE}:{id}")),
+            ("Reject".to_string(), format!("{REJECT}:{id}")),
+        ];
+
+        self.transport.send(&text, &buttons).await
+    }
+
+    /// Handle one button press and return what to show the human.
+    ///
+    /// Infallible by design: this answers a callback query, and every outcome —
+    /// including a malformed payload or a store fault — has to come back as
+    /// something displayable. Failures are logged with their detail and
+    /// reported to the human in general terms.
+    pub async fn handle_callback(&self, data: &str) -> String {
+        match parse_callback(data) {
+            Some(Callback::Approve(id)) => self.approve(id).await,
+            Some(Callback::Reject(id)) => self.reject(id),
+            None => {
+                // Not an error: old buttons from a previous build, or someone
+                // poking the bot. Deliberately does not echo `data` back.
+                tracing::debug!("ignoring unrecognised telegram callback data");
+                "That button is not one I recognise. Nothing was done.".to_string()
+            }
+        }
+    }
+
+    /// Approve and execute.
+    ///
+    /// The `proposed -> approved` transition *is* the claim: one conditional
+    /// UPDATE, so of two concurrent taps exactly one proceeds to the executor.
+    /// No extra lock here — see the module docs.
+    async fn approve(&self, id: i64) -> String {
+        if let Err(err) = self.actions.approve(id) {
+            // Almost always the losing half of a double tap, occasionally an
+            // expired proposal. Either way the row itself is the authority on
+            // what to say, so read it rather than surfacing this error.
+            tracing::debug!(action = id, error = %err, "approve transition did not apply");
+            return self.already_handled(id);
+        }
+
+        match self.executor.execute_approved(id).await {
+            Ok(action) => match action.status {
+                ActionStatus::Executed => format!("Executed #{id}."),
+                ActionStatus::Failed => format!(
+                    "#{id} was approved, but the connector refused it. Nothing changed on their side."
+                ),
+                other => format!("#{id} is now {}.", other.as_str()),
+            },
+            Err(err) => {
+                tracing::warn!(action = id, error = %err, "approved action failed to execute");
+                format!("#{id} was approved but could not be run. Check `ea actions`.")
+            }
+        }
+    }
+
+    /// Reject. Nothing is executed and the connector is never reached — there
+    /// is no call to the executor on this path at all.
+    fn reject(&self, id: i64) -> String {
+        match self.actions.reject(id, "rejected from Telegram") {
+            Ok(_) => format!("Rejected #{id}. Nothing was called."),
+            Err(err) => {
+                tracing::debug!(action = id, error = %err, "reject transition did not apply");
+                self.already_handled(id)
+            }
+        }
+    }
+
+    /// The sentence shown when a transition did not apply.
+    ///
+    /// This is the double-tap loser's reply, and the reason it reads the row
+    /// back instead of formatting the transition error: a person holding a
+    /// phone needs "already handled", not a status-machine diagnostic.
+    fn already_handled(&self, id: i64) -> String {
+        match self.actions.get(id) {
+            Ok(Some(action)) => match action.status {
+                // The transition failed but the row still looks decidable.
+                // Rare — a store fault rather than a race.
+                ActionStatus::Proposed => {
+                    format!("#{id} could not be updated just now. Try again.")
+                }
+                ActionStatus::Approved => {
+                    format!("#{id} was already approved — it is being handled now.")
+                }
+                ActionStatus::Executed => format!("#{id} was already handled: it ran."),
+                ActionStatus::Rejected => format!("#{id} was already handled: rejected."),
+                ActionStatus::Failed => {
+                    format!("#{id} was already handled: it ran and failed.")
+                }
+                ActionStatus::Expired => {
+                    format!("#{id} expired before anyone decided. Nothing was done.")
+                }
+            },
+            Ok(None) => format!("#{id} is not an action I know about."),
+            Err(err) => {
+                tracing::warn!(action = id, error = %err, "could not read action back");
+                format!("#{id} could not be looked up just now.")
+            }
+        }
+    }
+}
+
+/// Where the bot's credentials live, once read.
+///
+/// Deliberately has no `Debug` derive and no `Display`: the whole point of the
+/// type is that the token inside it never reaches an output stream by accident.
+pub struct TelegramConfig {
+    token: String,
+    pub chat_id: i64,
+}
+
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
+}
+
+/// Read a secret file, insisting it is not readable by anyone else.
+///
+/// The mode check is not decoration. A bot token in a world-readable file in a
+/// shared home directory is a credential handed to every process on the box,
+/// and the failure is silent. Note what the error messages contain: the path,
+/// never the contents.
+fn read_secret(path: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} is mode {mode:04o}; it holds a credential and must be 0600 \
+             (run: chmod 600 {})",
+            path.display(),
+            path.display()
+        );
+    }
+
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value = raw.trim().to_string();
+    if value.is_empty() {
+        bail!("{} is empty", path.display());
+    }
+    Ok(value)
+}
+
+impl TelegramConfig {
+    /// Load from `~/.config/exec-agent` (or `$EA_CONFIG_DIR`).
+    pub fn load() -> anyhow::Result<Self> {
+        Self::load_from(&ea_core::paths::config_dir())
+    }
+
+    /// Load from an explicit directory. Used by tests, and by anyone running
+    /// more than one bot out of one checkout.
+    pub fn load_from(dir: &Path) -> anyhow::Result<Self> {
+        let token_path: PathBuf = dir.join(TOKEN_FILE);
+        let token = read_secret(&token_path)?;
+
+        // The token goes into the Bot API *URL path*. A stray `/` or `?` in it
+        // would not be a bad credential, it would be a request to a different
+        // endpoint, so the charset is checked rather than trusted. The error
+        // says which file, and does not quote what was in it.
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+        {
+            bail!(
+                "{} does not look like a Telegram bot token (unexpected characters)",
+                token_path.display()
+            );
+        }
+
+        let chat_path = dir.join(CHAT_ID_FILE);
+        let chat_raw = std::fs::read_to_string(&chat_path)
+            .with_context(|| format!("reading {}", chat_path.display()))?;
+        let chat_id: i64 = chat_raw
+            .trim()
+            .parse()
+            .with_context(|| format!("{} must contain a numeric chat id", chat_path.display()))?;
+
+        Ok(Self { token, chat_id })
+    }
+}
+
+/// The wire. The only thing in this module that opens a socket, and the only
+/// thing that holds the token.
+pub struct TelegramTransport {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+    chat_id: i64,
+}
+
+impl fmt::Debug for TelegramTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramTransport")
+            .field("base", &self.base)
+            .field("token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
+}
+
+impl TelegramTransport {
+    pub fn new(token: impl Into<String>, chat_id: i64) -> Self {
+        Self::with_base_url(DEFAULT_API_BASE, token, chat_id)
+    }
+
+    pub fn from_config(config: &TelegramConfig) -> Self {
+        Self::new(config.token.clone(), config.chat_id)
+    }
+
+    /// Point at a different Bot API origin. Telegram publishes a self-hostable
+    /// Bot API server, and this is also how the transport is exercised against
+    /// a local stub without ever reaching Telegram.
+    pub fn with_base_url(base: impl Into<String>, token: impl Into<String>, chat_id: i64) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: base.into().trim_end_matches('/').to_string(),
+            token: token.into(),
+            chat_id,
+        }
+    }
+}
+
+impl Transport for TelegramTransport {
+    fn send(
+        &self,
+        text: &str,
+        buttons: &[(String, String)],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        let url = format!("{}/bot{}/sendMessage", self.base, self.token);
+
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": truncate(text, MAX_MESSAGE_BYTES),
+        });
+        if !buttons.is_empty() {
+            let row: Vec<_> = buttons
+                .iter()
+                .map(|(label, data)| serde_json::json!({ "text": label, "callback_data": data }))
+                .collect();
+            body["reply_markup"] = serde_json::json!({ "inline_keyboard": [row] });
+        }
+
+        let request = self.http.post(url).json(&body);
+
+        async move {
+            // `without_url` on every error path: the URL is
+            // `https://api.telegram.org/bot<TOKEN>/sendMessage`, and reqwest
+            // puts it in `Display`. Without this the token lands in the first
+            // log line written after the network hiccups.
+            let response = request
+                .send()
+                .await
+                .map_err(|err| err.without_url())
+                .context("sending a Telegram message")?;
+
+            let status = response.status();
+            if !status.is_success() {
+                // Telegram's error body is `{"ok":false,"description":...}` and
+                // does not echo the token, but it is truncated anyway rather
+                // than pasted whole into a log.
+                let detail = response
+                    .text()
+                    .await
+                    .map(|body| truncate(&body, 300))
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                bail!("Telegram refused the message: HTTP {status}: {detail}");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use ea_core::policy::Policy;
+    use ea_core::store::actions::ProposeInput;
+    use ea_core::store::runs::RunStore;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// What a transport was asked to send: the body, and the buttons as
+    /// `(label, callback_data)`.
+    type Sent = (String, Vec<(String, String)>);
+
+    #[derive(Clone, Default)]
+    struct FakeTransport {
+        sent: Arc<Mutex<Vec<Sent>>>,
+    }
+
+    impl Transport for FakeTransport {
+        fn send(
+            &self,
+            text: &str,
+            buttons: &[(String, String)],
+        ) -> impl Future<Output = anyhow::Result<()>> + Send {
+            let record = (text.to_string(), buttons.to_vec());
+            let sent = self.sent.clone();
+            async move {
+                sent.lock().unwrap().push(record);
+                Ok(())
+            }
+        }
+    }
+
+    /// Records every connector call. The assertion that matters throughout this
+    /// module is on the *length* of this vector: "the connector was reached
+    /// exactly once" is not provable from a status column alone.
+    #[derive(Clone, Default)]
+    struct FakeCaller {
+        calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+        /// Held across the await so that two concurrent approvals genuinely
+        /// overlap rather than completing one after the other in a single poll.
+        delay: Duration,
+    }
+
+    impl ToolCaller for FakeCaller {
+        fn call(
+            &self,
+            connector: &str,
+            tool: &str,
+            args: Value,
+        ) -> impl Future<Output = anyhow::Result<String>> + Send {
+            let calls = self.calls.clone();
+            let delay = self.delay;
+            let record = (connector.to_string(), tool.to_string(), args);
+            async move {
+                calls.lock().unwrap().push(record);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok("done".to_string())
+            }
+        }
+    }
+
+    fn policy() -> Policy {
+        Policy::parse(
+            r#"
+[fortnox]
+record_voucher = "approve"
+"#,
+        )
+        .unwrap()
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        notifier: Notifier<FakeTransport, FakeCaller>,
+        sent: Arc<Mutex<Vec<Sent>>>,
+        calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+        actions: ActionStore,
+    }
+
+    fn fixture_with_delay(delay: Duration) -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(
+            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+        ));
+
+        let transport = FakeTransport::default();
+        let sent = transport.sent.clone();
+        let caller = FakeCaller {
+            delay,
+            ..Default::default()
+        };
+        let calls = caller.calls.clone();
+
+        let executor = Arc::new(Executor::new(
+            ActionStore::new(conn.clone()),
+            RunStore::new(conn.clone()),
+            policy(),
+            caller,
+        ));
+
+        Fixture {
+            _dir: dir,
+            notifier: Notifier::new(transport, ActionStore::new(conn.clone()), executor),
+            sent,
+            calls,
+            actions: ActionStore::new(conn),
+        }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with_delay(Duration::ZERO)
+    }
+
+    fn propose(actions: &ActionStore) -> i64 {
+        actions
+            .propose(ProposeInput {
+                connector: "fortnox".into(),
+                tool: "record_voucher".into(),
+                args: serde_json::json!({ "amount": 4200 }),
+                preview: "Record voucher 4200 SEK to 5410 Consumables".into(),
+                rationale: "the receipt arrived by mail".into(),
+                ttl: chrono::Duration::hours(24),
+            })
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn pushing_an_action_carries_the_preview_and_both_callback_ids() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        f.notifier.push_action(id).await.unwrap();
+
+        let sent = f.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "one message per proposal");
+        let (text, buttons) = &sent[0];
+
+        assert!(
+            text.contains("Record voucher 4200 SEK to 5410 Consumables"),
+            "the human decides on the preview, so it must be in the body: {text}"
+        );
+        assert!(text.contains("the receipt arrived by mail"), "{text}");
+
+        assert_eq!(
+            buttons,
+            &vec![
+                ("Approve".to_string(), format!("approve:{id}")),
+                ("Reject".to_string(), format!("reject:{id}")),
+            ],
+            "callback data is the whole protocol between the button and the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approve_callback_approves_and_executes() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        let reply = f.notifier.handle_callback(&format!("approve:{id}")).await;
+
+        assert!(reply.contains("Executed"), "{reply}");
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Executed
+        );
+
+        let calls = f.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "fortnox");
+        assert_eq!(calls[0].1, "record_voucher");
+        assert_eq!(calls[0].2["amount"], 4200);
+    }
+
+    #[tokio::test]
+    async fn a_reject_callback_rejects_and_never_reaches_the_connector() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        let reply = f.notifier.handle_callback(&format!("reject:{id}")).await;
+
+        assert!(reply.contains("Rejected"), "{reply}");
+        let action = f.actions.get(id).unwrap().unwrap();
+        assert_eq!(action.status, ActionStatus::Rejected);
+        assert!(action.reason.is_some(), "a rejection must record why");
+        assert!(
+            f.calls.lock().unwrap().is_empty(),
+            "a rejected action must make zero connector calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_id_answers_gracefully() {
+        let f = fixture();
+
+        let reply = f.notifier.handle_callback("approve:999999").await;
+
+        assert!(
+            reply.contains("not an action I know about"),
+            "expected a human sentence, got: {reply}"
+        );
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    /// Callback data is attacker-reachable input. Nothing in this list may
+    /// panic, and none of it may reach a connector.
+    #[tokio::test]
+    async fn malformed_callback_data_answers_gracefully() {
+        let f = fixture();
+        // A real action exists, so a payload that *nearly* parses cannot be
+        // dismissed just because the store is empty.
+        let id = propose(&f.actions);
+
+        let malformed = [
+            "",
+            ":",
+            "approve",
+            "approve:",
+            "approve:abc",
+            "approve:0",
+            "approve:-1",
+            // i64::MAX + 1, and a value with no chance of fitting anything
+            "approve:9223372036854775808",
+            "approve:99999999999999999999999999999999",
+            "approve:1.0",
+            "approve: 1",
+            "approve:1:2",
+            "reject:ö",
+            "APPROVE:1",
+            "delete:1",
+            "approve:1; DROP TABLE actions",
+            "🙂",
+            "approve:\u{0}1",
+        ];
+
+        for data in malformed {
+            let reply = f.notifier.handle_callback(data).await;
+            assert!(
+                reply.contains("not one I recognise"),
+                "{data:?} should be ignored politely, got: {reply}"
+            );
+        }
+
+        assert!(
+            f.calls.lock().unwrap().is_empty(),
+            "malformed callback data must never reach a connector"
+        );
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Proposed,
+            "and must never move a real action"
+        );
+    }
+
+    /// Review Focus #5. The human's thumb is faster than the network; two
+    /// `approve:<id>` callbacks for the same action arrive at once. Exactly one
+    /// voucher may be posted.
+    ///
+    /// The delay in the fake caller holds the first execution open across an
+    /// await point, so the second callback is genuinely evaluated while the
+    /// first is mid-flight. The loser must get a sentence with "already" in it,
+    /// not a transition diagnostic.
+    #[tokio::test]
+    async fn a_double_tapped_approve_executes_exactly_once() {
+        let f = fixture_with_delay(Duration::from_millis(50));
+        let id = propose(&f.actions);
+
+        // Bound to locals rather than inlined: `tokio::join!` holds both
+        // futures past the end of the statement, so a `&format!(..)` temporary
+        // in the argument would not live long enough.
+        let tap = format!("approve:{id}");
+        let (a, b) = tokio::join!(
+            f.notifier.handle_callback(&tap),
+            f.notifier.handle_callback(&tap)
+        );
+
+        assert_eq!(
+            f.calls.lock().unwrap().len(),
+            1,
+            "the connector must be called once: {a} / {b}"
+        );
+        let replies = format!("{a} {b}");
+        assert!(
+            replies.contains("already") || replies.contains("Executed"),
+            "{replies}"
+        );
+        assert!(
+            replies.contains("already"),
+            "the losing tap must be told it was already handled, not shown an \
+             error: {replies}"
+        );
+        assert!(
+            !replies.contains("cannot move to"),
+            "a raw store diagnostic reached the human: {replies}"
+        );
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Executed
+        );
+    }
+
+    /// The same race with the two taps spread across tokio worker threads,
+    /// so they can be running in the store at literally the same moment rather
+    /// than interleaving at await points on one thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_double_tapped_approve_executes_exactly_once_across_threads() {
+        let f = Arc::new(fixture_with_delay(Duration::from_millis(50)));
+        let id = propose(&f.actions);
+
+        let one = {
+            let f = f.clone();
+            tokio::spawn(async move { f.notifier.handle_callback(&format!("approve:{id}")).await })
+        };
+        let two = {
+            let f = f.clone();
+            tokio::spawn(async move { f.notifier.handle_callback(&format!("approve:{id}")).await })
+        };
+        let (a, b) = (one.await.unwrap(), two.await.unwrap());
+
+        assert_eq!(
+            f.calls.lock().unwrap().len(),
+            1,
+            "the connector must be called once: {a} / {b}"
+        );
+        assert!(format!("{a} {b}").contains("already"));
+    }
+
+    /// Approving something a human already rejected must not run it.
+    #[tokio::test]
+    async fn approving_an_already_rejected_action_changes_nothing() {
+        let f = fixture();
+        let id = propose(&f.actions);
+
+        f.notifier.handle_callback(&format!("reject:{id}")).await;
+        let reply = f.notifier.handle_callback(&format!("approve:{id}")).await;
+
+        assert!(reply.contains("already handled: rejected"), "{reply}");
+        assert!(f.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            f.actions.get(id).unwrap().unwrap().status,
+            ActionStatus::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn pushing_an_already_decided_action_is_refused() {
+        let f = fixture();
+        let id = propose(&f.actions);
+        f.actions.reject(id, "no").unwrap();
+
+        assert!(f.notifier.push_action(id).await.is_err());
+        assert!(
+            f.sent.lock().unwrap().is_empty(),
+            "no buttons on an action that is no longer decidable"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_sends_a_plain_message_with_no_buttons() {
+        let f = fixture();
+
+        f.notifier
+            .notify("digest: 3 things happened")
+            .await
+            .unwrap();
+
+        let sent = f.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "digest: 3 things happened");
+        assert!(sent[0].1.is_empty());
+    }
+
+    #[test]
+    fn truncate_never_splits_a_character() {
+        // Every prefix length of a string of multi-byte characters: the naive
+        // `&s[..max]` panics on most of these.
+        let s = "åäöéüñ🙂🙂🙂";
+        for max in 0..s.len() + 4 {
+            let out = truncate(s, max);
+            assert!(out.len() <= max + "…".len().max(s.len()));
+        }
+        assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    // --- the token, which must never leave the config directory ---
+
+    fn write_secret(dir: &Path, name: &str, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn the_token_is_read_from_a_private_file() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue-_x\n", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "-1001234567890\n", 0o600);
+
+        let config = TelegramConfig::load_from(dir.path()).unwrap();
+
+        assert_eq!(config.token, "123456:AAEtOkenValue-_x");
+        assert_eq!(config.chat_id, -1_001_234_567_890);
+    }
+
+    #[test]
+    fn a_world_readable_token_is_refused_and_not_echoed() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), TOKEN_FILE, "123456:AAEtOkenValue", 0o644);
+        write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+
+        let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
+
+        assert!(err.contains("0644"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+        assert!(
+            !err.contains("AAEtOkenValue"),
+            "the error leaked the token: {err}"
+        );
+    }
+
+    #[test]
+    fn a_token_with_url_metacharacters_is_refused_and_not_echoed() {
+        let dir = TempDir::new().unwrap();
+        // The token goes into the URL path; a `/` would silently retarget the
+        // request at a different endpoint.
+        write_secret(dir.path(), TOKEN_FILE, "123456:AA/../getUpdates", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+
+        let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
+
+        assert!(
+            err.contains("does not look like a Telegram bot token"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("getUpdates"),
+            "the error leaked the token: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_missing_token_is_an_error_not_a_blank_bot() {
+        let dir = TempDir::new().unwrap();
+        assert!(TelegramConfig::load_from(dir.path()).is_err());
+
+        write_secret(dir.path(), TOKEN_FILE, "   \n", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+        let err = format!("{:#}", TelegramConfig::load_from(dir.path()).unwrap_err());
+        assert!(err.contains("is empty"), "{err}");
+    }
+
+    #[test]
+    fn the_config_never_prints_the_token() {
+        let dir = TempDir::new().unwrap();
+        write_secret(dir.path(), TOKEN_FILE, "123456:SeCrEtValue", 0o600);
+        write_secret(dir.path(), CHAT_ID_FILE, "42", 0o600);
+
+        let config = TelegramConfig::load_from(dir.path()).unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("SeCrEtValue"), "{debug}");
+        assert!(debug.contains("redacted"), "{debug}");
+
+        let transport = TelegramTransport::from_config(&config);
+        let debug = format!("{transport:?}");
+        assert!(!debug.contains("SeCrEtValue"), "{debug}");
+    }
+
+    // --- the wire ---
+    //
+    // The transport is the one part of this module the fake cannot check, and
+    // the Bot API's JSON shape is the one thing about it that can be silently
+    // wrong: a message with `reply_markup` spelled anything else arrives with
+    // no buttons at all, and nothing in the daemon would ever notice. These two
+    // tests point it at a local stub. Nothing here reaches Telegram.
+
+    #[tokio::test]
+    async fn the_transport_posts_the_bot_api_shape_telegram_expects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:TOKEN/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .mount(&server)
+            .await;
+
+        let transport = TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42);
+        transport
+            .send(
+                "Approve this action?",
+                &[
+                    ("Approve".into(), "approve:7".into()),
+                    ("Reject".into(), "reject:7".into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let requests: Vec<Request> = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+        assert_eq!(body["chat_id"], -42);
+        assert_eq!(body["text"], "Approve this action?");
+        let row = &body["reply_markup"]["inline_keyboard"][0];
+        assert_eq!(row[0]["text"], "Approve");
+        assert_eq!(row[0]["callback_data"], "approve:7");
+        assert_eq!(row[1]["text"], "Reject");
+        assert_eq!(row[1]["callback_data"], "reject:7");
+    }
+
+    /// The token sits in the URL path, and `reqwest` puts the URL in its error
+    /// `Display`. A refused send must not be the thing that writes the bot's
+    /// bearer credential into the log.
+    #[tokio::test]
+    async fn a_refused_send_errors_without_leaking_the_token() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"ok":false,"description":"Unauthorized"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let transport = TelegramTransport::with_base_url(server.uri(), "123456:SeCrEtValue", 1);
+        let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
+
+        assert!(err.contains("401"), "{err}");
+        assert!(
+            !err.contains("SeCrEtValue"),
+            "the error leaked the token: {err}"
+        );
+    }
+
+    /// The same, for a transport error rather than an HTTP status: the server
+    /// is gone, so `reqwest` fails at the connection, which is the variant
+    /// whose `Display` carries the URL.
+    #[tokio::test]
+    async fn a_connection_failure_errors_without_leaking_the_token() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        drop(server);
+
+        let transport = TelegramTransport::with_base_url(uri, "123456:SeCrEtValue", 1);
+        let err = format!("{:#}", transport.send("hello", &[]).await.unwrap_err());
+
+        assert!(
+            !err.contains("SeCrEtValue"),
+            "the error leaked the token: {err}"
+        );
+    }
+}
