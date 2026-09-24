@@ -16,8 +16,14 @@
 //!
 //! [`domain::money`] holds the rounding rule everything else depends on;
 //! [`domain::bas`] holds the Swedish BAS chart of accounts.
+//!
+//! [`auth`] holds the OAuth flow and the rotating-refresh-token store, and
+//! [`errors`] the one error type it returns.
 
+pub mod auth;
 pub mod domain;
+pub mod errors;
 pub mod reporting;
 
 pub use domain::{bas, moms, money, posting, voucher};
+pub use errors::FortnoxError;

@@ -443,8 +443,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ea-core",
+ "reqwest",
  "rust_decimal",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
