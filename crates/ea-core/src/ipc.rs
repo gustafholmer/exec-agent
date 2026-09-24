@@ -62,6 +62,18 @@ impl Response {
 /// `ea chat` overrides this: a `claude -p` session legitimately takes minutes.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Methods whose timeout is more likely to mean "waiting its turn" than
+/// "wedged".
+///
+/// The daemon serialises chat: one turn holds a lock for its whole session, so
+/// a turn started in the terminal while a Telegram turn is running simply
+/// waits, and can pass this client's deadline while the daemon is perfectly
+/// healthy. Telling the owner to check the launchd log and restart at that
+/// moment is the wrong advice about the wrong problem — and a restart there
+/// kills the turn that *is* running. Every other method answers from the
+/// database in milliseconds, so a timeout on one of those really is a wedge.
+const QUEUEING_METHODS: [&str; 1] = ["chat"];
+
 /// A client for the daemon's unix-socket IPC server.
 ///
 /// Each `call` opens a fresh connection, sends a single request line, and
@@ -101,6 +113,20 @@ impl Client {
     ) -> anyhow::Result<serde_json::Value> {
         match tokio::time::timeout(self.timeout, self.exchange(method, params)).await {
             Ok(result) => result,
+            Err(_elapsed) if QUEUEING_METHODS.contains(&method) => anyhow::bail!(
+                "the daemon did not answer {method:?} within {:?} (socket: {}). \
+                 Turns run strictly one at a time, so the likeliest reason is that \
+                 this one is queued behind another turn — one started from Telegram, \
+                 say — not that the daemon is stuck. Do not restart it: a restart \
+                 here kills a turn that is working. \
+                 Worth knowing either way: the daemon finishes a queued turn even \
+                 though this client stopped waiting, so the conversation will end up \
+                 holding this question and an answer you never saw, and the next turn \
+                 continues from there. If nothing answers for several minutes, check \
+                 the launchd log at ~/.local/state/exec-agent/daemon.err.log.",
+                self.timeout,
+                self.socket_path.display(),
+            ),
             Err(_elapsed) => anyhow::bail!(
                 "the daemon did not answer {method:?} within {:?} (socket: {}). \
                  It is running but wedged; check the launchd log at \
@@ -202,6 +228,58 @@ mod tests {
         assert!(err.contains("did not answer"), "{err}");
         assert!(err.contains("approve"), "{err}");
         assert!(err.contains("wedged"), "{err}");
+        accepting.abort();
+    }
+
+    /// The finding: a `chat` turn that is merely *queued* got told the daemon
+    /// was wedged and that a restart was in order — the wrong diagnosis at the
+    /// moment it costs the most, because a restart there kills a turn that is
+    /// working. Turns run one at a time, so a CLI turn behind a slow Telegram
+    /// turn hits this deadline on a perfectly healthy daemon.
+    ///
+    /// The message must also say the second-order effect: the daemon finishes
+    /// the queued turn regardless, so the transcript ends up holding a question
+    /// and an answer the owner never saw on the CLI.
+    #[tokio::test]
+    async fn a_queued_chat_turn_is_not_reported_as_a_wedged_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("busy.sock");
+
+        // A daemon that accepts and is busy with somebody else's turn.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accepting = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = Client::with_timeout(&path, Duration::from_millis(200));
+        let err = client
+            .call("chat", serde_json::json!({ "message": "hi" }))
+            .await
+            .expect_err("the deadline still has to fire")
+            .to_string();
+
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(err.contains("chat"), "{err}");
+        assert!(
+            err.contains("queued"),
+            "a queued turn must be named as one: {err}"
+        );
+        assert!(
+            !err.contains("wedged"),
+            "the wedged-daemon diagnosis is wrong here: {err}"
+        );
+        assert!(
+            err.contains("Do not restart"),
+            "restarting kills the turn that is running: {err}"
+        );
+        assert!(
+            err.contains("an answer you never saw"),
+            "the owner has to be told the transcript will hold a Q&A they did \
+             not see: {err}"
+        );
         accepting.abort();
     }
 
