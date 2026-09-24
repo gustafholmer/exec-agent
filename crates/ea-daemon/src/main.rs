@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config_dir = ea_core::paths::config_dir();
     let state_dir = ea_core::paths::state_dir();
+
     let config = DaemonConfig::load_from(&config_dir)?;
     tracing::info!(?config, "configuration loaded");
 
@@ -74,7 +75,12 @@ async fn main() -> anyhow::Result<()> {
             "no connectors discovered: a directory needs both connector.toml and policy.toml"
         );
     }
-    let dirs: Vec<_> = manifests.iter().map(|m| m.dir.clone()).collect();
+    // Paired with the name from each `connector.toml`, so `load_dirs` can
+    // refuse a policy file that declares a section belonging to somebody else.
+    let dirs: Vec<(String, std::path::PathBuf)> = manifests
+        .iter()
+        .map(|m| (m.name.clone(), m.dir.clone()))
+        .collect();
     let policy = Policy::load_dirs(&dirs)?;
     let connector_names: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
     tracing::info!(connectors = ?connector_names, "loaded connectors and their policies");

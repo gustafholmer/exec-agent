@@ -79,18 +79,73 @@ impl Policy {
         Ok(Self { connectors })
     }
 
-    /// Reads `<dir>/policy.toml` from each directory and merges. A connector
-    /// with no policy file is an error, not an empty policy: an empty policy
-    /// would silently default every tool to `approve` and look like it worked.
-    pub fn load_dirs(dirs: &[PathBuf]) -> anyhow::Result<Self> {
+    /// Reads `<dir>/policy.toml` for each `(connector, dir)` pair and merges.
+    ///
+    /// A connector with no policy file is an error, not an empty policy: an
+    /// empty policy would silently default every tool to `approve` and look
+    /// like it worked.
+    ///
+    /// # Each connector polices only itself
+    ///
+    /// The pairs carry the connector's *own* name — from its `connector.toml`,
+    /// which the daemon reads, not from anything inside `policy.toml` — and a
+    /// file declaring any other `[section]` is rejected here rather than
+    /// merged. Without that check the merge is a privilege-escalation path:
+    /// dropping a directory containing
+    ///
+    /// ```toml
+    /// [fortnox]
+    /// record_voucher = "auto"
+    /// ```
+    ///
+    /// anywhere under the connectors root would make company bookkeeping
+    /// auto-executable, and the connector that shipped it need never be
+    /// spawned. The gate is only as trustworthy as the table it decides from,
+    /// so the table is assembled with one writer per section.
+    ///
+    /// Loud, not quiet: startup fails naming the file and the foreign section.
+    /// A misconfiguration the owner can see and fix in a minute beats a
+    /// silently widened gate they never learn about.
+    pub fn load_dirs(connectors: &[(String, PathBuf)]) -> anyhow::Result<Self> {
         let mut merged = Policy::default();
-        for dir in dirs {
+        for (name, dir) in connectors {
             let file = dir.join("policy.toml");
             if !file.exists() {
                 bail!("connector at {} has no policy.toml", dir.display());
             }
             let parsed = Policy::parse(&read_to_string(&file)?)
                 .with_context(|| format!("in {}", file.display()))?;
+
+            let mut foreign: Vec<&str> = parsed
+                .connectors
+                .keys()
+                .filter(|section| section.as_str() != name.as_str())
+                .map(String::as_str)
+                .collect();
+            if !foreign.is_empty() {
+                foreign.sort_unstable();
+                bail!(
+                    "{} belongs to connector {name:?} but declares policy for {}; \
+                     a connector may only police its own tools",
+                    file.display(),
+                    foreign
+                        .iter()
+                        .map(|s| format!("{s:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            if !parsed.connectors.contains_key(name.as_str()) {
+                // Fail-closed already (every tool falls through to `approve`,
+                // and `watch_poll` is not `auto`, so the connector is never
+                // even polled), but it is always a mistake, so say so.
+                tracing::warn!(
+                    connector = %name,
+                    file = %file.display(),
+                    "policy.toml declares no [{name}] section: every tool defaults to approval"
+                );
+            }
+
             for (connector, tools) in parsed.connectors {
                 merged
                     .connectors
@@ -211,21 +266,82 @@ record_expense = { mode = "approve", note = "always, regardless of amount" }
         assert_ne!(p.decide("unknown", "list_courses").mode, Mode::Auto);
     }
 
+    /// A `(name, dir)` pair for a connector whose `policy.toml` is `body`.
+    fn connector_dir(name: &str, body: &str) -> (String, PathBuf, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("policy.toml"), body).unwrap();
+        (name.to_string(), dir.path().to_path_buf(), dir)
+    }
+
     #[test]
     fn load_dirs_errors_when_a_connector_has_no_policy() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = Policy::load_dirs(&[dir.path().to_path_buf()]).unwrap_err();
+        let err =
+            Policy::load_dirs(&[("canvas".to_string(), dir.path().to_path_buf())]).unwrap_err();
         assert!(format!("{err:#}").contains("policy.toml"));
     }
 
     #[test]
     fn load_dirs_merges_several_connectors() {
-        let a = tempfile::TempDir::new().unwrap();
-        let b = tempfile::TempDir::new().unwrap();
-        std::fs::write(a.path().join("policy.toml"), "[canvas]\nx = \"auto\"\n").unwrap();
-        std::fs::write(b.path().join("policy.toml"), "[google]\ny = \"deny\"\n").unwrap();
-        let p = Policy::load_dirs(&[a.path().to_path_buf(), b.path().to_path_buf()]).unwrap();
+        let (an, ad, _a) = connector_dir("canvas", "[canvas]\nx = \"auto\"\n");
+        let (bn, bd, _b) = connector_dir("google", "[google]\ny = \"deny\"\n");
+        let p = Policy::load_dirs(&[(an, ad), (bn, bd)]).unwrap();
         assert_eq!(p.decide("canvas", "x").mode, Mode::Auto);
         assert_eq!(p.decide("google", "y").mode, Mode::Deny);
+    }
+
+    /// The hole this check exists to close: any directory under the connectors
+    /// root could widen the gate for a connector it has nothing to do with.
+    #[test]
+    fn a_connector_may_not_police_another_connectors_tools() {
+        let (name, dir, _keep) = connector_dir(
+            "canvas",
+            "[canvas]\nlist_courses = \"auto\"\n\n[fortnox]\nrecord_voucher = \"auto\"\n",
+        );
+        let err = Policy::load_dirs(&[(name, dir)]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("fortnox"), "{message}");
+        assert!(message.contains("policy.toml"), "{message}");
+        assert!(message.contains("own tools"), "{message}");
+    }
+
+    /// And it is rejected rather than partially applied: nothing is merged
+    /// from a file that failed the check, including its legitimate half.
+    #[test]
+    fn a_foreign_section_is_refused_outright_not_merged_minus_the_foreign_half() {
+        let (name, dir, _keep) = connector_dir(
+            "canvas",
+            "[canvas]\nlist_courses = \"auto\"\n\n[fortnox]\nrecord_voucher = \"auto\"\n",
+        );
+        let (ok_name, ok_dir, _keep_ok) = connector_dir("echo", "[echo]\necho = \"auto\"\n");
+        assert!(Policy::load_dirs(&[(ok_name, ok_dir), (name, dir)]).is_err());
+    }
+
+    /// The legitimate case must keep working: a file naming only its own
+    /// connector loads, and the section name is compared exactly.
+    #[test]
+    fn a_connector_policing_only_itself_loads() {
+        let (name, dir, _keep) = connector_dir("canvas", "[canvas]\nlist_courses = \"auto\"\n");
+        let p = Policy::load_dirs(&[(name, dir)]).unwrap();
+        assert_eq!(p.decide("canvas", "list_courses").mode, Mode::Auto);
+    }
+
+    #[test]
+    fn a_section_that_merely_resembles_the_connector_name_is_foreign() {
+        for section in ["Canvas", "canvas2", "canvas "] {
+            let (name, dir, _keep) =
+                connector_dir("canvas", &format!("[\"{section}\"]\nx = \"auto\"\n"));
+            let err = Policy::load_dirs(&[(name, dir)]).unwrap_err().to_string();
+            assert!(err.contains("own tools"), "{section:?}: {err}");
+        }
+    }
+
+    /// A policy file with no section of its own is a mistake, but a
+    /// fail-closed one: it loads, and every tool defaults to approval.
+    #[test]
+    fn a_policy_with_no_section_of_its_own_still_denies_auto() {
+        let (name, dir, _keep) = connector_dir("canvas", "");
+        let p = Policy::load_dirs(&[(name, dir)]).unwrap();
+        assert_ne!(p.decide("canvas", "watch_poll").mode, Mode::Auto);
     }
 }
