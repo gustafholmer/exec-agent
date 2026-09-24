@@ -559,6 +559,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ea-fortnox-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ea-core",
+ "ea-fortnox",
+ "rmcp",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "ea-google"
 version = "0.1.0"
 dependencies = [

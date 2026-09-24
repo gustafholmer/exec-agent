@@ -9,6 +9,7 @@ members = [
   "crates/ea-canvas",
   "crates/ea-google",
   "crates/ea-fortnox",
+  "crates/ea-fortnox-mcp",
 ]
 
 [workspace.package]
