@@ -108,10 +108,15 @@ pub const MAX_BREAKER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 ///   who learns to ignore this daemon's alerts has lost the safety property
 ///   the alerts exist for. But quiet hours are the wrong tool for it —
 ///   they fix the flap by suppressing the *first* message too, which is the
-///   one that mattered. The right tool is a bound on repetition, which is this
-///   constant: one message per trip, and at most one per job per six hours
-///   however often it re-trips. The realistic overnight worst case is one
-///   message per broken job per night.
+///   one that mattered. The right tool is a bound on repetition, which is
+///   this constant: at most one message per job per six hours *while it stays
+///   tripped* -- a half-open retry that fails again does not re-push. A
+///   connector that recovers and then breaks again is a new, genuine failure,
+///   not the flap this constant is guarding against, so closing the breaker
+///   re-arms the push; see `last_health_push`'s doc comment on
+///   [`JobState`]. The realistic overnight worst case is one message per
+///   broken job per night, unless it is actually flapping between up and
+///   down, in which case the owner hearing about each flap is the point.
 /// * The owner also has a direct, obvious control the daemon should not
 ///   second-guess: muting the Telegram chat. Choosing for them by withholding
 ///   a fault report is the more presumptuous of the two options.
@@ -190,10 +195,21 @@ struct JobState {
     /// success or on `reset`. This is what makes a tripped breaker visible
     /// to `ea status` instead of just a name with no explanation.
     last_error: Mutex<Option<String>>,
-    /// When this job last had a health push sent about it. Deliberately *not*
-    /// cleared by a success or by `reset`: it is a rate limit on the owner's
-    /// phone, and a job that recovers and breaks again twenty minutes later is
-    /// precisely the flap [`HEALTH_REPUSH_INTERVAL`] exists to damp.
+    /// When this job last had a health push *successfully sent* about it.
+    /// Cleared whenever the breaker closes -- by a successful half-open
+    /// attempt (see [`Scheduler::record_success`]) or by a manual
+    /// [`Scheduler::reset`] -- so a job that recovers and then breaks again is
+    /// treated as a new, genuine failure and pushed right away.
+    /// [`HEALTH_REPUSH_INTERVAL`] exists to stop a job that is *continuously*
+    /// tripped from nagging on every half-open retry, not to hide a second
+    /// real breakage; closing the breaker is what tells this window the first
+    /// failure is over.
+    ///
+    /// A failed send never sets this: burning the window on a push that never
+    /// reached the owner would silently cost them the one notification they
+    /// were going to get. Deliberately not cleared across a daemon restart --
+    /// an in-memory `Instant` cannot survive one, and a restart is itself a
+    /// signal worth re-notifying about, so that is acceptable as is.
     last_health_push: Mutex<Option<Instant>>,
 }
 
@@ -394,6 +410,9 @@ impl Scheduler {
         *lock(&state.last_error) = None;
         *lock(&state.cooldown) = self.breaker_cooldown;
         *lock(&state.last_started) = None;
+        // The breaker just closed by hand; see `last_health_push`'s doc
+        // comment for why that means the next trip is news again.
+        *lock(&state.last_health_push) = None;
         tracing::info!(job = name, "circuit breaker cleared by hand");
         true
     }
@@ -537,6 +556,10 @@ impl Scheduler {
         *lock(&state.last_error) = None;
         *lock(&state.cooldown) = initial_cooldown;
         if state.tripped.swap(false, Ordering::SeqCst) {
+            // The breaker just closed; see `last_health_push`'s doc comment
+            // for why that re-arms the push rather than leaving the window
+            // running.
+            *lock(&state.last_health_push) = None;
             tracing::info!(
                 job = %state.job.name,
                 "circuit breaker closed: the job recovered on its own"
@@ -591,13 +614,19 @@ impl Scheduler {
     /// Tell the owner their assistant has stopped doing something.
     ///
     /// Called only on the trip transition, and then only if no health push
-    /// went out about this job within [`HEALTH_REPUSH_INTERVAL`]. Quiet hours
-    /// are deliberately not consulted; the reasoning is on that constant.
+    /// *successfully sent* about this job within [`HEALTH_REPUSH_INTERVAL`]
+    /// -- the window is cleared whenever the breaker closes (see
+    /// `last_health_push`'s doc comment), so a job that recovers and breaks
+    /// again inside the window is still pushed. Quiet hours are deliberately
+    /// not consulted; the reasoning is on that constant.
     ///
-    /// A failed push is logged and dropped. The alternative -- retrying, or
-    /// failing the job -- would put an unreachable Telegram in the path of the
-    /// scheduler, and the trip is already recorded in `last_error` for
-    /// `ea status`.
+    /// The window is stamped only after `pusher.notify` succeeds. A failed
+    /// push is logged and dropped -- the alternative, retrying or failing the
+    /// job, would put an unreachable Telegram in the path of the scheduler,
+    /// and the trip is already recorded in `last_error` for `ea status` -- but
+    /// it must not also burn the one notification the owner was going to get:
+    /// leaving the window unstamped means the next trip tries again rather
+    /// than silently staying quiet for the rest of it.
     async fn report_trip(
         state: &JobState,
         tripped_now: bool,
@@ -607,18 +636,14 @@ impl Scheduler {
         if !tripped_now {
             return;
         }
-        {
-            let mut last = lock(&state.last_health_push);
-            if let Some(previous) = *last {
-                if now.saturating_duration_since(previous) < HEALTH_REPUSH_INTERVAL {
-                    tracing::warn!(
-                        job = %state.job.name,
-                        "breaker tripped again within the health-push window; not pushing again"
-                    );
-                    return;
-                }
+        if let Some(previous) = *lock(&state.last_health_push) {
+            if now.saturating_duration_since(previous) < HEALTH_REPUSH_INTERVAL {
+                tracing::warn!(
+                    job = %state.job.name,
+                    "breaker tripped again within the health-push window; not pushing again"
+                );
+                return;
             }
-            *last = Some(now);
         }
 
         let Some(pusher) = health.as_ref() else {
@@ -634,21 +659,29 @@ impl Scheduler {
             .unwrap_or_else(|| "no error was recorded".to_string());
         let wait = Self::wait_for(state, true);
         let text = format!(
-            "exec-agent has stopped running `{}`.
-
-{reason}
-
-It will try again by itself in              about {} minutes. `ea status` for the detail, `ea resume {}` to retry now.",
+            "exec-agent has stopped running `{}`.\n\n\
+             {reason}\n\n\
+             It will try again by itself in about {} minutes. \
+             `ea status` for the detail, `ea resume {}` to retry now.",
             state.job.name,
             wait.as_secs().div_ceil(60),
             state.job.name,
         );
-        if let Err(err) = pusher.notify(&text).await {
-            tracing::warn!(
-                job = %state.job.name,
-                error = %format!("{err:#}"),
-                "could not push the breaker-tripped alert"
-            );
+        debug_assert!(
+            !text.contains("  "),
+            "health-push text must not contain a double space: {text:?}"
+        );
+        match pusher.notify(&text).await {
+            Ok(()) => {
+                *lock(&state.last_health_push) = Some(now);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    job = %state.job.name,
+                    error = %format!("{err:#}"),
+                    "could not push the breaker-tripped alert"
+                );
+            }
         }
     }
 
@@ -1445,12 +1478,16 @@ mod tests {
     #[derive(Default)]
     struct HealthSpy {
         sent: Mutex<Vec<String>>,
-        fail: bool,
+        fail: AtomicBool,
     }
 
     impl HealthSpy {
         fn sent(&self) -> Vec<String> {
             lock(&self.sent).clone()
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -1459,7 +1496,7 @@ mod tests {
             &'a self,
             text: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
-            if self.fail {
+            if self.fail.load(Ordering::SeqCst) {
                 return Box::pin(async { Err(anyhow::anyhow!("telegram is unreachable")) });
             }
             lock(&self.sent).push(text.to_string());
@@ -1545,11 +1582,14 @@ mod tests {
         );
     }
 
-    /// A connector that recovers and breaks again twenty minutes later is a
-    /// flap, and a flap at 03:00 is worse than silence. One push per job per
-    /// [`HEALTH_REPUSH_INTERVAL`], however often it re-trips.
+    /// A connector that recovers and breaks again is a second, genuine
+    /// failure, not the kind of continuous nagging
+    /// [`HEALTH_REPUSH_INTERVAL`] exists to damp -- see that field's doc
+    /// comment. Recovering closes the breaker, which clears the window, so
+    /// the very next trip is pushed too even though it lands well inside the
+    /// window.
     #[tokio::test]
-    async fn a_flapping_job_is_pushed_once_per_window() {
+    async fn a_job_that_recovers_and_re_trips_inside_the_window_is_pushed_twice() {
         let sched = Scheduler::with_cooldown(1, Duration::from_secs(1), Duration::from_secs(1));
         let spy = with_health(&sched);
         let interval = Duration::from_secs(60);
@@ -1558,35 +1598,25 @@ mod tests {
 
         let t0 = Instant::now();
         await_all(sched.tick(t0)).await;
-        assert_eq!(spy.sent().len(), 1);
+        assert_eq!(spy.sent().len(), 1, "the first trip is pushed");
 
-        // Recovers, then breaks again twice inside the window.
-        let mut at = t0;
-        for _ in 0..2 {
-            healthy.store(true, Ordering::SeqCst);
-            at += interval;
-            await_all(sched.tick(at)).await;
-            assert!(!sched.is_tripped("canvas"));
-
-            healthy.store(false, Ordering::SeqCst);
-            at += interval;
-            await_all(sched.tick(at)).await;
-            assert!(sched.is_tripped("canvas"));
-        }
-        assert_eq!(
-            spy.sent().len(),
-            1,
-            "a flap must not machine-gun the owner's phone"
-        );
-
-        // Past the window, the next trip is news again.
+        // Recovers -- the breaker closes and clears the window.
         healthy.store(true, Ordering::SeqCst);
-        at += HEALTH_REPUSH_INTERVAL;
+        let mut at = t0 + interval;
         await_all(sched.tick(at)).await;
+        assert!(!sched.is_tripped("canvas"));
+
+        // ...then breaks again, well inside HEALTH_REPUSH_INTERVAL.
         healthy.store(false, Ordering::SeqCst);
         at += interval;
         await_all(sched.tick(at)).await;
-        assert_eq!(spy.sent().len(), 2);
+        assert!(sched.is_tripped("canvas"));
+
+        assert_eq!(
+            spy.sent().len(),
+            2,
+            "a genuine second failure must reach the owner, not be swallowed by the window"
+        );
     }
 
     /// Quiet hours are deliberately not consulted — see
@@ -1632,7 +1662,7 @@ mod tests {
         let sched = Scheduler::new(1);
         sched.set_health_pusher(Some(Arc::new(HealthSpy {
             sent: Mutex::new(Vec::new()),
-            fail: true,
+            fail: AtomicBool::new(true),
         }) as Arc<dyn Pusher>));
         let probe = Probe::new();
         sched.add(probe.err_job("canvas", Duration::from_secs(60)));
@@ -1641,6 +1671,51 @@ mod tests {
 
         assert!(sched.is_tripped("canvas"));
         assert_eq!(sched.last_error("canvas").as_deref(), Some("boom"));
+    }
+
+    /// A failed send must not burn the health-push window: the owner never
+    /// received the first attempt, so the next trip must still try, not find
+    /// the window already spent. Under the old, buggy behaviour the window
+    /// was stamped before the send even ran, so this second, genuine trip
+    /// would have found the window already "used" and stayed silent.
+    #[tokio::test]
+    async fn a_failed_send_does_not_burn_the_window() {
+        let sched = Scheduler::with_cooldown(1, Duration::from_secs(1), Duration::from_secs(1));
+        let spy = Arc::new(HealthSpy {
+            sent: Mutex::new(Vec::new()),
+            fail: AtomicBool::new(true),
+        });
+        sched.set_health_pusher(Some(Arc::clone(&spy) as Arc<dyn Pusher>));
+        let interval = Duration::from_secs(60);
+        let (job, healthy, _calls) = flaky_job("canvas", interval);
+        sched.add(job);
+
+        let t0 = Instant::now();
+        await_all(sched.tick(t0)).await;
+        assert!(sched.is_tripped("canvas"));
+        assert!(
+            spy.sent().is_empty(),
+            "the send failed, so nothing reached the owner"
+        );
+
+        // Recovers, then breaks again well inside HEALTH_REPUSH_INTERVAL --
+        // Telegram is back up for this second, genuine trip.
+        healthy.store(true, Ordering::SeqCst);
+        let mut at = t0 + interval;
+        await_all(sched.tick(at)).await;
+        assert!(!sched.is_tripped("canvas"));
+
+        spy.set_fail(false);
+        healthy.store(false, Ordering::SeqCst);
+        at += interval;
+        await_all(sched.tick(at)).await;
+        assert!(sched.is_tripped("canvas"));
+
+        assert_eq!(
+            spy.sent().len(),
+            1,
+            "the next attempt must still push, since the failed one never did"
+        );
     }
 
     /// Without Telegram the daemon still runs; the trip is recorded, and only

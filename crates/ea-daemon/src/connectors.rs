@@ -97,6 +97,11 @@ fn default_watch_interval_secs() -> u64 {
 /// no policy is deliberately *not* a connector -- an unpoliced connector would
 /// be a hole in the gate -- and is skipped rather than reported.
 ///
+/// Two things fail loudly rather than being tolerated: a manifest whose
+/// declared `name` does not match its directory's basename, and two manifests
+/// declaring the same name. Both are startup errors -- see the comments on
+/// [`load_manifest`] and further down in this function for why.
+///
 /// Results are sorted by name so discovery order is deterministic.
 pub fn discover(root: &Path) -> Result<Vec<ConnectorManifest>> {
     let mut found = Vec::new();
@@ -127,7 +132,34 @@ pub fn discover(root: &Path) -> Result<Vec<ConnectorManifest>> {
         found.push(load_manifest(&manifest_path)?);
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
+    reject_duplicate_names(&found)?;
     Ok(found)
+}
+
+/// Refuse two connectors that declare the same name.
+///
+/// The name/directory check in [`load_manifest`] already makes this
+/// unreachable for a single `root` on any real filesystem -- two entries in
+/// one directory cannot share a basename, so they cannot share a declared
+/// name either. This check stays anyway, as the second half of closing this
+/// bug class for good: it is what actually stops `Registry::new`'s `HashMap`
+/// from silently keeping whichever manifest it builds last, and it keeps
+/// doing that even if `discover` later grows a second source of manifests
+/// (another root, a flattened config) that the name/directory check does not
+/// cover. `found` is expected sorted by name, so duplicates are adjacent.
+fn reject_duplicate_names(found: &[ConnectorManifest]) -> Result<()> {
+    for pair in found.windows(2) {
+        if pair[0].name == pair[1].name {
+            bail!(
+                "two connectors both declare name {:?}: {} and {}; \
+                 connector names must be unique",
+                pair[0].name,
+                pair[0].dir.display(),
+                pair[1].dir.display(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_manifest(path: &Path) -> Result<ConnectorManifest> {
@@ -144,6 +176,24 @@ fn load_manifest(path: &Path) -> Result<ConnectorManifest> {
     }
     if raw.command.trim().is_empty() {
         bail!("manifest {} has an empty command", path.display());
+    }
+    // The declared name is what `Policy::load_dirs` trusts as "this
+    // connector's own section" -- see its doc comment. If a directory could
+    // declare any name it likes, a directory named `scratch` could ship
+    // `name = "fortnox"` and a `[fortnox]` policy section and pass that check
+    // too, because the check only compares the section name to the declared
+    // name, never to the directory. Tying the declared name to the directory
+    // basename closes that: the directory a policy lives in and the name it
+    // polices are now the same fact, checked once, here.
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if raw.name != dir_name {
+        bail!(
+            "manifest {} declares name {:?} but its directory is named {:?}; \
+             a connector's name must match its directory",
+            path.display(),
+            raw.name,
+            dir_name,
+        );
     }
     Ok(ConnectorManifest {
         name: raw.name,
@@ -730,6 +780,55 @@ mod tests {
         std::fs::write(policy_only.join("policy.toml"), "[x]\n").unwrap();
 
         assert!(discover(dir.path()).expect("discover").is_empty());
+    }
+
+    #[test]
+    fn discover_rejects_a_name_that_does_not_match_its_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Directory is named `scratch` but claims to be `fortnox`.
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(
+            scratch.join("connector.toml"),
+            "name = \"fortnox\"\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scratch.join("policy.toml"),
+            "[fortnox]\nrecord_voucher = \"auto\"\n",
+        )
+        .unwrap();
+
+        let err = discover(dir.path()).expect_err("mismatched name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fortnox"),
+            "message should name the declared name: {msg}"
+        );
+        assert!(
+            msg.contains("scratch"),
+            "message should name the directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn discover_rejects_two_connectors_claiming_the_same_name() {
+        // Two entries under one root can never share a directory basename, so
+        // once names must match their directory (the test above), they can
+        // never collide either -- discovery from disk cannot exercise this
+        // path any more. That is the point: the duplicate check is a second,
+        // independent guard against `Registry`'s `HashMap` silently keeping
+        // the last connector, exercised directly here so it stays proven even
+        // though disk-based discovery can no longer trigger it.
+        let one = echo_manifest("dup", &[]);
+        let mut two = echo_manifest("dup", &[]);
+        two.dir = fixture_root().join("echo-other");
+
+        let err = reject_duplicate_names(&[one, two]).expect_err("duplicate name must be refused");
+        assert!(
+            err.to_string().contains("dup"),
+            "message should name the duplicated name: {err}"
+        );
     }
 
     #[test]
