@@ -21,7 +21,9 @@
 //! * **Injection into a prompt is selective.** [`FactStore::matching`] returns
 //!   the facts whose topic shares a word with what the user just said, so a
 //!   conversation about the tenta does not carry the invoicing address, and a
-//!   conversation that matches nothing carries no facts block at all.
+//!   conversation that matches nothing carries no facts block at all — and it
+//!   is bounded at [`MAX_MATCHING_FACTS`], newest first, so a table that grows
+//!   cannot grow the prompt with it.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -45,6 +47,18 @@ pub const MAX_BODY_CHARS: usize = 4_000;
 /// whose topic contained one would be injected into every conversation and the
 /// selectivity would be decoration.
 pub const MIN_MATCH_CHARS: usize = 3;
+
+/// How many facts [`FactStore::matching`] will ever return.
+///
+/// Without a bound, the block spliced into the chat system prompt grows with
+/// the fact table: a topic word like "tenta" that a hundred facts share would
+/// put all hundred in front of the model, on every turn, at that turn's price.
+/// Twenty is far above what the selectivity rule produces in practice (a
+/// message shares a topic word with one or two facts) and still bounds the
+/// worst case at twenty notes rather than the whole table.
+///
+/// Which twenty matters as much as the number: see [`FactStore::matching`].
+pub const MAX_MATCHING_FACTS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Fact {
@@ -161,21 +175,47 @@ impl FactStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// The facts whose topic shares a word with `text`.
+    /// Every fact, most recently written or corrected first.
+    ///
+    /// The order is total and deterministic: `updated_at` when the fact has
+    /// been corrected and `created_at` when it has not, and the id to break a
+    /// tie between two facts written in the same instant. Without the
+    /// tie-break, [`MAX_MATCHING_FACTS`] would cut a different set of facts
+    /// from one run to the next.
+    fn by_recency(&self) -> anyhow::Result<Vec<Fact>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM facts ORDER BY COALESCE(updated_at, created_at) DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The facts whose topic shares a word with `text`, newest first, at most
+    /// [`MAX_MATCHING_FACTS`] of them.
     ///
     /// Matching happens in Rust rather than in SQL: the table is tens of rows,
     /// and a `LIKE` per token over an unindexed column is not cheaper than
     /// reading it — while the tokenisation rule stays one function that a test
     /// can call directly.
+    ///
+    /// The cap is applied to [`FactStore::by_recency`] and not to
+    /// [`FactStore::all`], which is oldest-first. That ordering matters more
+    /// than the number: a cap on the oldest-first order would keep whatever
+    /// the owner happened to say first and drop every later correction —
+    /// dropping exactly the rows that exist because the earlier ones were
+    /// wrong. Recency-first keeps the newest, and a correction moves its fact
+    /// back to the front (`remember` writes `updated_at`).
     pub fn matching(&self, text: &str) -> anyhow::Result<Vec<Fact>> {
         let wanted = match_tokens(text);
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
         Ok(self
-            .all()?
+            .by_recency()?
             .into_iter()
             .filter(|fact| match_tokens(&fact.topic).iter().any(|t| wanted.contains(t)))
+            .take(MAX_MATCHING_FACTS)
             .collect())
     }
 
@@ -295,6 +335,55 @@ mod tests {
         let hit = facts.matching("what is the invoicing situation?").unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].topic, "invoicing address");
+    }
+
+    /// A large fact table must not splice an unbounded block into a chat
+    /// system prompt, and the bound must keep the facts most likely to be
+    /// worth having: the most recently written or corrected ones.
+    #[test]
+    fn matching_is_bounded_and_keeps_the_most_recently_touched_facts() {
+        let (_dir, facts) = store();
+        for i in 0..(MAX_MATCHING_FACTS + 5) {
+            facts
+                .remember(&format!("tenta {i}"), &format!("body {i}"))
+                .unwrap();
+        }
+
+        let hit = facts.matching("what about the tenta").unwrap();
+        assert_eq!(hit.len(), MAX_MATCHING_FACTS, "the block is bounded");
+        assert_eq!(
+            hit.first().unwrap().topic,
+            format!("tenta {}", MAX_MATCHING_FACTS + 4),
+            "the newest fact is kept"
+        );
+        assert_eq!(
+            hit.last().unwrap().topic,
+            "tenta 5",
+            "the five oldest are the ones dropped"
+        );
+    }
+
+    /// The bound is on recency, not on insertion order: correcting an old
+    /// fact is exactly the case where dropping it would be worst, because the
+    /// correction is the newest thing the owner said.
+    #[test]
+    fn a_corrected_fact_is_kept_over_newer_but_untouched_ones() {
+        let (_dir, facts) = store();
+        for i in 0..(MAX_MATCHING_FACTS + 1) {
+            facts
+                .remember(&format!("tenta {i}"), &format!("body {i}"))
+                .unwrap();
+        }
+        // The oldest fact falls outside the bound...
+        let hit = facts.matching("the tenta").unwrap();
+        assert!(!hit.iter().any(|fact| fact.topic == "tenta 0"), "{hit:?}");
+
+        // ...until it is corrected, which is the moment it matters most.
+        facts.remember("tenta 0", "moved to the 21st").unwrap();
+        let hit = facts.matching("the tenta").unwrap();
+        assert_eq!(hit.len(), MAX_MATCHING_FACTS);
+        assert_eq!(hit.first().unwrap().topic, "tenta 0");
+        assert_eq!(hit.first().unwrap().body, "moved to the 21st");
     }
 
     #[test]

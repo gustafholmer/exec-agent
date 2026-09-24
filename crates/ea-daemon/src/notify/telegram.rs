@@ -224,9 +224,28 @@ pub const NO_TEXT_REPLY: &str = "I can only read text messages.";
 /// to run `ea status` from. So both are shown: the answer first, then the note
 /// under it, separated by a blank line and marked with a dash so it reads as
 /// the daemon's aside rather than part of the answer.
+///
+/// # Why the note's length is reserved rather than trusted to survive
+///
+/// Every outgoing message is cut to [`MAX_MESSAGE_BYTES`] by the transport,
+/// and the note is at the *end*. Cutting the concatenation therefore takes
+/// the note first: a model that answers at length on an over-budget day would
+/// push off exactly the sentence that day exists to deliver, and the owner
+/// crosses their spending ceiling without being told. So the reply is cut to
+/// what is left after the note — and after the ellipsis [`truncate`] adds,
+/// which is why the note is not simply subtracted — leaving the transport's
+/// own cut nothing to do.
+///
+/// A note longer than the whole budget would leave the reply nothing at all;
+/// that is the right way round. The notes are this daemon's own short
+/// sentences, and the note is the part that must not be lost.
 fn rendered_turn(turn: ChatTurn) -> String {
     match (turn.reply, turn.note) {
-        (Some(reply), Some(note)) => format!("{reply}\n\n— {note}"),
+        (Some(reply), Some(note)) => {
+            let tail = format!("\n\n— {note}");
+            let room = MAX_MESSAGE_BYTES.saturating_sub(tail.len() + ELLIPSIS.len());
+            format!("{}{tail}", truncate(&reply, room))
+        }
         (Some(reply), None) => reply,
         (None, Some(note)) => note,
         (None, None) => "I had nothing to say.".to_string(),
@@ -262,7 +281,12 @@ fn parse_callback(data: &str) -> Option<Callback> {
     }
 }
 
-/// Cut `s` to at most `max` bytes without splitting a character.
+/// What [`truncate`] marks a cut with. Its own length is part of the budget
+/// anything reserving room ahead of a cut has to allow for.
+const ELLIPSIS: &str = "…";
+
+/// Cut `s` to at most `max` bytes without splitting a character, plus
+/// [`ELLIPSIS`] when anything was cut.
 ///
 /// `&s[..max]` panics when `max` lands inside a multi-byte character, and a
 /// preview containing a name with an accent in the wrong column is exactly how
@@ -277,7 +301,7 @@ fn truncate(s: &str, max: usize) -> String {
         .take_while(|i| *i <= max)
         .last()
         .unwrap_or(0);
-    format!("{}…", &s[..end])
+    format!("{}{ELLIPSIS}", &s[..end])
 }
 
 impl<T: Transport, C: ToolCaller> Notifier<T, C> {
@@ -2288,6 +2312,42 @@ record_voucher = "approve"
         assert!(
             reply.find("the tenta").unwrap() < reply.find("answered anyway").unwrap(),
             "the note is appended after the answer, not interleaved: {reply}"
+        );
+    }
+
+    /// The over-budget note is appended *after* the reply, so a near-limit
+    /// reply used to push it off the end at `MAX_MESSAGE_BYTES` — the one
+    /// case where the note matters most is the one where it vanished, and the
+    /// owner was billed past their ceiling without being told. The reply is
+    /// what gets cut; the note is reserved before the cut is made.
+    #[tokio::test]
+    async fn a_long_reply_is_cut_to_make_room_for_the_over_budget_note() {
+        const NOTE: &str = "answered anyway, but the daily session budget of 60 is spent";
+        // Multi-byte all the way through: the cut has to keep landing on a
+        // character boundary, whatever the reserved length pushes it onto.
+        let long = "ä".repeat(4_000);
+        let (f, _chat) = chat_fixture(FakeChat::answering_with_note(&long, NOTE));
+
+        let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
+
+        // What `Transport::send` and `send_message` actually put on the wire.
+        let on_the_wire = truncate(&reply, MAX_MESSAGE_BYTES);
+        assert!(
+            on_the_wire.contains(NOTE),
+            "the note has to reach the phone, not be cut off the end of it \
+             ({} bytes before the transport's cut)",
+            reply.len()
+        );
+        assert!(
+            on_the_wire.contains("ääää"),
+            "the answer is still there, cut short"
+        );
+        assert_eq!(
+            on_the_wire,
+            reply,
+            "the reply is cut to fit the note, so the transport has nothing \
+             left to take: {} bytes",
+            reply.len()
         );
     }
 

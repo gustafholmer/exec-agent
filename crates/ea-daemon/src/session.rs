@@ -1582,6 +1582,7 @@ mod tests {
             notify_log: crate::notify::log::NotificationLog::new(ea_core::store::kv::KvStore::new(
                 Arc::clone(&conn),
             )),
+            kv: ea_core::store::kv::KvStore::new(Arc::clone(&conn)),
             connectors: Vec::new(),
         })
         .register(&mut server);

@@ -110,13 +110,16 @@ fn how_to_create(path: &Path) -> String {
 }
 
 impl Credentials {
-    /// Load from `~/.config/exec-agent/canvas/` (or `$EA_CONFIG_DIR/canvas/`).
-    pub fn load() -> anyhow::Result<Self> {
-        Self::load_from(&ea_core::paths::connector_config_dir(CONNECTOR))
-    }
-
-    /// Load from an explicit directory. Used by the tests, and by anyone
-    /// running against two Canvas instances out of one checkout.
+    /// Load from a directory — in production
+    /// `~/.config/exec-agent/canvas/` (or `$EA_CONFIG_DIR/canvas/`), which
+    /// `main` names once and hands to the server.
+    ///
+    /// The directory is a parameter rather than a constant so the tests can
+    /// point one server at a `wiremock` instance, and so anyone running
+    /// against two Canvas instances out of one checkout can too. There is
+    /// deliberately no no-argument `load()`: this is read on every call (see
+    /// [`crate::tools::CanvasServer`]), and a second entry point that
+    /// hard-codes the directory is how a start-up latch grows back.
     pub fn load_from(dir: &Path) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 

@@ -60,6 +60,11 @@ enum Command {
         n: i64,
     },
     /// Stop the scheduler starting new work. In-flight work finishes.
+    ///
+    /// The pause is durable: a crash or a reboot comes back paused, and only
+    /// `ea resume` starts work again. `ea status` shows `paused_since`, and
+    /// warns once a pause has stood long enough to endanger the Fortnox
+    /// grant.
     Pause,
     /// Undo `pause`, or — given a job name — clear that job's tripped
     /// circuit breaker so it starts polling again.

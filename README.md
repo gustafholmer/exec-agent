@@ -1,37 +1,196 @@
 # exec-agent
 
 A personal executive assistant that runs as a background daemon on macOS. It
-watches a handful of services, decides what is worth your attention, and asks
-before it changes anything.
+watches five services — mail, two calendars, coursework, Notion, and the
+company's books — decides what is worth your attention, interrupts you on
+Telegram when something is, and asks before it changes anything.
 
-The whole system is built around one rule: **a language model proposes; it never
-performs.** Every write to the outside world becomes a row in a ledger, passes a
-policy gate, and — unless you have explicitly pre-authorised that exact tool —
-waits for you to tap Approve on your phone.
+## The one idea
 
-## What it does today (Phase 1)
+**A language model may only ever _propose_. Deterministic Rust disposes.**
 
-- Polls each configured connector on its own interval and records what changed
-  as `events`. One connector ships so far: [Canvas](connectors/canvas/README.md),
-  read-only, for coursework deadlines.
-- Triages those events every five minutes: a free rules pass (tier 0), then one
-  cheap model session (tier 1, `claude-haiku-4-5`) that scores what survives.
-- Interrupts you on Telegram when something scores above the threshold, outside
-  quiet hours, and within the hourly rate limit. Everything else is held for a
+A model session runs as a `claude -p` subprocess with the write tools stripped
+out and, at most, two MCP tools allowed. The only one that can reach the outside
+world is `propose_action`, and it does no work: it hands the proposal to the
+daemon, which puts it through `ea_core::policy::Policy::decide` over the merged
+`policy.toml` of every discovered connector. `auto` runs now. `approve` becomes
+a row in the queue and a pair of buttons on your phone, and nothing happens
+until you tap one. `deny` is refused on the spot.
+
+The part that makes this safe rather than merely tidy: **anything the policy
+does not name resolves to `approve`, never `auto`.** An unknown connector, a
+tool the model invented, a typo — all of them queue for a human. So the worst a
+confused session can do is ask you a question. See
+[How the gate works](#how-the-gate-works) before you change anything.
+
+## What it costs
+
+**A Claude subscription, not metered tokens.** Every piece of thinking is a
+`claude -p` child process using the CLI's own subscription login — which is why
+the daemon never passes `--bare`, a flag that would take auth strictly from
+`ANTHROPIC_API_KEY` and put a 24/7 loop on a metered key. That constraint shaped
+everything downstream:
+
+- Tier-1 triage batches up to forty events into **one** session, because the
+  dominant cost is the ~16k-token cached prompt prefix, paid once per session
+  rather than once per event.
+- Every session names its model explicitly — Haiku for triage, Sonnet for the
+  briefings and for `ea chat`. Left unset, the CLI inherits whatever you last
+  picked interactively, which on this machine is `opus[1m]`, and `--setting-sources ''`
+  does not clear it.
+- `daily_session_budget` (60) is a hard ceiling on sessions per day, counted
+  from the `runs` table over your own day, so a restart does not refund what the
+  day already spent.
+
+If you want the number anyway, `ea log` prints `cost_usd` per run.
+
+## What ships
+
+Five connectors, each a stdio MCP server the daemon spawns as a child process
+and talks to over stdin/stdout. None of them is compiled into the daemon.
+
+| connector | watches | can write | poll |
+|---|---|---|---|
+| [google](connectors/google/README.md) | Gmail and Google Calendar, several identities at once (`work`, `private`) | `create_draft` — approval | 2 min |
+| [kth](connectors/kth/README.md) | the KTH mailbox, over Microsoft Graph; reads unread mail and leaves it unread | nothing | 5 min |
+| [canvas](connectors/canvas/README.md) | coursework deadlines in Canvas LMS | nothing | 30 min |
+| [notion](connectors/notion/README.md) | shared Notion databases, anything with a date on it | `create_page` — **auto**; `append_to_page` — approval | 1 h |
+| [fortnox](connectors/fortnox/README.md) | the company's books: unpaid invoices, VAT, Skatteverket deadlines | four writes, all approval, no amount threshold | 24 h |
+
+`notion.create_page` is the single write in the whole system that runs without a
+human tap. `connectors/notion/policy.toml` argues the case at length; the short
+version is reversal cost — a stray page is one click to trash, a stray paragraph
+appended to a document you trust may never be found.
+
+Around the connectors:
+
+- **Triage**, every five minutes. Tier 0 is pure Rust — a mute list plus a
+  keyword rescue — costs nothing, and must not become clever. Tier 1 is one
+  `claude-haiku-4-5` session that scores a batch of what survived, 0–100 for
+  salience, and calls no connector at all.
+- **Notifications** on Telegram when a score clears the threshold, falls outside
+  quiet hours, and fits the hourly rate limit. Everything else is held for the
   digest.
-- Accepts proposals from model sessions, runs the ones policy marks `auto`, and
-  queues the rest for approval — in Telegram, or with `ea approve`.
-- Answers `ea chat` by running a session that can read, think, and propose.
+- **Three cron briefings**, all on `claude-sonnet-4-5`, all in your own time
+  zone: `morning_briefing` daily at 07:00, `bookkeeping_pass` Mondays at 09:00,
+  `vat_prep` at 09:00 on the first of the month.
+- **An approval queue** — Telegram buttons, or `ea queue` / `ea approve` /
+  `ea reject`.
+- **`ea chat`**, one conversation shared by the terminal and the phone. A
+  question asked on Telegram is answerable in the terminal ten seconds later,
+  mid-sentence. A chat session gets no connectors: its two tools are
+  `propose_action` and `remember`.
+- **Daily retention**, which prunes terminal rows and rotates the logs.
+
+## How it fits together
+
+Two paths, and they meet only in the database.
+
+**Something happens in the world → your phone.**
+
+```
+connector.watch_poll        every N seconds, the scheduler calls exactly this
+       │                    one tool, by name, on each connector
+       ▼
+  events table              { source, external_id, kind, payload }; the daemon
+       │                    stamps `source` itself, so a connector cannot write
+       │                    events as another one
+       ▼
+  tier 0 (Rust)             mutes and keyword rescues. Free. Drops the rest.
+       │
+       ▼
+  tier 1 (Haiku)            one session, up to 40 events, salience 0-100
+       │
+       ▼
+  notification policy       threshold → quiet hours → rate limit, in that order
+       │                    (each one can only hold a message back)
+       ├──── clears all three ────▶  Telegram, now
+       └──── held ────────────────▶  digest, drained by the morning briefing
+```
+
+**A model wants to change something → the world.**
+
+```
+  session (claude -p)       Write/Edit/Bash/NotebookEdit disallowed;
+       │                    --strict-mcp-config; a dedicated empty cwd
+       │  propose_action
+       ▼
+  ea-propose (MCP)          forwards over the control socket; does no work
+       │
+       ▼
+  Policy::decide            merged policy.toml of every discovered connector
+       │
+       ├─ auto ───────────▶  execute now, record the result
+       ├─ approve ────────▶  `proposed` row + Telegram buttons; waits for a tap
+       ├─ deny ───────────▶  refused
+       └─ not listed ─────▶  treated as approve
+```
+
+The decision is taken *before* the action row exists, so nothing about the
+stored row can influence whether a connector is reached.
+
+The two paths never touch: triage reads events and writes scores, and cannot
+call a connector; the executor calls connectors and never reads events. The
+briefings are the one place both meet, and they do it through the same
+constraints — see [How the gate works](#how-the-gate-works).
+
+## Before you can start it: two connectors are blocked
+
+Read this before `install-launchd.sh`. Check `ls ~/.config/exec-agent/` first:
+if it is empty — as it was when this was written — the daemon will come up,
+discover five connectors, and fail every poll until all five breakers trip.
+Credentials are per connector and none of them is in this repository.
+
+Three of them you can fix yourself in a browser: **canvas** (mint a token),
+**notion** (one Internal Integration Secret per workspace), **google**
+(`ea-google-authorize <account>`, but read that connector's README about the
+seven-day token *before* the first consent — the publishing status at consent
+time is what decides which kind of refresh token you mint, and it cannot be
+changed afterwards).
+
+**Two need somebody other than you, and no change in this repository can work
+around either.**
+
+- **Fortnox: the stored grant is dead and needs re-consent at the Developer
+  Portal.** The old integration's tokens at `~/.config/fortnox-mcp/tokens.json`
+  were last written on 2026-06-18, against a refresh token that lapses after 45
+  days unused. They cannot be revived. Worse, the client credentials are not
+  lying around either: the old `dev0` project's `.env` declares
+  `FORTNOX_CLIENT_ID` and `FORTNOX_CLIENT_SECRET` and leaves **both empty**. So
+  you supply them yourself from <https://developer.fortnox.se/>. Full procedure
+  under [Re-authorising a connector](#re-authorising-a-connector).
+- **KTH: no app registration exists, and the consent may need a KTH
+  administrator.** You register the application in a tenant of your own
+  (multitenant, public client, redirect
+  `http://127.0.0.1:8473/callback`), write `~/.config/exec-agent/kth/app.json`,
+  and then run `ea-kth-authorize kth` to find out what KTH's tenant does. If it
+  answers `AADSTS65001` / "Need admin approval", user consent is disabled and
+  only KTH IT can unblock it. `connectors/kth/README.md` lists the options and
+  their real costs.
+
+Neither blocks the daemon: an unconfigured connector completes the MCP handshake
+and fails each *call* with instructions, so its breaker trips, `ea status` says
+why, and the other four keep working.
+
+One more thing to know before the first run: **no connector here has ever
+spoken to its real service.** Every test in the workspace runs against
+`wiremock` on loopback, so what is proven is that this code handles the shapes
+each API's *documentation* describes. Each connector's README closes with the
+specific assumptions to re-check against a live account. See
+[Development](#development).
 
 ## Prerequisites
 
 - **Rust**, stable. This workspace needs 1.88 or newer.
   (If `rustc` on your `PATH` is broken, use rustup's:
   `PATH="$HOME/.cargo/bin:$PATH" cargo …`.)
-- **A logged-in `claude` CLI.** The daemon shells out to `claude -p` for triage
-  and chat. Run `claude` once interactively and sign in. Without it the daemon
-  still starts, still polls, and still gates actions — it just does no thinking,
-  and says so at startup and in `ea status`.
+- **A logged-in `claude` CLI.** The daemon shells out to `claude -p` for
+  tier-1 triage, the three briefings and `ea chat`. Run `claude` once
+  interactively and sign in — on a subscription, not an API key; see
+  [What it costs](#what-it-costs). Without it the daemon still starts, still
+  polls, and still gates actions: triage drops to tier 0, the briefings report
+  that they could not run, `ea chat` cannot reply, and `ea status` shows
+  `sessions_available: false`.
 - **macOS**, for the `launchd` service. Nothing else is macOS-specific.
 
 ## Build
@@ -40,10 +199,18 @@ waits for you to tap Approve on your phone.
 cargo build --release
 ```
 
-That produces `target/release/ea-daemon`, `target/release/ea`, and one binary
-per connector (`ea-canvas`, plus the `ea-propose` MCP server). The daemon
-resolves connector binaries relative to itself, so a release build needs no
-install step.
+That produces, in `target/release/`:
+
+- `ea-daemon` and `ea` — the daemon and its CLI;
+- one MCP server per connector: `ea-canvas`, `ea-google`, `ea-kth`,
+  `ea-notion`, `ea-fortnox-mcp`;
+- three one-shot OAuth helpers: `ea-google-authorize`, `ea-kth-authorize`,
+  `ea-fortnox-authorize`;
+- `ea-propose`, the MCP server that carries a session's one proposal back to
+  the daemon.
+
+The daemon resolves connector binaries relative to itself, so a release build
+needs no install step.
 
 ## Configure
 
@@ -150,7 +317,18 @@ and is skipped: an unpoliced connector would be a hole in the gate.
 Credentials live in `~/.config/exec-agent/<connector>/`, never in the
 repository. See each connector's own README:
 
-- [Canvas](connectors/canvas/README.md) — a Canvas access token.
+- [canvas](connectors/canvas/README.md) — one Canvas access token.
+- [google](connectors/google/README.md) — a Cloud OAuth client in `app.json`,
+  then `ea-google-authorize <account>` per identity. **Read it before the first
+  consent**; the publishing status you consent under decides whether the refresh
+  token lives seven days or indefinitely.
+- [kth](connectors/kth/README.md) — a Microsoft Entra app registration in
+  `app.json`, then `ea-kth-authorize kth`. May be refused by KTH's tenant.
+- [notion](connectors/notion/README.md) — one Internal Integration Secret per
+  workspace, each under its own label. Every tool takes a required `workspace`
+  argument; there is no default.
+- [fortnox](connectors/fortnox/README.md) — Client ID and Secret in `app.json`
+  from the Developer Portal, then `ea-fortnox-authorize`.
 
 ## Install as a service
 
@@ -176,8 +354,8 @@ script, it refuses rather than installing a daemon that cannot think.
 | `ea approve <id>` | approve one and run it |
 | `ea reject <id> [--reason "..."]` | reject one; nothing is called |
 | `ea log [-n 20]` | recent runs: sessions and executed actions, with cost |
-| `ea pause` | stop the scheduler starting new work (in-flight work finishes) |
-| `ea resume` | undo `pause` |
+| `ea pause` | stop the scheduler starting new work (in-flight work finishes). Durable: a crash or a reboot comes back paused |
+| `ea resume` | undo `pause`, including the persisted part of it |
 | `ea resume <job>` | clear one job's tripped circuit breaker at once |
 | `ea chat [message...]` | say something to the assistant; with no message, an interactive loop until Ctrl-D |
 | `ea facts` | what the assistant has been told to remember |
@@ -202,7 +380,10 @@ and what a bad value looks like:
 | field | what it means |
 |---|---|
 | `status` | always `"ok"` when you get an answer at all. The real health check is whether the command answers: a refused connection to `~/.local/state/exec-agent/daemon.sock` means the daemon is not running. |
-| `paused` | `true` after `ea pause` — the scheduler is starting nothing new. Nothing else in the system sets this, so if it is `true` and you did not do it, somebody did. |
+| `paused` | `true` after `ea pause` — the scheduler is starting nothing new. Nothing else in the system sets this, and nothing un-pauses it on its own, so if it is `true` and you did not do it, somebody did. |
+| `paused_since` | when the pause was recorded, from the durable row rather than the in-memory flag. A `paused: true` with a **null** `paused_since` is a pause that did not reach disk and will not survive the next restart. |
+| `paused_for_days` | the same, as a number of days. |
+| `pause_warning` | present only after 30 days paused, and only when a Fortnox connector is discovered: the Fortnox refresh token lapses after 45 days unused, and re-authorising is a manual browser round trip. It warns; it never un-pauses you. |
 | `pending_actions` | proposals sitting in the queue. A number that only grows means you are not answering Telegram; `ea queue` shows them. |
 | `unscorable_events` | events triage gave up on after repeated failures to score them. Nonzero is the daemon admitting it decided not to look at something. |
 | `digest_pending` | scores held back by the threshold, quiet hours or the rate limit, waiting for the morning briefing. Normally the hours since the last briefing. **Climbing past a day means the briefing has stopped running** — check `schedules` below. |
@@ -304,7 +485,7 @@ a person at a browser.
 | **kth** | `./target/release/ea-kth-authorize <account>`. | No — same. |
 | **fortnox** | `./target/release/ea-fortnox-authorize`. See below. | No — tokens are re-read on every call. |
 | **notion** | Rewrite `~/.config/exec-agent/notion/<workspace>.json` with a fresh Internal Integration Secret from <https://www.notion.so/my-integrations>, mode `0600`. | No — files are read fresh on every call. |
-| **canvas** | Mint a new token in Canvas → Account → Settings → *+ New Access Token*, write it to `~/.config/exec-agent/canvas/credentials.json`, mode `0600`. | **Yes.** `ea-canvas` loads its credentials once at process start, so the connector child has to be respawned. |
+| **canvas** | Mint a new token in Canvas → Account → Settings → *+ New Access Token*, write it to `~/.config/exec-agent/canvas/credentials.json`, mode `0600`. | No — `CanvasServer` builds its client from whatever the file holds at the time of each call. The very next request carries the new token. |
 
 Two of these have a failure mode worth knowing before it happens.
 
@@ -321,15 +502,14 @@ publishing status at consent time is what decides which kind of token you mint.
 **Fortnox's stored refresh token is dead, today.** Every Fortnox refresh
 returns a new refresh token and kills the one presented, and a refresh token
 unused for 45 days lapses. The old integration's tokens at
-`~/.config/fortnox-mcp/tokens.json` were last written **98 days ago** against
-that 45-day limit; they lapsed long before anyone noticed, because nothing was
-asking. They cannot be revived. Only re-consent through the Fortnox Developer
+`~/.config/fortnox-mcp/tokens.json` were last written on **2026-06-18** against
+that 45-day limit; they lapsed at the beginning of August and nobody noticed,
+because nothing was asking. They cannot be revived. Only re-consent through the Fortnox Developer
 Portal can fix this, and it has to be you at the browser.
 
 The credentials for that are also not lying around: the old `dev0` project's
-`.env` (`~/dev/tryffle/dev0/apps/fortnox-mcp/.env`) declares
-`FORTNOX_CLIENT_ID` and `FORTNOX_CLIENT_SECRET` and leaves **both of them
-empty** — the lines are the key, an `=`, and nothing. So you supply your own:
+`.env` declares `FORTNOX_CLIENT_ID` and `FORTNOX_CLIENT_SECRET` and leaves
+**both of them empty** — the lines are the key, an `=`, and nothing. So you supply your own:
 open <https://developer.fortnox.se/>, open the existing integration (do not
 register a second one), copy its Client ID and Client Secret into
 `~/.config/exec-agent/fortnox/app.json` at mode `0600`, then run
@@ -366,10 +546,22 @@ batch per pass once the budget comes back.
 
 **`ea pause`.** Stops the scheduler starting anything new — no polls, no
 triage passes, no cron briefings. Work already in flight finishes. Nothing
-reaches a connector, so no breaker can trip and nothing accumulates. But
-`paused` is an in-memory flag: **a daemon restart clears it**, and the plist has
-`KeepAlive`, so a crash or a reboot silently un-pauses you. Good for an
-afternoon; not something to trust for two weeks.
+reaches a connector, so no breaker can trip and nothing accumulates.
+
+The pause is **durable**: it is written to `kv` under `scheduler.paused` and
+re-applied before the scheduler starts, so a crash or a reboot comes back
+paused. That is deliberate — the plist has `KeepAlive`, and a pause the owner
+thinks will outlive a reboot and does not is a worse failure than a forgotten
+one. Nothing expires it. What stops a forgotten pause from being permanent is
+visibility instead: `ea status` reports `paused_since` and `paused_for_days`,
+and past 30 days adds a `pause_warning` naming the Fortnox refresh token's
+45-day lapse — the one connector a long pause permanently breaks.
+
+The persistence lives in the IPC handler, not in `Scheduler::pause`, because
+`main` calls that primitive as the first step of its shutdown drain: persisting
+there would record every clean shutdown as a pause and, under `KeepAlive`, bring
+the daemon back paused and never running again. The regression test is
+`daemon::tests::a_clean_shutdown_does_not_persist_a_pause`.
 
 **Unloading the launchd job** (`./scripts/install-launchd.sh --uninstall`, or
 `launchctl unload ~/Library/LaunchAgents/dev.gustaf.exec-agent.plist`) stops
@@ -380,7 +572,9 @@ back to the Developer Portal.
 
 The recommendation, for an actual holiday: set `daily_session_budget = 0` and
 leave it running. The connectors stay warm, the grants stay alive, nothing
-interrupts you, and coming back is one edit and a restart.
+interrupts you, and coming back is one edit and a restart. `ea pause` is the
+better answer only if you want the polling to stop too — and then `ea resume` is
+the thing you must remember, because nothing will do it for you.
 
 ### Adding a connector
 
@@ -477,12 +671,29 @@ override them, which is how the tests avoid touching yours.
 
 Read this before changing anything.
 
-A model session runs as a `claude -p` subprocess with `Write`, `Edit` and `Bash`
-removed and exactly one MCP tool allowed: `propose_action`, served by the
-`ea-propose` binary. That tool does no work. It forwards the proposal to the
-daemon over the control socket, and the daemon puts it through
-`Policy::decide`, which reads the merged `policy.toml` of every discovered
-connector:
+A model session runs as a `claude -p` subprocess with `Write`, `Edit`, `Bash`
+and `NotebookEdit` disallowed on the command line, `--strict-mcp-config` so the
+CLI cannot add any of your own servers, and `--setting-sources ''` from a
+dedicated empty working directory so no hooks, plugins, CLAUDE.md or auto-memory
+are discovered. `--allowedTools` is a closed list chosen by the session's kind,
+not shared between kinds:
+
+| session | allowed tools | connectors it can see |
+|---|---|---|
+| tier-1 triage | none at all | none |
+| the three briefings | `propose_action` | none |
+| `ea chat` | `propose_action`, `remember` | none |
+
+`remember` writes one row to the local `facts` table and reaches nothing, and
+chat is the only kind given it: the prompt of a chat session is the owner
+talking, which is the only provenance that makes a fact safe to splice back into
+a later system prompt.
+
+So the only tool in the system that can reach the outside world is
+`propose_action`, served by the `ea-propose` binary — and it does no work. It
+forwards the proposal to the daemon over the control socket, and the daemon puts
+it through `Policy::decide`, which reads the merged `policy.toml` of every
+discovered connector:
 
 - **`auto`** — execute now, record the result;
 - **`approve`** — record it as `proposed` and push it to Telegram; nothing
@@ -509,10 +720,24 @@ named something like `connectors.call` was on this socket once and was removed
 for exactly this reason. Do not add it back: anything that can reach the socket
 could then call any tool on any connector with the gate bypassed.
 
-The one connector call with no `actions` row behind it is the scheduler's
-`watch_poll`, and it is constrained three ways: the tool name is a constant,
-the policy must rate it `auto` for that connector, and nothing reachable from
-the socket chooses any part of it.
+Two kinds of connector call have no `actions` row behind them, and both are
+constrained the same three ways — the tool name comes from a constant in the
+daemon's own source, the merged policy must already rate that tool `auto` for
+that connector, and nothing reachable from the socket chooses any part of it:
+
+1. **The scheduler's `watch_poll`**, once per connector per interval.
+2. **The reads a briefing gathers** before its session starts —
+   `unpaid_invoices`, `vat_summary`, `account_ledger` on `fortnox`. The daemon
+   makes these itself, never the model; a connector whose `unpaid_invoices` were
+   graded `approve` would simply not be read, and the refusal says so.
+
+The material a briefing gathers then travels into the prompt as text, fenced and
+labelled as data. A briefing session's tool scope is `propose_action` only —
+deliberately **not** `remember`, because the material is text other people wrote
+and a durable fact written from it would be spliced back into a later chat
+prompt — and it is handed an empty connector list, so there is not even a server
+for a tool call to land on. A briefing that wants to change something must
+propose it like anything else.
 
 ## Development
 
@@ -522,6 +747,22 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-No test in the default suite touches Telegram, Canvas, or spawns a real
-`claude`. The few that would are marked `#[ignore]` and are listed in
-`.superpowers/sdd/`'s task reports along with how to run them.
+No test in the default suite touches Telegram, Canvas, Google, Microsoft
+Graph, Notion or Fortnox, and none spawns a real `claude`. Every connector's
+tests run against a `wiremock` server on loopback. Exactly one test is
+`#[ignore]`d — `session.rs`'s, which spawns the real CLI and spends
+subscription usage; run it by name when you want to check the CLI's output
+shape has not moved under you.
+
+Be clear about what that buys and what it does not. **No connector in this
+repository has ever spoken to its real service.** The tests show this code
+handles the shapes each API's documentation describes; they cannot show those
+are the shapes the API sends. Every connector's README ends with a section
+saying so and listing the specific assumptions worth re-checking the first time
+you point it at a live account — `connectors/kth/README.md` is the longest, and
+its first unverified claim is whether KTH will let you connect at all.
+
+So the first real run of any of these is an experiment, not a deployment. It
+will fail loudly if it fails: a connector that gets an unexpected shape
+propagates the error, the breaker trips after five of them, and `ea status`
+carries the reason in `last_error`.

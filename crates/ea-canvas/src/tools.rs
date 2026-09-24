@@ -31,6 +31,7 @@
 //! `due_at` may be and still be emitted; there is deliberately no forward
 //! bound (see its doc comment).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -41,7 +42,7 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Assignment, CanvasClient, Course};
+use crate::client::{Assignment, CanvasClient, Course, Credentials};
 
 /// The `kind` every watch entry carries. Triage mutes and keywords match on
 /// it, so it is a stable name rather than something derived per assignment.
@@ -98,14 +99,21 @@ pub fn assignment_external_id(assignment_id: i64) -> String {
     format!("assignment:{assignment_id}")
 }
 
-/// Either a working client, or the reason there isn't one.
+/// Either the directory the credentials are read from, or the reason there
+/// isn't one.
 ///
 /// A connector with no credentials still starts and still completes the MCP
 /// handshake; it just fails every call with a message naming the file to
 /// create. Exiting at start-up instead would give the daemon "handshake
 /// failed", which says nothing about what to do.
+///
+/// Note what is deliberately *not* latched here: the credentials themselves.
+/// They are read off disk on every call, so a token regenerated in Canvas —
+/// or a `credentials.json` written for the first time — takes effect without
+/// a daemon restart, the same way `ea-notion` and `ea-kth` read their token
+/// stores per call.
 enum Backend {
-    Ready(CanvasClient),
+    Ready(PathBuf),
     Unconfigured(String),
 }
 
@@ -120,9 +128,10 @@ pub struct CanvasServer {
 }
 
 impl CanvasServer {
-    pub fn new(client: CanvasClient) -> Self {
+    /// A server that reads `credentials.json` out of `dir` on every call.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
-            backend: Arc::new(Backend::Ready(client)),
+            backend: Arc::new(Backend::Ready(dir.into())),
             tool_router: Self::tool_router(),
         }
     }
@@ -135,14 +144,28 @@ impl CanvasServer {
         }
     }
 
-    fn client(&self) -> Result<&CanvasClient, String> {
+    fn config_dir(&self) -> Result<&Path, String> {
         match &*self.backend {
-            Backend::Ready(client) => Ok(client),
-            Backend::Unconfigured(reason) => Err(format!(
-                "canvas: this connector has no usable credentials, so it cannot read \
-                 anything from Canvas. {reason}"
-            )),
+            Backend::Ready(dir) => Ok(dir),
+            Backend::Unconfigured(reason) => Err(unusable(reason)),
         }
+    }
+
+    /// A client built from the credentials as they are on disk *now*.
+    ///
+    /// Built per call rather than held: the token is the thing that changes,
+    /// and the cost of rebuilding is one file read and a `reqwest::Client`
+    /// against four tools that each make a network round trip anyway. A token
+    /// regenerated in Canvas therefore needs no daemon restart — the
+    /// behaviour `ea-notion` and `ea-kth` already have.
+    fn client(&self) -> Result<CanvasClient, String> {
+        let dir = self.config_dir()?;
+        // `{err:#}` keeps the "create it with..." lines. These messages name
+        // a path, never a token — see `client.rs`.
+        let credentials =
+            Credentials::load_from(dir).map_err(|err| unusable(&format!("{err:#}")))?;
+        CanvasClient::new(&credentials.base_url, credentials.token())
+            .map_err(|err| unusable(&format!("{err:#}")))
     }
 
     /// [`poll_since`](Self::poll_since) against the wall clock.
@@ -198,6 +221,16 @@ fn entry(course: &Course, assignment: &Assignment) -> WatchEntry {
             "html_url": assignment.html_url,
         }),
     }
+}
+
+/// The one sentence every credential failure is wrapped in, whether it was
+/// found at start-up or on this very call. One function, so the two cannot
+/// drift into two different-looking failures for the same situation.
+fn unusable(reason: &str) -> String {
+    format!(
+        "canvas: this connector has no usable credentials, so it cannot read \
+         anything from Canvas. {reason}"
+    )
 }
 
 /// `anyhow` error -> the string the model reads. `{:#}` keeps the context
@@ -297,8 +330,45 @@ mod tests {
         ResponseTemplate::new(200).set_body_raw(body.to_string(), "application/json")
     }
 
-    fn server_for(mock: &MockServer) -> CanvasServer {
-        CanvasServer::new(CanvasClient::new(&mock.uri(), TOKEN).unwrap())
+    /// Write a `credentials.json` the server will read, pointing at `base_url`.
+    /// 0600, because [`Credentials::load_from`] refuses anything looser.
+    fn write_credentials(dir: &Path, base_url: &str, token: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(crate::client::CREDENTIALS_FILE);
+        std::fs::write(
+            &path,
+            serde_json::json!({ "baseUrl": base_url, "token": token }).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A configured server and the directory its credentials live in.
+    ///
+    /// The directory has to outlive the server, which reads it on every call;
+    /// `Deref` so a test that only wants the server can still write
+    /// `server_for(&mock).poll()`.
+    struct Configured {
+        server: CanvasServer,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Configured {
+        type Target = CanvasServer;
+
+        fn deref(&self) -> &CanvasServer {
+            &self.server
+        }
+    }
+
+    fn server_for(mock: &MockServer) -> Configured {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_credentials(dir.path(), &mock.uri(), TOKEN);
+        Configured {
+            server: CanvasServer::new(dir.path()),
+            _dir: dir,
+        }
     }
 
     async fn canvas_with(courses: serde_json::Value, assignments: serde_json::Value) -> MockServer {
@@ -541,6 +611,80 @@ mod tests {
             .await
             .expect_err("a half-read poll must not be reported as a complete one");
         assert!(err.contains("500"), "{err}");
+    }
+
+    /// A regenerated Canvas token has to reach the connector without a
+    /// daemon restart — the property the other connectors get from reading
+    /// their token stores on every call. Latching a client at start-up made
+    /// rotating a token a `launchctl kickstart`.
+    #[tokio::test]
+    async fn a_new_token_is_picked_up_without_a_restart() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/courses"))
+            .respond_with(json_page(one_course()))
+            .mount(&mock)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        write_credentials(dir.path(), &mock.uri(), "first-token");
+        let server = CanvasServer::new(dir.path());
+        server.list_courses().await.expect("the first call");
+
+        // The owner regenerates the token in Canvas and rewrites the file.
+        // The process keeps running.
+        write_credentials(dir.path(), &mock.uri(), "second-token");
+        server
+            .list_courses()
+            .await
+            .expect("the call after the change");
+
+        let tokens: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "Bearer first-token".to_string(),
+                "Bearer second-token".to_string()
+            ],
+            "the second call must carry the new token"
+        );
+    }
+
+    /// The other half of the same property: a connector started before its
+    /// credentials existed answers with the path to create, and then works —
+    /// no restart between the two.
+    #[tokio::test]
+    async fn credentials_written_after_start_up_need_no_restart() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/courses"))
+            .respond_with(json_page(one_course()))
+            .mount(&mock)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = CanvasServer::new(dir.path());
+
+        let err = server
+            .list_courses()
+            .await
+            .expect_err("nothing to read yet");
+        assert!(err.contains("credentials.json"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+
+        write_credentials(dir.path(), &mock.uri(), TOKEN);
+        server.list_courses().await.expect("configured in flight");
     }
 
     #[tokio::test]

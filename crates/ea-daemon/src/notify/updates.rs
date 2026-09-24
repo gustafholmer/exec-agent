@@ -40,15 +40,37 @@
 //! same sentence a malformed payload gets, so nobody can map the action space
 //! by diffing replies.
 //!
-//! # At-least-once, and why that is safe
+//! # Delivery: at most once, because a duplicate costs money
 //!
-//! The offset is persisted after each update is handled, so the same tap is
-//! not replayed on the next poll or after a restart. It cannot be
-//! exactly-once: the process can die between executing an action and writing
-//! the offset. What makes that harmless is that a replay is not a second
-//! effect — the `proposed -> approved` transition is a conditional UPDATE, so
-//! a redelivered approval finds the row already decided and answers "already
-//! handled".
+//! Two durable marks, written at opposite ends of handling one update, and
+//! the difference between them is the whole design.
+//!
+//! [`OffsetStore`] is the cursor Telegram is polled with, and it is written
+//! **after** an update is handled. Telegram redelivers an update until its
+//! offset is confirmed, so a process that dies mid-batch gets the rest of the
+//! batch again rather than losing it.
+//!
+//! [`HandledUpdates`] is the idempotency key, and it is written **before** the
+//! handler runs. It is what makes a redelivery a no-op. Without it, a crash
+//! between answering a message and writing the offset would hand the same
+//! message back after the restart and answer it a second time — and a
+//! free-text message is a `claude` session charged against the day's budget,
+//! so "answer it again" means "bill the owner again", silently.
+//!
+//! Claiming before the handler chooses the cheaper failure deliberately. A
+//! crash *during* handling now costs the outcome rather than producing a
+//! duplicate:
+//!
+//! * A message loses its answer. The owner sees no reply and re-sends — one
+//!   session, on purpose, and they know they are spending it.
+//! * A tap loses its press. The buttons are still on the phone and the action
+//!   is still `proposed`, so tapping again does exactly what the first tap
+//!   would have. (A crash *after* the `proposed -> approved` transition was
+//!   never recoverable by replay anyway: the conditional UPDATE means a
+//!   redelivered approval already only answered "already handled".)
+//!
+//! Both of those are a re-do the owner can see and repeat. A duplicate
+//! charge is neither.
 
 use std::future::Future;
 use std::time::Duration;
@@ -62,6 +84,10 @@ use crate::notify::telegram::{Notifier, TelegramUserId, Transport, UNRECOGNISED_
 
 /// `kv` key holding the next `getUpdates` offset.
 pub const OFFSET_KEY: &str = "telegram.update_offset";
+
+/// `kv` key holding the highest `update_id` this daemon has taken
+/// responsibility for. See [`HandledUpdates`].
+pub const HANDLED_KEY: &str = "telegram.handled_through";
 
 /// How long Telegram holds a `getUpdates` request open with nothing to say.
 ///
@@ -274,6 +300,58 @@ impl OffsetStore {
     }
 }
 
+/// Which updates this daemon has already taken responsibility for.
+///
+/// A high-water mark rather than a set: Telegram issues `update_id`s in
+/// increasing order per bot, so "everything up to and including *n*" is the
+/// whole truth about what has been claimed, and it is one small `kv` row
+/// instead of a list that grows forever.
+///
+/// Durable for the same reason [`crate::notify::log::NotificationLog`] is: the
+/// daemon runs under `launchd` with `KeepAlive`, so "the process came back" is
+/// routine, and a claim held in memory would be forgotten by exactly the crash
+/// it exists to survive.
+///
+/// See the module docs for why this is written *before* the handler runs and
+/// the offset after it.
+pub struct HandledUpdates {
+    kv: KvStore,
+}
+
+impl HandledUpdates {
+    pub fn new(kv: KvStore) -> Self {
+        Self { kv }
+    }
+
+    /// The highest claimed `update_id`, or `None` on a fresh database.
+    pub fn high_water(&self) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .kv
+            .get(HANDLED_KEY)?
+            .and_then(|raw| raw.trim().parse::<i64>().ok()))
+    }
+
+    /// Whether `update_id` has already been claimed — and so must not be
+    /// acted on a second time.
+    pub fn contains(&self, update_id: i64) -> anyhow::Result<bool> {
+        Ok(self
+            .high_water()?
+            .is_some_and(|claimed| claimed >= update_id))
+    }
+
+    /// Claim `update_id` before anything is done about it.
+    ///
+    /// Monotonic, like [`OffsetStore::set`] and for the same reason: a
+    /// redelivered or reordered batch must never lower the mark and make an
+    /// update claimable again.
+    pub fn mark(&self, update_id: i64) -> anyhow::Result<()> {
+        if self.contains(update_id)? {
+            return Ok(());
+        }
+        self.kv.set(HANDLED_KEY, &update_id.to_string())
+    }
+}
+
 // --------------------------------------------------------------------------
 // The loop
 // --------------------------------------------------------------------------
@@ -286,6 +364,8 @@ pub struct UpdateLoop<S: UpdateSource, H: CallbackHandler + MessageHandler> {
     /// else is refused.
     chat_id: i64,
     offsets: OffsetStore,
+    /// Written before each update is handled; see the module docs.
+    handled: HandledUpdates,
     poll_timeout_secs: u64,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -301,15 +381,26 @@ pub struct PollSummary {
     pub handled: usize,
     /// Updates refused before the handler: wrong chat, or no callback data.
     pub refused: usize,
+    /// Updates Telegram delivered again that this daemon had already claimed.
+    /// Expected after a crash mid-handling; a steady stream of them means the
+    /// offset is not being written and wants looking at.
+    pub duplicates: usize,
 }
 
 impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
-    pub fn new(source: S, handler: H, chat_id: i64, offsets: OffsetStore) -> Self {
+    pub fn new(
+        source: S,
+        handler: H,
+        chat_id: i64,
+        offsets: OffsetStore,
+        handled: HandledUpdates,
+    ) -> Self {
         Self {
             source,
             handler,
             chat_id,
             offsets,
+            handled,
             poll_timeout_secs: POLL_TIMEOUT_SECS,
             initial_backoff: INITIAL_BACKOFF,
             max_backoff: MAX_BACKOFF,
@@ -341,6 +432,11 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
     /// answered, rather than once at the end of the batch. A failure halfway
     /// through a batch therefore costs the remaining updates a redelivery, not
     /// the whole batch.
+    ///
+    /// Each update is claimed in [`HandledUpdates`] before it is handled, and
+    /// one Telegram has already been answered for is skipped however often it
+    /// is redelivered. See the module docs for why the two marks are written
+    /// at opposite ends.
     pub async fn poll_once(&self) -> anyhow::Result<PollSummary> {
         let offset = self.offsets.get()?;
         let updates = self
@@ -356,15 +452,34 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
 
         for update in updates {
             let id = update.update_id;
+
+            // Telegram redelivers until the offset is confirmed, so this is
+            // the ordinary shape of a crash recovery, not an anomaly.
+            if self.handled.contains(id)? {
+                tracing::info!(
+                    update = id,
+                    "skipping a telegram update this daemon has already answered"
+                );
+                summary.duplicates += 1;
+                self.offsets.set(id + 1)?;
+                continue;
+            }
+
+            // Before the effect, never after: a chat turn is a paid session,
+            // and an update answered but not marked is answered again after a
+            // restart. Marked-but-not-answered costs the owner a re-send or a
+            // second tap, which they can see and redo; charged twice for one
+            // sentence is silent. See the module docs.
+            self.handled.mark(id)?;
+
             match self.dispatch(update).await {
                 Dispatched::Handled => summary.handled += 1,
                 Dispatched::Refused => summary.refused += 1,
                 Dispatched::Ignored => {}
             }
-            // After the effect, never before: an update that is acted on and
-            // then loses its offset write is replayed and refused by the
-            // store's status transition. An update whose offset was written
-            // first and then failed to act would be lost silently.
+            // After the effect, so that a batch interrupted halfway through is
+            // redelivered rather than lost; the claim above is what keeps the
+            // redelivery from being acted on twice.
             self.offsets.set(id + 1)?;
         }
 
@@ -498,10 +613,11 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
             match poll {
                 Ok(summary) => {
                     backoff = self.initial_backoff;
-                    if summary.handled > 0 || summary.refused > 0 {
+                    if summary.handled > 0 || summary.refused > 0 || summary.duplicates > 0 {
                         tracing::info!(
                             handled = summary.handled,
                             refused = summary.refused,
+                            duplicates = summary.duplicates,
                             "telegram callbacks processed"
                         );
                     }
@@ -701,6 +817,30 @@ mod tests {
         }
     }
 
+    /// A handler that never comes back: it records the call and then panics,
+    /// which is as close as a test can get to the daemon being killed halfway
+    /// through a `claude` session. Used only by
+    /// [`a_crash_inside_the_handler_leaves_the_update_already_claimed`].
+    #[derive(Default)]
+    struct CrashingHandler {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MessageHandler for Arc<CrashingHandler> {
+        async fn handle_message(&self, _from: TelegramUserId, text: &str) -> String {
+            // The lock is released before the panic, or the poisoned mutex
+            // would be what the test noticed instead of the missing mark.
+            self.calls.lock().unwrap().push(text.to_string());
+            panic!("simulated crash partway through handling a telegram update");
+        }
+    }
+
+    impl CallbackHandler for Arc<CrashingHandler> {
+        async fn handle(&self, _from: TelegramUserId, _data: &str) -> String {
+            unreachable!("the crash test only sends messages");
+        }
+    }
+
     /// A handler whose reply is longer than Telegram will accept.
     struct LongWinded;
 
@@ -786,14 +926,28 @@ mod tests {
             OffsetStore::new(KvStore::new(Arc::clone(&self.conn)))
         }
 
+        fn handled(&self) -> HandledUpdates {
+            HandledUpdates::new(KvStore::new(Arc::clone(&self.conn)))
+        }
+
         /// A fresh loop over the same source, handler and database — which is
         /// also what a restart looks like from the offset's point of view.
         fn build(&self) -> UpdateLoop<Arc<ScriptedSource>, Arc<SpyHandler>> {
+            self.build_with(Arc::clone(&self.handler))
+        }
+
+        /// The same loop over a handler of the caller's choosing — the crash
+        /// test needs one that does not come back.
+        fn build_with<H: CallbackHandler + MessageHandler>(
+            &self,
+            handler: H,
+        ) -> UpdateLoop<Arc<ScriptedSource>, H> {
             UpdateLoop::new(
                 Arc::clone(&self.source),
-                Arc::clone(&self.handler),
+                handler,
                 OWNER_CHAT,
                 self.offsets(),
+                self.handled(),
             )
             .with_backoff(Duration::from_millis(5), Duration::from_millis(20))
             .with_idle_pause(Duration::from_millis(1))
@@ -1044,6 +1198,157 @@ mod tests {
         assert_eq!(f.handler.seen().len(), 1);
     }
 
+    /// Telegram redelivers an update until its offset is confirmed, so a
+    /// crash between answering a message and committing the offset hands the
+    /// same message back after the restart. A free-text message costs a
+    /// `claude` session, charged against the daily budget, so answering it
+    /// twice charges the owner twice for the same sentence.
+    #[tokio::test]
+    async fn a_redelivered_message_is_answered_once_across_a_restart() {
+        let f = Fixture::new(vec![
+            Ok(vec![says(7, "when is the tenta?")]),
+            Ok(vec![says(7, "when is the tenta?")]),
+        ]);
+
+        f.build().poll_once().await.unwrap();
+        assert_eq!(f.handler.messages().len(), 1, "the first delivery answers");
+
+        // The crash: the reply went out, the offset write never landed, so
+        // the restarted daemon asks Telegram for update 7 again.
+        KvStore::new(Arc::clone(&f.conn))
+            .set(OFFSET_KEY, "7")
+            .unwrap();
+
+        let summary = f.build().poll_once().await.unwrap();
+
+        assert_eq!(
+            f.handler.messages().len(),
+            1,
+            "one session, not two: the update was claimed before it was answered"
+        );
+        assert_eq!(summary.received, 1);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.handled, 0);
+        assert_eq!(
+            f.source.sent().len(),
+            1,
+            "and the owner is not answered twice either"
+        );
+        // The cursor still moves past it, or the loop would stick on it.
+        assert_eq!(f.offsets().get().unwrap(), Some(8));
+    }
+
+    /// The ordering the whole module is shaped around, pinned at the only
+    /// moment it can actually be observed: *inside* the crash.
+    ///
+    /// Neither neighbouring test sees it.
+    /// `a_redelivered_message_is_answered_once_across_a_restart` rewinds the
+    /// offset by hand after a poll that ran to completion, so the mark is
+    /// already written whichever side of `dispatch` writes it, and
+    /// `a_handled_update_leaves_a_high_water_mark` reads the mark only after
+    /// `poll_once` has returned, by which point so is it. The crash the
+    /// ordering *exists for* is the one that lands between the handler
+    /// starting and finishing, and it is only visible if the handler never
+    /// returns.
+    ///
+    /// So the handler panics mid-session and takes the poll down with it. If
+    /// the claim is written before `dispatch` it is already in `kv` when
+    /// `launchd` brings the daemon back, and Telegram's redelivery is a
+    /// no-op. If it were written after, it would never have been reached, and
+    /// the restart would answer the same sentence again — a second paid
+    /// `claude -p` session against the owner's daily budget, silently.
+    ///
+    /// Moving `self.handled.mark(id)?` below the `dispatch` call must fail
+    /// this test. That is the only thing it is here for; it is not a
+    /// duplicate of either neighbour.
+    #[tokio::test]
+    async fn a_crash_inside_the_handler_leaves_the_update_already_claimed() {
+        let f = Fixture::new(vec![
+            Ok(vec![says(11, "when is the tenta?")]),
+            // The restart: the offset was never confirmed, so Telegram hands
+            // the very same update back.
+            Ok(vec![says(11, "when is the tenta?")]),
+        ]);
+
+        let crashing = Arc::new(CrashingHandler::default());
+        let calls = Arc::clone(&crashing.calls);
+        let lp = f.build_with(crashing);
+
+        // Spawned so the panic is contained: this is the daemon dying, and
+        // what the test is about is what it left behind in `kv`.
+        let died = tokio::spawn(async move { lp.poll_once().await }).await;
+        let crash = died.expect_err("the handler was supposed to crash the poll");
+        assert!(
+            crash.is_panic(),
+            "the fixture is wrong: the poll ended for some reason other than \
+             the handler panicking ({crash})"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the handler must have been entered, or there was no crash to survive"
+        );
+        assert_eq!(
+            f.offsets().get().unwrap(),
+            None,
+            "the crash must land before the offset is confirmed, or this is a \
+             completed poll being simulated rather than an interrupted one"
+        );
+
+        assert!(
+            f.handled().contains(11).unwrap(),
+            "update 11 must be claimed BEFORE the handler runs. The handler \
+             panicked without returning, so nothing below the `dispatch` call \
+             ran: an unclaimed update here means `self.handled.mark(id)?` has \
+             moved after the dispatch, and the redelivery that follows this \
+             crash will answer the same message a second time — another paid \
+             `claude` session charged against the owner's daily budget, with \
+             nothing said about it."
+        );
+
+        // The restart proper: a fresh loop and an ordinary handler over the
+        // same database, handed the same update again.
+        let summary = f.build().poll_once().await.unwrap();
+        assert!(
+            f.handler.messages().is_empty(),
+            "a claimed update must not reach a handler a second time"
+        );
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.handled, 0);
+        assert!(
+            f.source.sent().is_empty(),
+            "and the owner is not answered for a turn they never got an answer to"
+        );
+        assert_eq!(
+            f.offsets().get().unwrap(),
+            Some(12),
+            "the cursor still moves past it, or the loop would stick on it forever"
+        );
+    }
+
+    /// The mark is a high-water mark, not a set: claiming 11 spends
+    /// everything below it and nothing above it.
+    ///
+    /// Note what this does **not** test, despite what it was once called: it
+    /// reads `kv` only after `poll_once` has returned, so it passes whichever
+    /// side of `dispatch` the mark is written on. The ordering is pinned by
+    /// [`a_crash_inside_the_handler_leaves_the_update_already_claimed`].
+    #[tokio::test]
+    async fn a_handled_update_leaves_a_high_water_mark() {
+        let f = Fixture::new(vec![Ok(vec![says(11, "hello")])]);
+        let handled = HandledUpdates::new(KvStore::new(Arc::clone(&f.conn)));
+        assert!(!handled.contains(11).unwrap());
+
+        f.build().poll_once().await.unwrap();
+
+        assert!(handled.contains(11).unwrap());
+        assert!(
+            handled.contains(10).unwrap(),
+            "the mark is a high-water mark: everything below it is spent too"
+        );
+        assert!(!handled.contains(12).unwrap());
+    }
+
     /// A reordered or duplicated batch must not rewind the cursor and replay
     /// taps that have already been acted on.
     #[test]
@@ -1071,7 +1376,8 @@ mod tests {
             Arc::clone(&source),
             LongWinded,
             OWNER_CHAT,
-            OffsetStore::new(KvStore::new(conn)),
+            OffsetStore::new(KvStore::new(Arc::clone(&conn))),
+            HandledUpdates::new(KvStore::new(conn)),
         );
         lp.poll_once().await.unwrap();
         assert_eq!(source.answers()[0].1.chars().count(), CALLBACK_TEXT_LIMIT);
@@ -1264,6 +1570,7 @@ mod end_to_end {
                 Arc::clone(&self.notifier),
                 CHAT,
                 OffsetStore::new(KvStore::new(Arc::clone(&self.conn))),
+                HandledUpdates::new(KvStore::new(Arc::clone(&self.conn))),
             );
             (source, lp)
         }
@@ -1425,8 +1732,12 @@ mod end_to_end {
         assert!(h.calls.lock().unwrap().is_empty());
     }
 
-    /// At-least-once delivery is safe because the store's transition is the
-    /// claim: a redelivered tap finds the row already decided.
+    /// A redelivered update is now stopped by the claim, before the handler
+    /// and before the store — one `update_id`, one effect, whatever Telegram
+    /// sends. The store's `proposed -> approved` transition is still the
+    /// second line of defence for the genuinely double *tap* (two presses,
+    /// two `update_id`s); see
+    /// `telegram::tests::a_double_tapped_approve_executes_exactly_once`.
     #[tokio::test]
     async fn a_redelivered_tap_does_not_execute_twice() {
         let h = harness();
@@ -1434,17 +1745,21 @@ mod end_to_end {
         let data = format!("approve:{id}");
         let (source, lp) = h.drive(vec![press(1, OWNER, &data), press(1, OWNER, &data)]);
 
-        lp.poll_once().await.unwrap();
+        let summary = lp.poll_once().await.unwrap();
 
         assert_eq!(
             h.calls.lock().unwrap().len(),
             1,
             "the second delivery must not produce a second voucher"
         );
-        assert!(
-            source.answers()[1].1.contains("already handled"),
-            "{:?}",
+        assert_eq!(summary.duplicates, 1, "and it is counted as what it was");
+        assert_eq!(
+            source.answers().len(),
+            1,
+            "the copy is dropped before the handler, so there is nothing new \
+             to answer: {:?}",
             source.answers()
         );
+        assert_eq!(h.status(id), "executed");
     }
 }
