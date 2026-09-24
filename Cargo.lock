@@ -408,6 +408,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ea-google"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ea-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "ea-propose"
 version = "0.1.0"
 dependencies = [
