@@ -2,7 +2,7 @@
 //!
 //! Upstream this is `bank-import/post.ts`.
 //!
-//! # The three safeguards
+//! # The four safeguards
 //!
 //! 1. **Dry run by default.** `commit: false` builds every payload and reports
 //!    what it would send, and sends nothing. Nothing about the code path
@@ -13,7 +13,9 @@
 //!    consequences this tool has no business making. If the year is missing
 //!    the run aborts with [`FiscalYearMissing`] before a single voucher is
 //!    built.
-//! 3. **Idempotency by marker.** Every voucher this tool has ever written
+//! 3. **The rows must fall inside that year.** See below: without this,
+//!    safeguard 4 is scoped to the wrong year and silently does nothing.
+//! 4. **Idempotency by marker.** Every voucher this tool has ever written
 //!    carries `[imp:<Rad_id>]` in its description. Before posting anything the
 //!    run collects those markers from the vouchers already in the year and
 //!    skips any row whose marker is there, so `post --commit` twice books each
@@ -25,19 +27,51 @@
 //! That is the failure the pagination exists to prevent, and
 //! `collects_markers_through_the_paginating_call` pins it.
 //!
+//! # Why safeguard 3 exists
+//!
+//! The marker scan is **scoped to one financial year**: `get_all("vouchers",
+//! …, &[("financialyear", id)])`. That is upstream's query and it is the right
+//! one — scanning every year of a company's history to post one month of bank
+//! lines would be gratuitous. But it means the idempotency check only sees
+//! vouchers *in the year that was looked up*, and nothing else in the run ties
+//! that year to the dates on the rows.
+//!
+//! Left alone, that is a duplicate-voucher bug rather than a tidiness
+//! question. [`FY_START`]/[`FY_END`] name the year that ended 2026-06-30, and
+//! a closed year is not deleted from Fortnox — `financialyears` still lists
+//! it, so [`covering_year`] still finds it and the run does **not** abort.
+//! It then scans last year's vouchers for markers, finds none matching rows
+//! dated this year, and posts every one of them. Run it twice and every line
+//! is booked twice: the exact failure the pagination work exists to prevent,
+//! reached by a different road.
+//!
+//! So every row's `Datum` is checked against the bounds of the year actually
+//! being scanned, and a row outside them aborts the run with
+//! [`RowOutsideFinancialYear`] naming the row's date and the year's bounds.
+//! The guard is on the *relationship* between the rows and the year, not on
+//! the ability to override a constant: [`PostOptions::fiscal_year`] is the
+//! escape hatch, and this is what makes forgetting to use it loud.
+//!
+//! A row whose `Datum` is not a `YYYY-MM-DD` date at all is left to
+//! [`forslag_to_payload`], which refuses it as a per-row failure — it has no
+//! *when* to compare, and it can never reach Fortnox either way.
+//!
 //! # Divergences from the TypeScript
 //!
-//! * **The financial year is overridable.** Upstream hardcodes
-//!   `2025-07-01`/`2026-06-30` as module constants, which means that on the
-//!   first day of the next financial year `post` aborts saying the year does
-//!   not exist — when what has actually happened is that the constants name
-//!   last year. The constants stay as the default so the behaviour is unchanged
-//!   for the year they describe, but [`PostOptions::fiscal_year`] lets a caller
-//!   name a different one. This is an addition, not a translation.
-//! * **Errors are [`anyhow::Error`]**, with [`FiscalYearMissing`] recoverable by
+//! * **The financial year is overridable, and the rows are checked against
+//!   it.** Upstream hardcodes `2025-07-01`/`2026-06-30` as module constants
+//!   and never looks at the row dates, which is the duplicate-voucher bug
+//!   described above. The constants stay as the default so behaviour is
+//!   unchanged for the year they describe;
+//!   [`PostOptions::fiscal_year`] names a different one, and safeguard 3
+//!   makes the mismatch an error rather than a silent double posting. This is
+//!   an addition, not a translation.
+//! * **Errors are [`anyhow::Error`]**, with [`FiscalYearMissing`] and
+//!   [`RowOutsideFinancialYear`] recoverable by
 //!   [`anyhow::Error::downcast_ref`] — upstream's `instanceof` check, in the
 //!   form Rust has.
 
+use std::collections::HashSet;
 use std::future::Future;
 
 use anyhow::Result;
@@ -67,6 +101,30 @@ pub struct FiscalYearMissing {
     /// The first day that had to be covered.
     pub from: String,
     /// The last day that had to be covered.
+    pub to: String,
+}
+
+/// A row is dated outside the financial year whose vouchers were scanned.
+///
+/// Posting it anyway would book a voucher into a year whose existing vouchers
+/// were never examined for its `[imp:…]` marker, so a second run would book it
+/// again. The fix is almost always to name the right year with
+/// [`PostOptions::fiscal_year`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "row {rad_id} is dated {datum}, outside the financial year {from} → {to} \
+     that was checked for already-booked rows. Posting it would scan the wrong \
+     year for idempotency markers and could book it twice. Name the right \
+     financial year (PostOptions::fiscal_year), or split the rows by year."
+)]
+pub struct RowOutsideFinancialYear {
+    /// The offending row's `Rad_id`.
+    pub rad_id: String,
+    /// The offending row's `Datum`.
+    pub datum: String,
+    /// First day of the year that was scanned.
+    pub from: String,
+    /// Last day of the year that was scanned.
     pub to: String,
 }
 
@@ -122,8 +180,11 @@ pub struct PostOptions<'a> {
     /// [`DEFAULT_SERIES`](super::voucher::DEFAULT_SERIES).
     pub series: Option<&'a str>,
     /// The financial year that must exist, as `(from, to)`. Defaults to
-    /// [`FY_START`]/[`FY_END`]. See the module docs: this is an addition to the
-    /// TypeScript, which hardcodes the pair.
+    /// [`FY_START`]/[`FY_END`], which name the year that ended 2026-06-30 —
+    /// so for current work this has to be set. Leaving it unset for rows
+    /// dated outside that year is an error ([`RowOutsideFinancialYear`]), not
+    /// a silent second booking; see the module docs. This is an addition to
+    /// the TypeScript, which hardcodes the pair.
     pub fiscal_year: Option<(&'a str, &'a str)>,
 }
 
@@ -209,12 +270,32 @@ fn date_field(node: &Value, key: &str) -> String {
         .collect()
 }
 
+/// `Some(s)` unless `s` is empty — a Fortnox field that was absent or blank.
+fn non_empty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// Whether `s` is a `YYYY-MM-DD` date, which is what makes the lexicographic
+/// comparison against a financial year's bounds mean what it looks like it
+/// means. Anything else is not a date this module will compare.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|&i| b[i].is_ascii_digit())
+}
+
 /// Post the approved rows, skipping the ones already booked.
 ///
 /// # Errors
 ///
-/// [`FiscalYearMissing`] when no financial year covers the target span, and
-/// whatever the client returns for the two reads. A failure to post an
+/// [`FiscalYearMissing`] when no financial year covers the target span,
+/// [`RowOutsideFinancialYear`] when a row is dated outside the year whose
+/// vouchers would be scanned, and whatever the client returns for the two
+/// reads. A failure to post an
 /// *individual* row is not an error: it lands in
 /// [`PostResult::failures`] and the run continues, because stopping at the
 /// first bad row would leave the ledger half-written with no summary of where
@@ -237,7 +318,34 @@ pub async fn run_post<C: PostClient>(
         .into());
     };
 
-    // 2. Every marker already in the year, through the paginating call. See
+    // 2. Every row must fall inside the year whose vouchers are about to be
+    //    scanned. Checked against the bounds Fortnox reports for the year that
+    //    was actually found — which may be wider than the requested span —
+    //    falling back to the requested span for a field Fortnox omitted. See
+    //    the module docs: without this the marker scan silently covers the
+    //    wrong year and every row is posted again on the next run.
+    let year_from = non_empty(date_field(year, "FromDate")).unwrap_or_else(|| fy_from.to_string());
+    let year_to = non_empty(date_field(year, "ToDate")).unwrap_or_else(|| fy_to.to_string());
+    for row in rows {
+        let datum = row.datum.trim();
+        // A malformed date has no *when* to compare; `forslag_to_payload`
+        // refuses it a few lines down as a per-row failure, so it can never
+        // be posted regardless.
+        if !is_iso_date(datum) {
+            continue;
+        }
+        if datum < year_from.as_str() || datum > year_to.as_str() {
+            return Err(RowOutsideFinancialYear {
+                rad_id: row.rad_id.clone(),
+                datum: datum.to_string(),
+                from: year_from,
+                to: year_to,
+            }
+            .into());
+        }
+    }
+
+    // 3. Every marker already in the year, through the paginating call. See
     //    the module docs for why a plain `get` would be a duplicate-posting
     //    bug rather than a performance question.
     let year_id = year.get("Id").map(render_id);
@@ -246,7 +354,9 @@ pub async fn run_post<C: PostClient>(
         None => Vec::new(),
     };
     let vouchers = client.get_all("vouchers", "Vouchers", &query).await?;
-    let booked: Vec<String> = vouchers
+    // A set, not a list: upstream uses a `Set` and a company-year of vouchers
+    // against a sheet of rows is a quadratic scan otherwise.
+    let booked: HashSet<String> = vouchers
         .iter()
         .flat_map(|v| extract_markers(v.get("Description").and_then(Value::as_str)))
         .collect();
@@ -501,6 +611,163 @@ mod tests {
             .is_ok());
     }
 
+    // ---- the row-inside-the-year guard (safeguard 3) ------------------------
+
+    /// The duplicate-voucher path, end to end.
+    ///
+    /// `FY_START`/`FY_END` name the year that ended 2026-06-30. A closed year
+    /// is not deleted from Fortnox, so `covering_year` finds it and the run
+    /// does **not** abort — it scopes the marker scan to *that* year's id
+    /// while posting rows dated *this* year, whose vouchers it never looked
+    /// at. Every row is posted again on every run.
+    #[tokio::test]
+    async fn rows_dated_after_the_default_year_abort_instead_of_double_posting() {
+        // Exactly what Fortnox answers today: last year, still listed,
+        // alongside the year the rows actually belong to.
+        let client = Mock::new().with_years(json!({ "FinancialYears": [
+            { "Id": 7, "FromDate": "2025-07-01", "ToDate": "2026-06-30" },
+            { "Id": 8, "FromDate": "2026-07-01", "ToDate": "2027-06-30" },
+        ] }));
+        let this_year = ForslagRow {
+            datum: "2026-09-01".to_string(),
+            ..row("a")
+        };
+
+        let err = run_post(
+            &client,
+            std::slice::from_ref(&this_year),
+            PostOptions {
+                commit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let outside = err
+            .downcast_ref::<RowOutsideFinancialYear>()
+            .unwrap_or_else(|| panic!("expected RowOutsideFinancialYear, got {err:#}"));
+        // The message has to carry both halves of the mismatch, or the reader
+        // cannot tell which of the two dates is the one they got wrong.
+        assert_eq!(outside.datum, "2026-09-01");
+        assert_eq!(outside.from, "2025-07-01");
+        assert_eq!(outside.to, "2026-06-30");
+        let rendered = format!("{err}");
+        for needle in ["2026-09-01", "2025-07-01", "2026-06-30"] {
+            assert!(rendered.contains(needle), "{rendered}");
+        }
+
+        // Nothing was posted, and the wrong year's vouchers were never even
+        // scanned — the guard runs before the listing.
+        assert!(client.posts().is_empty(), "nothing may be posted");
+        assert!(client.get_all_calls().is_empty());
+
+        // And with the right year named, the same rows go through — against
+        // *that* year's id, which is what makes the marker scan meaningful.
+        let client = Mock::new().with_years(json!({ "FinancialYears": [
+            { "Id": 7, "FromDate": "2025-07-01", "ToDate": "2026-06-30" },
+            { "Id": 8, "FromDate": "2026-07-01", "ToDate": "2027-06-30" },
+        ] }));
+        let r = run_post(
+            &client,
+            &[this_year],
+            PostOptions {
+                commit: true,
+                fiscal_year: Some(("2026-07-01", "2027-06-30")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.posted.len(), 1);
+        assert_eq!(
+            client.get_all_calls()[0].2,
+            vec![("financialyear".to_string(), "8".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_before_the_year_is_refused_too() {
+        let client = Mock::new();
+        let err = run_post(
+            &client,
+            &[
+                row("a"),
+                ForslagRow {
+                    datum: "2025-06-30".to_string(),
+                    ..row("b")
+                },
+            ],
+            PostOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RowOutsideFinancialYear>()
+                .map(|e| e.rad_id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bounds_come_from_the_year_fortnox_returned_not_the_requested_span() {
+        // The requested span is a subset of a wider year. A row outside the
+        // span but inside the year is fine: that year's vouchers *are* what
+        // the marker scan covers.
+        let client = Mock::new().with_years(
+            json!({ "FinancialYears": [{ "Id": 9, "FromDate": "2025-01-01", "ToDate": "2026-12-31" }] }),
+        );
+        let r = run_post(
+            &client,
+            &[ForslagRow {
+                datum: "2026-11-30".to_string(),
+                ..row("a")
+            }],
+            PostOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.posted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_boundary_days_of_the_year_are_inside_it() {
+        for datum in ["2025-07-01", "2026-06-30"] {
+            let client = Mock::new();
+            let r = run_post(
+                &client,
+                &[ForslagRow {
+                    datum: datum.to_string(),
+                    ..row("a")
+                }],
+                PostOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{datum}: {e:#}"));
+            assert_eq!(r.posted.len(), 1, "{datum}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_row_outside_the_year_still_aborts_the_run() {
+        // The sheet, not the row, is what is wrong: a Förslag whose rows
+        // straddle a year boundary cannot be posted safely in one pass, and
+        // saying so is better than posting half of it.
+        let client = Mock::new();
+        let err = run_post(
+            &client,
+            &[ForslagRow {
+                datum: "2026-09-01".to_string(),
+                godkann: "N".to_string(),
+                ..row("a")
+            }],
+            PostOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<RowOutsideFinancialYear>().is_some());
+    }
+
     #[tokio::test]
     async fn the_singular_key_and_a_bare_object_are_both_accepted() {
         for years in [
@@ -537,9 +804,15 @@ mod tests {
         assert!(run_post(&client, &[row("a")], PostOptions::default())
             .await
             .is_err());
+        // Rows in the overridden year, which is the only combination that
+        // makes sense: safeguard 3 refuses the rest.
+        let in_year = ForslagRow {
+            datum: "2026-09-01".to_string(),
+            ..row("a")
+        };
         assert!(run_post(
             &client,
-            &[row("a")],
+            &[in_year],
             PostOptions {
                 fiscal_year: Some(("2026-07-01", "2027-06-30")),
                 ..Default::default()
