@@ -16,21 +16,80 @@ already in force if anybody ever writes one.
 Three things discovered while building this that will otherwise cost you real
 time.
 
-### 1. Publish the OAuth app, or re-authorise every seven days
+### 1. The seven-day token, and why "just publish the app" is not free advice
 
 A Google Cloud OAuth client left in **Testing** publishing status issues refresh
-tokens that **expire after 7 days**. The daemon would work for a week and then
-fail every poll with `invalid_grant`, and the message you get back
-(`Re-authorise with: ea-google-authorize work`) would be correct and useless,
-because you would be doing it again next Tuesday.
+tokens to its test users that **expire seven days after consent**. The daemon
+would work for a week and then fail every poll with `invalid_grant`, and the
+message you get back (`Re-authorise with: ea-google-authorize work`) would be
+correct and useless, because you would be doing it again next Tuesday.
 
-In Google Cloud Console → **APIs & Services** → **OAuth consent screen**, set
-the publishing status to **In production** ("Publish app"). For an *External*
-app with only your own account as a user this needs no verification review as
-long as you request only the three scopes below — Google shows an "unverified
-app" interstitial during consent, which you click through once. Do this
-**before** the first `authorize` run, or the token you mint will be a seven-day
-one.
+The obvious fix — flip the app to **In production** — is not obviously
+available here, because of *which* scopes this connector asks for:
+
+| scope | Google's sensitivity tier |
+|---|---|
+| `calendar.readonly` | sensitive |
+| `gmail.readonly` | **restricted** |
+| `gmail.compose` | **restricted** |
+
+Restricted is Google's strictest tier. Google's own documentation says an app
+requesting restricted scopes must complete **app verification**, and that an app
+which "has the ability to access data from or through a third-party server" must
+additionally pass an independent **CASA security assessment** by a
+Google-empanelled assessor, repeated **annually**. That is a paid, recurring
+process aimed at products with users, not at a daemon on one laptop — and note
+that this daemon *does* forward mail bodies to a model provider for triage, so
+"it is only local, the assessment cannot apply to me" is not a conclusion to
+reach casually.
+
+So there is a real trade-off, and you have to pick:
+
+**A. Stay in Testing and re-authorise weekly.** Certain, free, and annoying: one
+`ea-google-authorize <account>` run per account per week, forever. If you only
+want the calendar side, dropping the two Gmail scopes leaves you with one
+*sensitive* scope and no restricted one, which takes the security assessment
+out of the picture — verification for production still applies, but that is a
+review, not an annual paid audit.
+
+**B. Internal app — the clean way out, if you have a Workspace domain.** If the
+account belongs to a Google Workspace or Cloud Identity organisation, and the
+Cloud project lives in that organisation, set the app's audience to **Internal**.
+An Internal app serves only users in the organisation and is not subject to the
+External verification flow, and the seven-day test-user expiry does not apply
+because an Internal app has no test users. Caveats: a consumer `@gmail.com`
+account cannot do this; your Workspace admin can still block the app or the
+scopes for the domain; and it covers only accounts in that domain, so a `work`
+account on the domain and a `private` consumer account are two different
+situations under one connector.
+
+**C. Publish External without verification.** Google documents that an app *can*
+be published unverified — while calling it strongly discouraged — with the app
+name and logo hidden, an unverified-app warning at consent, and a hard cap of
+100 users. What is documented, but which **I have not been able to confirm
+against a live project**, is whether that is actually reachable for an app
+requesting restricted scopes, and whether it removes the seven-day expiry:
+Google ties that expiry to the *Testing* status, which implies publishing ends
+it, and there are credible reports that the console refuses to publish an app
+requesting restricted Gmail scopes until verification is submitted. Google can
+also come back and require verification later. Treat this as "try it and see
+what the console says", not as a promise.
+
+**D. Submit for verification and CASA.** Correct if this ever becomes something
+other people use. Disproportionate for a single-user tool: it is an annual,
+paid assessment.
+
+What to actually do: open **Google Auth Platform** → **Audience** in the Cloud
+Console and read what your own project says — it states your audience, your
+publishing status, and what changing it would require. Decide **before** the
+first `authorize` run: the publishing status at consent time is what decides
+whether the token you mint is a seven-day one.
+
+References: [OAuth app state
+overview](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview),
+[Restricted scope
+verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification),
+[Manage app audience](https://support.google.com/cloud/answer/15549945).
 
 ### 2. Do not re-run `authorize` casually
 
@@ -69,8 +128,9 @@ fix; it is not in this phase.
 1. Google Cloud Console → create (or pick) a project.
 2. **APIs & Services** → **Enabled APIs & services** → enable the **Google
    Calendar API** and the **Gmail API**.
-3. **OAuth consent screen** → *External*, fill in the app name and your own
-   address, and add exactly these three scopes:
+3. **OAuth consent screen** → choose the audience point 1 pointed you at
+   (*Internal* if you have a Workspace domain, otherwise *External*), fill in
+   the app name and your own address, and add exactly these three scopes:
 
    ```
    https://www.googleapis.com/auth/calendar.readonly
@@ -81,7 +141,8 @@ fix; it is not in this phase.
    `gmail.compose` is what lets `create_draft` write a draft. It does not grant
    sending — `gmail.send` is deliberately absent, and adding it would weaken the
    guarantee in the first paragraph of this file.
-4. **Publish app** (see point 1 above).
+4. Set the publishing status you settled on in point 1 above — and know which
+   one it is before you authorise, not after.
 5. **Credentials** → **Create credentials** → **OAuth client ID** → **Desktop
    app**. Register `http://127.0.0.1:8471/callback` as the redirect URI — that
    is the loopback address `ea-google-authorize` listens on.
@@ -142,7 +203,7 @@ notification, you reading it — could tell.
 |---|---|---|
 | `list_events` | `auto` | Events on one account's primary calendar, now to `days` ahead (default 7, max 90). |
 | `find_conflicts` | `auto` | Overlapping timed events. Pass `other_accounts` to scan several accounts as one calendar — that is how a work meeting clashing with a private appointment is found. All-day events excluded; back-to-back is not a clash. |
-| `list_mail` | `auto` | Messages matching a Gmail query (default `is:unread`), newest first. |
+| `list_mail` | `auto` | Messages matching a Gmail query, newest first. Defaults to the same query `watch_poll` runs: `is:unread -category:promotions -category:social newer_than:7d`. |
 | `get_mail` | `auto` | One message in full, by the id `list_mail` returned. |
 | `create_draft` | `approve` | Writes a plain-text draft. **The only write in this connector.** A human approves each one: a draft is cheap, but it appears in your mailbox with your name on it. |
 | `watch_poll` | `auto` | What the daemon calls every `watch_interval_secs` (2 minutes). Takes no arguments. |
@@ -156,8 +217,8 @@ A JSON array of `{ external_id, kind, payload }`, covering three signals across
 | kind | external id | what |
 |---|---|---|
 | `calendar_event` | `gcal:<account>:<id>` | Each event in the next 7 days. |
-| `calendar_conflict` | `gconflict:<id>\|<id>` | Each overlapping pair, computed over the **merged** calendars of all accounts. |
-| `mail` | `gmail:<account>:<id>` | Each of the 25 most recent unread messages, per account. |
+| `calendar_conflict` | `gconflict:<id>\|<id>` | Each overlapping pair, computed over the **merged** calendars of all accounts — except a meeting you accepted in two of them, which is one meeting, not a clash. |
+| `mail` | `gmail:<account>:<id>` | Each of the 25 most recent messages matching `is:unread -category:promotions -category:social newer_than:7d`, per account. |
 
 The account is part of every id because the same event or message id can
 legitimately exist in two accounts, and those are two rows, not one.
@@ -167,6 +228,22 @@ unordered pair, and the order it arrives in depends on which account was polled
 first; an id built in arrival order would flip between polls, and each flip
 would register as a brand-new event — the same clash nagging you every two
 minutes forever.
+
+The unread query is not plain `is:unread`. That includes the Promotions and
+Social tabs, where most mailboxes keep most of their unread messages; with a cap
+of 25 per poll, a week of newsletters would fill every poll and starve out the
+mail you actually needed to see. `newer_than:7d` bounds it the way the 7-day
+lookahead bounds the calendar: mail older than that which is still unread is not
+news. Change it in `watch::UNREAD_QUERY`, or per call with `list_mail`'s `query`.
+
+One invitation accepted in **both** accounts is two calendar entries that
+overlap perfectly, and reporting it as a cross-account clash would be a
+permanent false alarm with a stable id — news the daemon can never retire, every
+two minutes, until you stop reading conflicts at all. Both copies are still
+reported as their own `calendar_event` rows; they are just not reported as
+clashing, because Google's `iCalUID` (stable across calendars, unlike the event
+id) says they are one meeting. Two events with **no** `iCalUID` are never
+treated as the same meeting: a missing conflict is worse than a spurious one.
 
 Mail bodies are truncated at 2000 characters, visibly. These payloads are read
 back into a tier-1 triage prompt in batches, and one newsletter with a 200 KB
@@ -226,6 +303,14 @@ Assumptions worth re-checking against live accounts:
 - All-day events are parsed (a bare `date` boundary, midnight UTC) but excluded
   from conflict detection, because an all-day event overlaps everything that day
   and would drown the signal.
+- Gmail's category operators (`-category:promotions`, `-category:social`) are
+  inbox-tab filters; an account with tabs disabled simply matches nothing extra,
+  which is the harmless direction.
+- `iCalUID` is read off `events.list` and used only to suppress the
+  same-meeting-twice conflict. Google documents it as stable across calendaring
+  systems; with `singleEvents=true` the instances of a recurring series can share
+  one, which only matters if two instances of one series overlap — and calling
+  that "not a conflict" is the right answer anyway.
 - Gmail reads `messages.list` then one `messages.get` per message at
   `format=full` — 1 + 25 requests per account per poll. `format=metadata` would
   be cheaper but omits the body, which is the part triage scores.

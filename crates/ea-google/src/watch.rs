@@ -15,7 +15,11 @@
 //! * **Calendar conflicts** — pairs of overlapping timed events, computed over
 //!   the *merged* list from every account. The cross-account collision (a
 //!   lecture against a private appointment) is the single most valuable one
-//!   and is only visible because the accounts are polled into one `Vec`.
+//!   and is only visible because the accounts are polled into one `Vec`. One
+//!   invitation accepted in *both* accounts is not one of them: it is two
+//!   copies of one meeting, told apart by `iCalUID` in
+//!   [`calendar::find_conflicts`], because reporting it every two minutes
+//!   forever is how the owner learns to ignore conflicts.
 //! * **Unread mail** — `gmail:<account>:<id>`, the most recent
 //!   [`MAX_UNREAD`] messages matching [`UNREAD_QUERY`].
 //!
@@ -74,9 +78,17 @@ pub const KIND_MAIL: &str = "mail";
 /// dedup keeps it from being re-announced in between.
 pub const LOOKAHEAD: chrono::Duration = chrono::Duration::days(7);
 
-/// The Gmail search a poll runs. Unread mail only: read mail is, by
-/// definition, mail the owner has already dealt with.
-pub const UNREAD_QUERY: &str = "is:unread";
+/// The Gmail search a poll runs.
+///
+/// Unread mail only — read mail is, by definition, mail the owner has already
+/// dealt with — but `is:unread` *alone* is not that search. It includes the
+/// Promotions and Social tabs, which in a typical mailbox hold far more
+/// unread messages than the inbox does; with [`MAX_UNREAD`] capping a poll at
+/// 25 messages per account, a week of newsletters would fill every poll and
+/// starve out the mail that matters. `newer_than:7d` bounds it the same way
+/// [`LOOKAHEAD`] bounds the calendar: mail older than a week that is still
+/// unread is not news.
+pub const UNREAD_QUERY: &str = "is:unread -category:promotions -category:social newer_than:7d";
 
 /// How many unread messages one poll fetches per account. Each one costs a
 /// `messages.get` (see the `gmail` module docs on the list-then-get cost), so
@@ -499,6 +511,55 @@ mod tests {
         assert_eq!(conflicts[0].payload["overlap_end"], "2026-09-25T11:30:00Z");
     }
 
+    /// The owner accepted one invitation in both accounts. Merging the
+    /// calendars makes those two copies overlap 100%, and without the
+    /// `iCalUID` check every poll would report a permanent cross-account
+    /// clash with a stable id that dedup never retires — noise in exactly the
+    /// signal this connector exists to produce. Both copies are still their
+    /// own event row: they really are two calendar entries.
+    #[tokio::test]
+    async fn one_invitation_accepted_in_both_accounts_is_not_reported_as_a_clash() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = both_accounts(tmp.path());
+
+        let mut work_copy = timed(
+            "w-copy",
+            "Sprint review",
+            "2026-09-25T10:00:00Z",
+            "2026-09-25T11:00:00Z",
+        );
+        work_copy["iCalUID"] = serde_json::json!("sprint-review@google.com");
+        let mut private_copy = timed(
+            "p-copy",
+            "Sprint review",
+            "2026-09-25T10:00:00Z",
+            "2026-09-25T11:00:00Z",
+        );
+        private_copy["iCalUID"] = serde_json::json!("sprint-review@google.com");
+
+        mount_events(&server, WORK_TOKEN, serde_json::json!([work_copy])).await;
+        mount_events(&server, PRIVATE_TOKEN, serde_json::json!([private_copy])).await;
+        mount_no_mail(&server, WORK_TOKEN).await;
+        mount_no_mail(&server, PRIVATE_TOKEN).await;
+
+        let (cal, mail) = clients(&server);
+        let entries = poll(&auth, &cal, &mail, &accounts(&["work", "private"]), at(NOW))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            of_kind(&entries, KIND_CONFLICT),
+            Vec::<&WatchEntry>::new(),
+            "one meeting in two calendars must not be a conflict: {entries:#?}"
+        );
+        assert_eq!(
+            of_kind(&entries, KIND_EVENT).len(),
+            2,
+            "both copies are still real calendar entries"
+        );
+    }
+
     #[tokio::test]
     async fn an_event_payload_carries_what_triage_needs() {
         let server = MockServer::start().await;
@@ -613,6 +674,7 @@ mod tests {
         let a = CalEvent {
             id: "zzz".into(),
             account: "work".into(),
+            ical_uid: None,
             title: "A".into(),
             start: at("2026-09-25T10:00:00Z"),
             end: at("2026-09-25T11:00:00Z"),

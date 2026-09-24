@@ -103,8 +103,19 @@ async fn watch_poll_without_credentials_is_an_error_naming_the_file_and_the_serv
 /// The required `account` is not merely declared in the schema — it is
 /// enforced on the wire. A call that omits it must fail, not fall back to
 /// some default mailbox.
+///
+/// This server is deliberately **unconfigured**, so every tool body would
+/// fail anyway with "no usable credentials". `is_error == Some(true)` alone
+/// therefore proves nothing at all: it is satisfied identically whether the
+/// schema rejected the call or the credentials did, and it stays green after
+/// `account` is made optional. The assertion that carries the weight is the
+/// text — `missing field \`account\`` is rmcp's argument-deserialisation
+/// refusal, produced *before* the tool body runs. Mutation-checked: making
+/// `account` an `Option<String>` on any of these four tools fails this test,
+/// because the call then reaches the body and comes back with the
+/// credentials error instead.
 #[tokio::test]
-async fn a_tool_call_with_no_account_is_refused() {
+async fn a_tool_call_with_no_account_is_refused_by_the_schema_not_by_the_credentials() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = spawn(dir.path()).await;
 
@@ -115,11 +126,21 @@ async fn a_tool_call_with_no_account_is_refused() {
             .call_tool(params)
             .await
             .expect("a missing argument must not kill the connector");
+        let text = text_of(&result);
         assert_eq!(
             result.is_error,
             Some(true),
-            "{tool} accepted a call with no account: {}",
-            text_of(&result)
+            "{tool} accepted a call with no account: {text}"
+        );
+        assert!(
+            text.contains("missing field `account`"),
+            "{tool} must refuse the call for the missing `account`, before it ever \
+             looks at credentials. Got: {text}"
+        );
+        assert!(
+            !text.contains("no usable credentials"),
+            "{tool} let a call with no account reach the tool body, where it failed \
+             for an unrelated reason. `account` is no longer required. Got: {text}"
         );
     }
 

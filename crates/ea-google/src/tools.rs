@@ -214,7 +214,8 @@ pub struct ListMailArgs {
     /// no default account.
     pub account: String,
     /// Gmail search syntax, e.g. `is:unread` or `from:prof@kth.se`. Defaults
-    /// to `is:unread`; pass an empty string for no filter.
+    /// to the poll's own query — unread mail from the last 7 days, excluding
+    /// the Promotions and Social tabs. Pass an empty string for no filter.
     pub query: Option<String>,
     /// How many messages to return. Defaults to 25.
     pub max: Option<u32>,
@@ -301,7 +302,9 @@ impl GoogleServer {
 
     #[tool(
         description = "List messages in one Google account's mailbox matching a Gmail search \
-                       query (default `is:unread`), newest first, as a JSON array of \
+                       query (default `is:unread -category:promotions -category:social \
+                       newer_than:7d`, the same query watch_poll runs), newest first, as a \
+                       JSON array of \
                        { id, thread_id, account, from, subject, snippet, body, received_at, \
                        labels }. Read-only. `account` is required: there is no default mailbox."
     )]
@@ -832,6 +835,26 @@ mod tests {
                  account: a default silently reads the wrong mailbox. {schema:#}"
             );
         }
+    }
+
+    /// The exemption list itself, pinned to its one member.
+    ///
+    /// Without this, the loop above skips whatever
+    /// `ACCOUNT_EXEMPT_TOOLS` happens to contain, so adding `"get_mail"` to it
+    /// would quietly buy that tool an exemption from the whole multi-account
+    /// rule and nothing in this crate would fail. Widening the list must mean
+    /// deliberately editing this test — and the only reason that has ever
+    /// been good enough is the one `watch_poll` has: the daemon calls it with
+    /// `{}` on a timer, so a required argument there breaks every poll. A
+    /// tool a *model* calls has no such excuse.
+    #[test]
+    fn only_watch_poll_is_exempt_from_the_required_account() {
+        assert_eq!(
+            ACCOUNT_EXEMPT_TOOLS,
+            ["watch_poll"],
+            "a second exempt tool means a tool that can read the wrong mailbox with \
+             nothing downstream able to tell. See the module docs."
+        );
     }
 
     /// The exemption, pinned rather than assumed: `ea_daemon::jobs` calls

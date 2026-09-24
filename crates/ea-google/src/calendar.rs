@@ -20,6 +20,12 @@
 //! the single most valuable thing this connector can surface. See the
 //! `a_conflict_spanning_work_and_private_accounts_is_found` test.
 //!
+//! Merging the accounts creates one false positive that has to be removed
+//! again: an invitation the owner accepted in *both* accounts appears twice,
+//! overlapping itself completely. [`same_meeting`] uses Google's `iCalUID` —
+//! stable across calendars, unlike the per-calendar event `id` — to tell one
+//! meeting seen twice from two meetings at once.
+//!
 //! # HTTP hardening
 //!
 //! The same standard as [`crate::auth`] and `ea-canvas`'s client: no
@@ -89,6 +95,13 @@ const PAGE_SIZE: &str = "250";
 pub struct CalEvent {
     pub id: String,
     pub account: String,
+    /// Google's cross-calendar identity for the meeting (`iCalUID` on
+    /// `events.list`), when it sends one. Two accounts that both accepted the
+    /// same invitation hold two events with two different `id`s and *one*
+    /// `iCalUID`; [`find_conflicts`] uses that to tell "the same meeting,
+    /// twice" from "two meetings at once". `None` when Google omitted it —
+    /// see [`same_meeting`] for why a missing id never collapses anything.
+    pub ical_uid: Option<String>,
     pub title: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
@@ -111,6 +124,8 @@ pub struct CalEvent {
 pub struct RawEvent {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default, rename = "iCalUID")]
+    i_cal_uid: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -185,6 +200,9 @@ pub fn normalize(raw: &RawEvent, account: &str) -> Option<CalEvent> {
     Some(CalEvent {
         id,
         account: account.to_string(),
+        // An empty `iCalUID` is no id at all, and must not make every event
+        // that has one "the same meeting" as every other.
+        ical_uid: raw.i_cal_uid.clone().filter(|uid| !uid.trim().is_empty()),
         title: raw
             .summary
             .clone()
@@ -217,6 +235,29 @@ fn parse_point(point: &RawPoint) -> Option<(DateTime<Utc>, bool)> {
 // Conflict detection
 // ---------------------------------------------------------------------------
 
+/// Whether two events are one meeting seen twice rather than two meetings.
+///
+/// Google gives every event an `iCalUID` that is stable *across* calendars:
+/// an invitation accepted in both the `work` and the `private` account
+/// becomes two events with two different `id`s, in two different calendars,
+/// carrying one `iCalUID`. Merging both accounts into one conflict scan (see
+/// the module docs) makes that pair overlap 100%, so without this check the
+/// owner's own dual-accepted meetings would each be reported as a permanent
+/// cross-account clash — every poll, forever, with a stable id that dedup
+/// will never retire. That is the fastest way to teach someone to ignore the
+/// one signal this connector exists to produce.
+///
+/// Two events with **no** `iCalUID` are *not* the same meeting. Treating a
+/// missing id as a match would collapse every id-less event into one and
+/// silence real clashes, which is the strictly worse failure: a false
+/// conflict is noise, a missing conflict is a meeting walked into.
+fn same_meeting(a: &CalEvent, b: &CalEvent) -> bool {
+    match (&a.ical_uid, &b.ical_uid) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 /// Every pair of timed events that overlap, across every account represented
 /// in `events`.
 ///
@@ -240,6 +281,11 @@ pub fn find_conflicts(events: &[CalEvent]) -> Vec<(CalEvent, CalEvent)> {
         for b in &timed[i + 1..] {
             if b.start >= a.end {
                 break;
+            }
+            // One meeting the owner accepted twice is not a clash with
+            // itself; see `same_meeting`.
+            if same_meeting(a, b) {
+                continue;
             }
             conflicts.push((a.clone(), (*b).clone()));
         }
@@ -527,6 +573,7 @@ mod tests {
     fn timed_event() -> RawEvent {
         RawEvent {
             id: Some("evt-1".to_string()),
+            i_cal_uid: Some("evt-1@google.com".to_string()),
             status: None,
             summary: Some("Advisor meeting".to_string()),
             start: Some(point_datetime("2026-10-01T14:00:00+02:00")),
@@ -627,6 +674,7 @@ mod tests {
         CalEvent {
             id: id.to_string(),
             account: account.to_string(),
+            ical_uid: None,
             title: id.to_string(),
             start: at(start),
             end: at(end),
@@ -642,6 +690,11 @@ mod tests {
         let mut e = timed(account, id, start, end);
         e.all_day = true;
         e
+    }
+
+    fn with_uid(mut event: CalEvent, uid: &str) -> CalEvent {
+        event.ical_uid = Some(uid.to_string());
+        event
     }
 
     #[test]
@@ -698,6 +751,114 @@ mod tests {
 
         let conflicts = find_conflicts(&[work.clone(), private.clone()]);
         assert_eq!(conflicts, vec![(work, private)]);
+    }
+
+    /// The false positive that would have cost this connector its most
+    /// valuable signal: one invitation accepted in *both* accounts is two
+    /// events overlapping 100%, and reporting it as a cross-account clash
+    /// every two minutes forever is how an owner learns to ignore conflicts.
+    #[test]
+    fn one_meeting_accepted_in_both_accounts_is_not_a_conflict_with_itself() {
+        let work = with_uid(
+            timed(
+                "work",
+                "work-copy",
+                "2026-10-01T14:00:00Z",
+                "2026-10-01T15:00:00Z",
+            ),
+            "abc123@google.com",
+        );
+        let private = with_uid(
+            timed(
+                "private",
+                "private-copy",
+                "2026-10-01T14:00:00Z",
+                "2026-10-01T15:00:00Z",
+            ),
+            "abc123@google.com",
+        );
+
+        assert_eq!(
+            find_conflicts(&[work, private]),
+            Vec::new(),
+            "the same meeting in two calendars is one meeting, not a clash"
+        );
+    }
+
+    /// And the check must not have bought that by silencing the real thing.
+    #[test]
+    fn two_different_meetings_overlapping_across_accounts_are_still_a_conflict() {
+        let work = with_uid(
+            timed(
+                "work",
+                "standup",
+                "2026-10-01T14:00:00Z",
+                "2026-10-01T15:00:00Z",
+            ),
+            "standup@google.com",
+        );
+        let private = with_uid(
+            timed(
+                "private",
+                "dentist",
+                "2026-10-01T14:30:00Z",
+                "2026-10-01T15:30:00Z",
+            ),
+            "dentist@google.com",
+        );
+
+        assert_eq!(
+            find_conflicts(&[work.clone(), private.clone()]),
+            vec![(work, private)]
+        );
+    }
+
+    /// A missing id is not a shared id. Collapsing every event Google sent no
+    /// `iCalUID` for into one "meeting" would silence real clashes, which is
+    /// strictly worse than the noise this check exists to remove.
+    #[test]
+    fn events_without_an_ical_uid_are_not_collapsed_into_one_meeting() {
+        let a = timed("work", "a", "2026-10-01T14:00:00Z", "2026-10-01T15:00:00Z");
+        let b = timed(
+            "private",
+            "b",
+            "2026-10-01T14:30:00Z",
+            "2026-10-01T15:30:00Z",
+        );
+        assert_eq!(a.ical_uid, None);
+
+        assert_eq!(find_conflicts(&[a.clone(), b.clone()]), vec![(a, b)]);
+    }
+
+    /// An empty string is a missing id, not a shared one — otherwise every
+    /// event Google answers with `"iCalUID": ""` matches every other.
+    #[test]
+    fn an_empty_ical_uid_is_treated_as_absent() {
+        let raw = RawEvent {
+            id: Some("evt-1".to_string()),
+            i_cal_uid: Some("   ".to_string()),
+            start: Some(point_datetime("2026-10-01T14:00:00Z")),
+            end: Some(point_datetime("2026-10-01T15:00:00Z")),
+            ..Default::default()
+        };
+
+        assert_eq!(normalize(&raw, "work").unwrap().ical_uid, None);
+    }
+
+    #[test]
+    fn normalize_carries_the_ical_uid_through() {
+        let raw = RawEvent {
+            id: Some("evt-1".to_string()),
+            i_cal_uid: Some("abc123@google.com".to_string()),
+            start: Some(point_datetime("2026-10-01T14:00:00Z")),
+            end: Some(point_datetime("2026-10-01T15:00:00Z")),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize(&raw, "work").unwrap().ical_uid.as_deref(),
+            Some("abc123@google.com")
+        );
     }
 
     #[test]
