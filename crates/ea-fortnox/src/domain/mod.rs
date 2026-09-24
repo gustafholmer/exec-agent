@@ -4,4 +4,5 @@
 pub mod bas;
 pub mod moms;
 pub mod money;
+pub mod posting;
 pub mod voucher;
