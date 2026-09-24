@@ -15,9 +15,9 @@ fn home() -> PathBuf {
 }
 
 /// Create `dir` (and any missing parents) with mode `0700` if it doesn't
-/// already exist, and re-assert `0700` if it does. This directory holds the
-/// daemon's database (approval queue) and its unix socket, so it must never
-/// be group- or world-accessible.
+/// already exist, and re-assert `0700` if it does. These directories hold the
+/// daemon's database (approval queue), its unix socket, and every connector's
+/// credentials, so none of them may be group- or world-accessible.
 fn ensure_private_dir(dir: &Path) {
     if !dir.exists() {
         let _ = std::fs::DirBuilder::new()
@@ -38,19 +38,32 @@ pub fn state_dir() -> PathBuf {
     dir
 }
 
-/// `~/.config/exec-agent`, or `$EA_CONFIG_DIR`. Created if absent.
-pub fn config_dir() -> PathBuf {
-    let dir = from_env_or("EA_CONFIG_DIR", || {
-        home().join(".config").join("exec-agent")
-    });
-    let _ = std::fs::create_dir_all(&dir);
+/// [`ensure_private_dir`], returning the directory, so the two config
+/// accessors below cannot drift from the state directory's guarantee.
+fn private_dir(dir: PathBuf) -> PathBuf {
+    ensure_private_dir(&dir);
     dir
 }
 
+/// `~/.config/exec-agent`, or `$EA_CONFIG_DIR`. Created (mode `0700`) if
+/// absent.
+///
+/// Owner-only for the same reason the state directory is, and it was not:
+/// `create_dir_all` takes the ambient umask, which on this machine yields
+/// `0755`. What lives here is the Telegram bot token, the owner's chat id, and
+/// — under [`connector_config_dir`] — whatever credential each connector keeps
+/// beside its manifest. A world-readable directory does not by itself expose a
+/// `0600` token file, but it does list the filenames, and the asymmetry
+/// between the two directories was an accident rather than a decision.
+pub fn config_dir() -> PathBuf {
+    private_dir(from_env_or("EA_CONFIG_DIR", || {
+        home().join(".config").join("exec-agent")
+    }))
+}
+
+/// One connector's configuration directory, `0700` like its parent.
 pub fn connector_config_dir(connector: &str) -> PathBuf {
-    let dir = config_dir().join(connector);
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    private_dir(config_dir().join(connector))
 }
 
 pub fn database_path() -> PathBuf {
@@ -80,6 +93,37 @@ mod tests {
         assert!(target.is_dir());
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "state dir must be owner-only");
+    }
+
+    /// The config directory holds the bot token and the connectors'
+    /// credentials; it must be as private as the state directory. Exercised
+    /// through the shared helper the public accessors now go through, for the
+    /// same reason as the test above.
+    #[test]
+    fn a_config_directory_is_owner_only_like_the_state_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = private_dir(tmp.path().join("exec-agent"));
+        let connector = private_dir(config.join("canvas"));
+
+        for dir in [&config, &connector] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only", dir.display());
+        }
+    }
+
+    /// And a directory left at the ambient umask by an older version is
+    /// tightened on the next start rather than left as it was.
+    #[test]
+    fn an_existing_world_readable_config_directory_is_tightened() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("exec-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = private_dir(dir);
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

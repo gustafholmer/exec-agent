@@ -12,10 +12,22 @@
 
 mod client;
 
+use std::time::Duration;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use client::Client;
 use serde_json::{json, Value};
+
+/// How long `ea chat` waits, where every other subcommand uses
+/// [`ea_core::ipc::DEFAULT_CALL_TIMEOUT`].
+///
+/// `chat` is the one call that blocks on a `claude -p` session, and the
+/// daemon's own runner gives that session 300 seconds
+/// (`ea_daemon::session::DEFAULT_TIMEOUT`) before it signals the child. Half a
+/// minute past that, so the daemon's bound is always the one that fires and
+/// the CLI's is only there for a daemon that has stopped answering at all.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(330);
 
 #[derive(Parser)]
 #[command(name = "ea", about = "exec-agent CLI", version)]
@@ -95,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Chat { message } => {
             let message = message.join(" ");
+            let client = Client::with_timeout(ea_core::paths::socket_path(), CHAT_TIMEOUT);
             print_json(&client.call("chat", json!({ "message": message })).await?)?
         }
     }

@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Context;
@@ -28,7 +29,44 @@ pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u32) -> anyhow::Resu
     conn.execute_batch(SCHEMA)
         .context("applying the database schema")?;
     migrate(&conn).context("migrating the database schema")?;
+    restrict(path);
     Ok(conn)
+}
+
+/// Tighten the database and its two WAL sidecars to `0600`.
+///
+/// SQLite creates all three at the ambient umask — `0644` on this machine —
+/// and this file is the approval queue, the action ledger and every event the
+/// connectors have fetched: the owner's mail subjects, calendar entries and
+/// coursework. The `0700` state directory already keeps other users out, but
+/// that is one mistake away from being the only thing that does (a directory
+/// copied with `cp -R`, a backup tool that flattens modes, a state dir
+/// relocated somewhere looser via `$EA_STATE_DIR`). Defence in depth, on the
+/// files themselves.
+///
+/// Re-applied on every open rather than once at creation: `-wal` and `-shm`
+/// are deleted on a clean close and recreated — at the ambient umask again —
+/// by whichever process next opens the database.
+///
+/// Best effort. A database that opened fine must not fail to be usable because
+/// its mode could not be changed (a read-only mount, a file owned by another
+/// user); the failure is logged and the daemon runs.
+fn restrict(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_os_string();
+        file.push(suffix);
+        let file = std::path::PathBuf::from(file);
+        if !file.exists() {
+            continue;
+        }
+        if let Err(err) = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %file.display(),
+                error = %err,
+                "could not restrict the database file to owner-only"
+            );
+        }
+    }
 }
 
 /// Columns added to a table that already exists in somebody's database.
@@ -154,6 +192,44 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(open(&path).unwrap());
         open(&path).expect("reopening an existing database must succeed");
+    }
+
+    /// The database is the approval queue and the whole event history. The
+    /// state directory being `0700` is not a reason for the files inside it to
+    /// be world-readable.
+    #[test]
+    fn the_database_and_its_wal_sidecars_are_owner_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = open(&path).unwrap();
+        // Force the WAL sidecars into existence with a real write.
+        conn.execute_batch(
+            "INSERT INTO events (source, external_id, kind, payload, created_at)
+             VALUES ('canvas','e1','assignment','{}','2026-09-23T00:00:00Z')",
+        )
+        .unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            let file = dir.path().join(format!("state.db{suffix}"));
+            assert!(file.exists(), "{} should exist", file.display());
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be owner-only", file.display());
+        }
+    }
+
+    /// The sidecars are recreated at the ambient umask by whoever opens the
+    /// database next, so the tightening has to happen on every open.
+    #[test]
+    fn a_reopened_database_is_tightened_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        drop(open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _conn = open(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

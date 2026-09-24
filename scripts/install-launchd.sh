@@ -99,9 +99,23 @@ cat > "$PLIST" <<PLIST_EOF
   <key>StandardErrorPath</key>
   <string>$LOG_DIR/daemon.err.log</string>
 
-  <!-- A crash loop should back off rather than spin. -->
+  <!-- A crash loop should back off rather than spin.
+
+       launchd's default is 10 seconds, and 10 seconds is not a back-off for
+       the failure that actually happens here: KeepAlive plus a *fatal startup*
+       error (a policy.toml naming a foreign connector, a corrupt database, a
+       state directory that cannot be locked) is a process that dies during
+       start-up and is restarted six times a minute, forever, each time writing
+       its error to daemon.err.log. Nothing rotates that log, because the job
+       that rotates it is the retention job, which lives inside the daemon that
+       never finishes starting. Overnight at 10s that is ~8600 restarts.
+
+       120 seconds: still well inside "it recovers on its own while you sleep"
+       for a transient cause, 12x fewer restarts and 12x less log for a
+       permanent one, and a delay a human watching `launchctl list` will
+       actually notice rather than mistake for a running daemon. -->
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>120</integer>
 </dict>
 </plist>
 PLIST_EOF

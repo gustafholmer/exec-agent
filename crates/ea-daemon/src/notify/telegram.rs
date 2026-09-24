@@ -376,7 +376,7 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
             },
             Err(err) => {
                 tracing::warn!(action = id, error = %err, "approved action failed to execute");
-                format!("#{id} was approved but could not be run. Check `ea actions`.")
+                Self::could_not_run(id)
             }
         }
     }
@@ -391,6 +391,20 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
                 self.already_handled(id)
             }
         }
+    }
+
+    /// What the owner is told when an approved action could not be run at all.
+    ///
+    /// It names commands that exist. This used to end "Check `ea actions`",
+    /// which is not a subcommand: a person following that instruction — at the
+    /// moment they have just been told something failed — gets a clap usage
+    /// error instead of an answer. The two that answer the question are
+    /// `ea queue` (what is still waiting) and `ea log` (what happened).
+    fn could_not_run(id: i64) -> String {
+        format!(
+            "#{id} was approved but could not be run. \
+             `ea queue` for what is still waiting, `ea log` for what happened."
+        )
     }
 
     /// The sentence shown when a transition did not apply.
@@ -965,6 +979,21 @@ record_voucher = "approve"
             })
             .unwrap()
             .id
+    }
+
+    /// Every command this module tells the owner to run has to be a command
+    /// that exists. `ea actions` never did; the two that answer the question
+    /// do.
+    #[test]
+    fn the_failure_reply_names_commands_that_exist() {
+        let text = Notifier::<FakeTransport, FakeCaller>::could_not_run(7);
+        assert!(text.contains("#7"), "{text}");
+        assert!(text.contains("`ea queue`"), "{text}");
+        assert!(text.contains("`ea log`"), "{text}");
+        assert!(
+            !text.contains("ea actions"),
+            "`ea actions` is not a subcommand: {text}"
+        );
     }
 
     #[tokio::test]
