@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ea-core",
+  "crates/ea-daemon",
+  "crates/ea-cli",
+  "crates/ea-echo",
+  "crates/ea-propose",
+  "crates/ea-canvas",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "signal", "io-util", "sync"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "3.4", features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
+uuid = { version = "1", features = ["v4"] }
+rust_decimal = "1"
+tempfile = "3"
+wiremock = "0.6"
+libc = "0.2"

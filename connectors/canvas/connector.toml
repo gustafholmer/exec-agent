@@ -1,0 +1,11 @@
+# Discovered by the daemon: a directory holding both connector.toml and
+# policy.toml is a connector. `command` is resolved against the running
+# executable's directory first, then $PATH, so a release build next to
+# ea-daemon needs no install step.
+name = "canvas"
+command = "ea-canvas"
+args = []
+
+# Half an hour. Coursework deadlines move on the order of days; polling harder
+# spends the user's Canvas rate limit for nothing.
+watch_interval_secs = 1800

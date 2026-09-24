@@ -1,0 +1,34 @@
+[package]
+name = "ea-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ea_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ea-daemon"
+path = "src/main.rs"
+
+[dependencies]
+ea-core = { path = "../ea-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+rmcp.workspace = true
+toml.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+wiremock.workspace = true

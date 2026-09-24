@@ -1,0 +1,4 @@
+name = "echo"
+command = "ea-echo"
+args = []
+watch_interval_secs = 3600
