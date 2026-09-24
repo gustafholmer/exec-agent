@@ -32,10 +32,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use ea_core::store::actions::{ActionStore, ProposeInput};
 use ea_core::store::conversations::ConversationStore;
 use ea_core::store::events::EventStore;
 use ea_core::store::runs::RunStore;
+use ea_core::store::schedules::ScheduleStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -44,6 +46,7 @@ use crate::ipc;
 use crate::jobs::Pusher;
 use crate::notify::log::NotificationLog;
 use crate::scheduler::Scheduler;
+use crate::schedules::Schedule;
 use crate::session::SessionRequest;
 use crate::triage::SessionBoundary;
 
@@ -172,6 +175,13 @@ pub struct Deps<C: ToolCaller> {
     pub events: EventStore,
     pub runs: RunStore,
     pub scheduler: Arc<Scheduler>,
+    /// The cron entries, read-only here: `status` answers "when is the next
+    /// briefing", which is the one question a scheduled job raises that the
+    /// interval jobs never did.
+    pub schedules: ScheduleStore,
+    /// The zone the cron entries are evaluated in — the owner's, the same one
+    /// quiet hours use.
+    pub time_zone: Tz,
     pub sessions: Option<Arc<dyn SessionBoundary>>,
     pub pusher: Option<Arc<dyn Pusher>>,
     /// Read-only here: `status` reports how much is waiting for a digest
@@ -193,6 +203,8 @@ pub struct Daemon<C: ToolCaller> {
     events: EventStore,
     runs: RunStore,
     scheduler: Arc<Scheduler>,
+    schedules: ScheduleStore,
+    time_zone: Tz,
     sessions: Option<Arc<dyn SessionBoundary>>,
     pusher: Option<Arc<dyn Pusher>>,
     notify_log: NotificationLog,
@@ -211,6 +223,8 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             events: deps.events,
             runs: deps.runs,
             scheduler: deps.scheduler,
+            schedules: deps.schedules,
+            time_zone: deps.time_zone,
             sessions: deps.sessions,
             pusher: deps.pusher,
             notify_log: deps.notify_log,
@@ -295,13 +309,16 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // silent failure the rest of this endpoint exists to prevent.
             "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
             // Scores held back by the threshold, by quiet hours or by the
-            // hourly rate limit. Nothing delivers them yet — the morning
-            // briefing is Phase 4 — so without these two numbers a backlog
-            // accumulating, and then silently falling off the 200-line cap,
-            // would be invisible to the one person it belongs to.
+            // hourly rate limit. The morning briefing now delivers them, so
+            // `digest_pending` is normally the hours since the last briefing
+            // rather than a permanent backlog — which is exactly why it is
+            // still here: a number that keeps climbing past a day means the
+            // briefing has stopped, and `digest_dropped` counts what the
+            // 200-line cap has destroyed in the meantime.
             "digest_pending": self.notify_log.digest_len().unwrap_or_default(),
             "digest_dropped": self.notify_log.digest_dropped().unwrap_or_default(),
             "jobs": jobs,
+            "schedules": self.schedule_status(),
             "connectors": self.connectors,
             "sessions_available": self.sessions.is_some(),
             "notifier_configured": self.pusher.is_some(),
@@ -309,6 +326,44 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "chat_model": self.chat_model,
             "started_at": self.started_at.to_rfc3339(),
         }))
+    }
+
+    /// The cron entries, with the next time each is due.
+    ///
+    /// `next_run_at` is the part worth having. A briefing that has silently
+    /// stopped and one that is simply not due until tomorrow look identical
+    /// from outside, and the difference between "07:00 tomorrow" and `null` is
+    /// the difference between a healthy schedule and a row whose expression no
+    /// longer parses.
+    ///
+    /// Read errors degrade to an empty list rather than failing `status`: this
+    /// endpoint is what someone reaches for when things are already wrong, and
+    /// it must answer.
+    fn schedule_status(&self) -> Vec<Value> {
+        let rows = match self.schedules.all() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "could not read the schedules table");
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .map(|row| {
+                let next = row.last_run_at.and_then(|last| {
+                    Schedule::parse(&row.name, &row.cron, self.time_zone, Some(last))
+                        .ok()?
+                        .next_after(last)
+                });
+                json!({
+                    "name": row.name,
+                    "cron": row.cron,
+                    "time_zone": self.time_zone.name(),
+                    "enabled": row.enabled,
+                    "last_run_at": row.last_run_at.map(|at| at.to_rfc3339()),
+                    "next_run_at": next.map(|at| at.to_rfc3339()),
+                })
+            })
+            .collect()
     }
 
     /// `queue` — the proposals waiting for a human.
@@ -749,6 +804,8 @@ record_voucher = "approve"
                 events: EventStore::new(Arc::clone(&conn)),
                 runs: RunStore::new(Arc::clone(&conn)),
                 scheduler: Arc::clone(&scheduler),
+                schedules: ScheduleStore::new(Arc::clone(&conn)),
+                time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
                 sessions: sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
                 notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
@@ -986,6 +1043,8 @@ record_voucher = "approve"
             events: f2.daemon.events.clone(),
             runs: f2.daemon.runs.clone(),
             scheduler: Arc::clone(&failing),
+            schedules: ScheduleStore::new(Arc::clone(&f2.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             sessions: None,
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f2.conn))),
@@ -1091,6 +1150,8 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
+            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             sessions: None,
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
@@ -1125,6 +1186,52 @@ record_voucher = "approve"
 
     /// Answering "ok" to a typo would be exactly the silent failure this
     /// review is about: the owner would think they had fixed it.
+    /// `status` answers "when is the next briefing". A schedule that has
+    /// silently stopped and one that is simply not due yet are otherwise
+    /// indistinguishable from outside.
+    #[tokio::test]
+    async fn status_reports_every_schedule_and_when_it_next_runs() {
+        let f = Fixture::new();
+        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        crate::schedules::register_built_ins(&store, "2026-09-24T10:00:00Z".parse().unwrap())
+            .unwrap();
+
+        let status = f.call("status", Value::Null).await.unwrap();
+        let schedules = status["schedules"].as_array().expect("an array").clone();
+        assert_eq!(schedules.len(), 3);
+
+        let morning = schedules
+            .iter()
+            .find(|s| s["name"] == crate::schedules::MORNING_BRIEFING)
+            .expect("the morning briefing");
+        assert_eq!(morning["cron"], crate::schedules::MORNING_BRIEFING_CRON);
+        assert_eq!(morning["enabled"], true);
+        assert_eq!(morning["time_zone"], "Europe/Stockholm");
+        assert_eq!(morning["last_run_at"], "2026-09-24T10:00:00+00:00");
+        // Installed at noon Stockholm on the 24th, so the next 07:00 local is
+        // the 25th, which is 05:00 UTC.
+        assert_eq!(morning["next_run_at"], "2026-09-25T05:00:00+00:00");
+    }
+
+    /// A row whose expression has been edited into nonsense reports a `null`
+    /// next run rather than taking `status` down with it.
+    #[tokio::test]
+    async fn a_broken_schedule_row_does_not_break_status() {
+        let f = Fixture::new();
+        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        store
+            .ensure(
+                "wrong",
+                "not a cron",
+                "2026-09-24T10:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+
+        let status = f.call("status", Value::Null).await.unwrap();
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["schedules"][0]["next_run_at"], Value::Null);
+    }
+
     #[tokio::test]
     async fn resume_job_refuses_a_name_no_job_has() {
         let (_f, scheduler, daemon) = tripped_fixture().await;
@@ -1542,6 +1649,8 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&f.scheduler),
+            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             sessions: f.sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),

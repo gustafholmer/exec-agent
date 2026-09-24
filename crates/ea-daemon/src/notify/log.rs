@@ -29,10 +29,11 @@ pub const RETENTION: Duration = Duration::hours(24);
 
 /// `kv` key holding the running count of digest lines dropped to the cap.
 ///
-/// Durable and never reset by the daemon: the count is the whole point. A
-/// digest nobody delivers yet (delivery is the morning briefing, Phase 4) that
-/// also discards its overflow silently loses the owner's data twice over —
-/// once by not sending, once by forgetting. This makes the second one
+/// Durable and never reset by the daemon: the count is the whole point. The
+/// morning briefing delivers the digest now, but a briefing that is failing,
+/// or a daemon whose owner has been away, still lets the backlog run into the
+/// cap — and a cap that discards silently loses the owner's data twice over,
+/// once by not sending and once by forgetting. This makes the second one
 /// countable, and `ea status` shows it.
 pub const DIGEST_DROPPED_KEY: &str = "notify.digest_dropped";
 
@@ -87,11 +88,10 @@ impl NotificationLog {
     ///
     /// Past [`MAX_DIGEST_LINES`] the oldest lines fall off — but never
     /// silently. Each drop is counted durably ([`DIGEST_DROPPED_KEY`]) and
-    /// logged, because until the morning briefing exists to deliver this
-    /// backlog, the cap is the one place where something the owner might have
-    /// wanted to read is destroyed. A number they can see in `ea status` is
-    /// the difference between "the daemon is quiet" and "the daemon has been
-    /// throwing away your mail for a week".
+    /// logged, because the cap is the one place where something the owner
+    /// might have wanted to read is destroyed. A number they can see in `ea
+    /// status` is the difference between "the daemon is quiet" and "the daemon
+    /// has been throwing away your mail for a week".
     pub fn push_digest(&self, line: impl Into<String>) -> anyhow::Result<()> {
         let mut lines: Vec<String> = self.kv.get_json(DIGEST_KEY)?;
         lines.push(line.into());
@@ -133,6 +133,32 @@ impl NotificationLog {
             .saturating_add(count.try_into().unwrap_or(u64::MAX));
         self.kv.set_json(DIGEST_DROPPED_KEY, &total)?;
         Ok(total)
+    }
+
+    /// Drop the first `count` lines of the digest, leaving the rest.
+    ///
+    /// What the morning briefing clears with, and the reason it is not
+    /// [`NotificationLog::take_digest`]. A briefing reads the backlog, spends
+    /// up to five minutes in a model session, and then sends one message;
+    /// triage runs every five minutes and pushes lines the whole time. Taking
+    /// the digest at the *end* would throw away lines that arrived during the
+    /// session and were never in the message, and taking it at the start would
+    /// lose the whole backlog if the session or the send failed. So: read,
+    /// send, then drop exactly the prefix that was read.
+    ///
+    /// The one imprecision left is the cap: if [`MAX_DIGEST_LINES`] lines
+    /// arrive while the briefing is running, the oldest fall off the front and
+    /// the prefix no longer names the same lines. That needs two hundred
+    /// digested events inside one session, and the cost is a handful of lines
+    /// dropped a briefing early rather than anything the owner was going to be
+    /// told twice.
+    pub fn drop_digest_prefix(&self, count: usize) -> anyhow::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let lines: Vec<String> = self.kv.get_json(DIGEST_KEY)?;
+        let kept: Vec<String> = lines.into_iter().skip(count).collect();
+        self.kv.set_json(DIGEST_KEY, &kept)
     }
 
     /// Everything held for the digest, clearing it.
@@ -306,5 +332,38 @@ mod tests {
         let reopened = store(&dir);
         assert_eq!(reopened.digest_dropped().unwrap(), 3);
         assert_eq!(reopened.digest_len().unwrap(), 0);
+    }
+
+    /// The briefing's clearing rule: what it read is dropped, what arrived
+    /// while it was thinking is kept for the next one.
+    #[test]
+    fn dropping_a_prefix_keeps_lines_that_arrived_during_the_briefing() {
+        let dir = TempDir::new().unwrap();
+        let log = store(&dir);
+        log.push_digest("one").unwrap();
+        log.push_digest("two").unwrap();
+
+        // What the briefing read.
+        let read = log.digest().unwrap();
+        assert_eq!(read.len(), 2);
+        // A triage pass lands mid-session.
+        log.push_digest("three").unwrap();
+
+        log.drop_digest_prefix(read.len()).unwrap();
+
+        assert_eq!(log.digest().unwrap(), vec!["three".to_string()]);
+    }
+
+    #[test]
+    fn dropping_nothing_changes_nothing_and_over_dropping_empties() {
+        let dir = TempDir::new().unwrap();
+        let log = store(&dir);
+        log.push_digest("one").unwrap();
+
+        log.drop_digest_prefix(0).unwrap();
+        assert_eq!(log.digest_len().unwrap(), 1);
+
+        log.drop_digest_prefix(99).unwrap();
+        assert_eq!(log.digest_len().unwrap(), 0);
     }
 }

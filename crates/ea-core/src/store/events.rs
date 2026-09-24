@@ -150,6 +150,43 @@ impl EventStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The most recent events of one `kind`, newest first.
+    ///
+    /// Filtering the *payload* — a calendar event that starts today, a
+    /// deadline that falls this month — is the caller's job and is done in
+    /// Rust: `payload` is opaque JSON here, and a store that grew a
+    /// `json_extract` per question would end up encoding one connector's
+    /// payload shape into the other's schema.
+    pub fn by_kind(&self, kind: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT * FROM events WHERE kind = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![kind, limit], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Events triaged after `since` and scored at or above `min_salience`,
+    /// newest first.
+    ///
+    /// What the morning briefing means by "what mattered since the last one".
+    /// `triaged_at`, not `created_at`: an event recorded a fortnight ago and
+    /// only scored this morning is news this morning.
+    pub fn scored_since(
+        &self,
+        min_salience: i64,
+        since: chrono::DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM events
+             WHERE salience >= ?1 AND triaged_at IS NOT NULL AND triaged_at > ?2
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![min_salience, since.to_rfc3339(), limit], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Record that `id` was submitted to a tier-1 batch that came back without
     /// a score for it. Returns the new attempt count.
     ///
@@ -232,6 +269,73 @@ mod tests {
             kind: "assignment".into(),
             payload,
         }
+    }
+
+    fn of_kind(source: &str, external_id: &str, kind: &str) -> RecordInput {
+        RecordInput {
+            source: source.into(),
+            external_id: external_id.into(),
+            kind: kind.into(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn by_kind_returns_only_that_kind_newest_first_and_respects_the_limit() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        store
+            .record(of_kind("google", "c1", "calendar_event"))
+            .unwrap();
+        store.record(of_kind("google", "m1", "mail")).unwrap();
+        store
+            .record(of_kind("google", "c2", "calendar_event"))
+            .unwrap();
+
+        let found = store.by_kind("calendar_event", 10).unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["c2", "c1"], "newest first, and no mail");
+
+        assert_eq!(store.by_kind("calendar_event", 1).unwrap().len(), 1);
+        assert!(store
+            .by_kind("nothing_records_this", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The morning briefing asks "what was scored above the threshold since
+    /// the last briefing" — so the cut is on `triaged_at`, not `created_at`,
+    /// and an unscored event is never in the answer however old it is.
+    #[test]
+    fn scored_since_cuts_on_triaged_at_and_ignores_the_unscored() {
+        let (_dir, conn) = temp_store();
+        let store = EventStore::new(conn);
+        let (low, _) = store
+            .record(of_kind("canvas", "low", "assignment"))
+            .unwrap();
+        let (high, _) = store
+            .record(of_kind("canvas", "high", "assignment"))
+            .unwrap();
+        let (untouched, _) = store
+            .record(of_kind("canvas", "raw", "assignment"))
+            .unwrap();
+
+        let before = Utc::now();
+        store.set_salience(low.id, 20).unwrap();
+        store.set_salience(high.id, 80).unwrap();
+
+        let found = store.scored_since(60, before, 10).unwrap();
+        let ids: Vec<i64> = found.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![high.id],
+            "below the threshold and unscored are both out"
+        );
+        assert!(store.get(untouched.id).unwrap().unwrap().salience.is_none());
+
+        // A cut *after* the scoring returns nothing: yesterday's news is not
+        // today's.
+        assert!(store.scored_since(60, Utc::now(), 10).unwrap().is_empty());
     }
 
     #[test]

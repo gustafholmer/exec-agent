@@ -33,6 +33,8 @@ use ea_core::store::events::EventStore;
 use ea_core::store::kv::KvStore;
 use ea_core::store::retention::RetentionStore;
 use ea_core::store::runs::RunStore;
+use ea_core::store::schedules::ScheduleStore;
+use ea_daemon::briefings::BriefingDeps;
 use ea_daemon::config::DaemonConfig;
 use ea_daemon::connectors::{self, Registry};
 use ea_daemon::daemon::{Daemon, Deps, SHUTDOWN_DRAIN};
@@ -46,6 +48,7 @@ use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, T
 use ea_daemon::notify::updates::{OffsetStore, UpdateLoop};
 use ea_daemon::retention::{retention_job, RetentionDeps};
 use ea_daemon::scheduler::Scheduler;
+use ea_daemon::schedules;
 use ea_daemon::session::SessionRunner;
 use ea_daemon::triage::SessionBoundary;
 
@@ -203,6 +206,32 @@ async fn main() -> anyhow::Result<()> {
             daily_session_budget: config.daily_session_budget,
         }),
     ));
+    // The cron jobs: the three briefings, on the owner's wall clock rather
+    // than on an interval. Registered in the `schedules` table first, which
+    // anchors a fresh install to *now* so that installing at 15:00 does not
+    // immediately fire all three; see `ea_core::store::schedules`.
+    let schedule_store = ScheduleStore::new(Arc::clone(&conn));
+    schedules::register_built_ins(&schedule_store, chrono::Utc::now())?;
+    let briefings = Arc::new(BriefingDeps {
+        events: EventStore::new(Arc::clone(&conn)),
+        runs: RunStore::new(Arc::clone(&conn)),
+        log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        sessions: sessions.clone(),
+        pusher: pusher.clone(),
+        caller: Arc::clone(&registry),
+        policy: policy.clone(),
+        time_zone: config.notify.time_zone,
+        threshold: config.notify.threshold,
+        daily_session_budget: config.daily_session_budget,
+    });
+    for job in schedules::briefing_jobs(
+        schedule_store.clone(),
+        config.notify.time_zone,
+        Arc::clone(&briefings),
+    ) {
+        scheduler.add(job);
+    }
+
     // The only job that deletes anything. Everything else in this daemon is
     // append-only, which over the years this thing is meant to run unattended
     // is a leak rather than an audit trail.
@@ -226,6 +255,8 @@ async fn main() -> anyhow::Result<()> {
         events: EventStore::new(Arc::clone(&conn)),
         runs: RunStore::new(Arc::clone(&conn)),
         scheduler: Arc::clone(&scheduler),
+        schedules: schedule_store,
+        time_zone: config.notify.time_zone,
         sessions,
         pusher,
         notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
