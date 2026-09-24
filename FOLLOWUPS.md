@@ -61,9 +61,17 @@ transition was never recoverable by replay anyway. A duplicate chat turn is a
 So the claim is applied to every update kind rather than to messages alone:
 one mechanism, one key, no branch on kind to get wrong.
 
-The regression tests are
-`updates::tests::a_redelivered_message_is_answered_once_across_a_restart` and
-`updates::tests::an_update_is_claimed_before_it_is_handled`.
+The regression test for the *ordering* is
+`updates::tests::a_crash_inside_the_handler_leaves_the_update_already_claimed`:
+the handler panics mid-session and the poll dies with it, and the claim has to
+already be in `kv` when the restarted loop is handed the same update back.
+Moving `self.handled.mark(id)?` below the `dispatch` call fails that test and
+only that test. Its neighbours,
+`a_redelivered_message_is_answered_once_across_a_restart` and
+`a_handled_update_leaves_a_high_water_mark`, cover the redelivery path and the
+high-water semantics but both read `kv` only after a poll that ran to
+completion, so neither can see which side of the handler the mark was written
+on.
 
 ## 5. `facts::matching` has no `LIMIT` — FIXED
 

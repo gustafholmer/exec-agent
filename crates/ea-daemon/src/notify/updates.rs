@@ -817,6 +817,30 @@ mod tests {
         }
     }
 
+    /// A handler that never comes back: it records the call and then panics,
+    /// which is as close as a test can get to the daemon being killed halfway
+    /// through a `claude` session. Used only by
+    /// [`a_crash_inside_the_handler_leaves_the_update_already_claimed`].
+    #[derive(Default)]
+    struct CrashingHandler {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MessageHandler for Arc<CrashingHandler> {
+        async fn handle_message(&self, _from: TelegramUserId, text: &str) -> String {
+            // The lock is released before the panic, or the poisoned mutex
+            // would be what the test noticed instead of the missing mark.
+            self.calls.lock().unwrap().push(text.to_string());
+            panic!("simulated crash partway through handling a telegram update");
+        }
+    }
+
+    impl CallbackHandler for Arc<CrashingHandler> {
+        async fn handle(&self, _from: TelegramUserId, _data: &str) -> String {
+            unreachable!("the crash test only sends messages");
+        }
+    }
+
     /// A handler whose reply is longer than Telegram will accept.
     struct LongWinded;
 
@@ -909,9 +933,18 @@ mod tests {
         /// A fresh loop over the same source, handler and database — which is
         /// also what a restart looks like from the offset's point of view.
         fn build(&self) -> UpdateLoop<Arc<ScriptedSource>, Arc<SpyHandler>> {
+            self.build_with(Arc::clone(&self.handler))
+        }
+
+        /// The same loop over a handler of the caller's choosing — the crash
+        /// test needs one that does not come back.
+        fn build_with<H: CallbackHandler + MessageHandler>(
+            &self,
+            handler: H,
+        ) -> UpdateLoop<Arc<ScriptedSource>, H> {
             UpdateLoop::new(
                 Arc::clone(&self.source),
-                Arc::clone(&self.handler),
+                handler,
                 OWNER_CHAT,
                 self.offsets(),
                 self.handled(),
@@ -1205,10 +1238,103 @@ mod tests {
         assert_eq!(f.offsets().get().unwrap(), Some(8));
     }
 
-    /// The claim is written before the handler runs, so a crash *during* the
-    /// session costs the answer rather than charging for a second one.
+    /// The ordering the whole module is shaped around, pinned at the only
+    /// moment it can actually be observed: *inside* the crash.
+    ///
+    /// Neither neighbouring test sees it.
+    /// `a_redelivered_message_is_answered_once_across_a_restart` rewinds the
+    /// offset by hand after a poll that ran to completion, so the mark is
+    /// already written whichever side of `dispatch` writes it, and
+    /// `a_handled_update_leaves_a_high_water_mark` reads the mark only after
+    /// `poll_once` has returned, by which point so is it. The crash the
+    /// ordering *exists for* is the one that lands between the handler
+    /// starting and finishing, and it is only visible if the handler never
+    /// returns.
+    ///
+    /// So the handler panics mid-session and takes the poll down with it. If
+    /// the claim is written before `dispatch` it is already in `kv` when
+    /// `launchd` brings the daemon back, and Telegram's redelivery is a
+    /// no-op. If it were written after, it would never have been reached, and
+    /// the restart would answer the same sentence again — a second paid
+    /// `claude -p` session against the owner's daily budget, silently.
+    ///
+    /// Moving `self.handled.mark(id)?` below the `dispatch` call must fail
+    /// this test. That is the only thing it is here for; it is not a
+    /// duplicate of either neighbour.
     #[tokio::test]
-    async fn an_update_is_claimed_before_it_is_handled() {
+    async fn a_crash_inside_the_handler_leaves_the_update_already_claimed() {
+        let f = Fixture::new(vec![
+            Ok(vec![says(11, "when is the tenta?")]),
+            // The restart: the offset was never confirmed, so Telegram hands
+            // the very same update back.
+            Ok(vec![says(11, "when is the tenta?")]),
+        ]);
+
+        let crashing = Arc::new(CrashingHandler::default());
+        let calls = Arc::clone(&crashing.calls);
+        let lp = f.build_with(crashing);
+
+        // Spawned so the panic is contained: this is the daemon dying, and
+        // what the test is about is what it left behind in `kv`.
+        let died = tokio::spawn(async move { lp.poll_once().await }).await;
+        let crash = died.expect_err("the handler was supposed to crash the poll");
+        assert!(
+            crash.is_panic(),
+            "the fixture is wrong: the poll ended for some reason other than \
+             the handler panicking ({crash})"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the handler must have been entered, or there was no crash to survive"
+        );
+        assert_eq!(
+            f.offsets().get().unwrap(),
+            None,
+            "the crash must land before the offset is confirmed, or this is a \
+             completed poll being simulated rather than an interrupted one"
+        );
+
+        assert!(
+            f.handled().contains(11).unwrap(),
+            "update 11 must be claimed BEFORE the handler runs. The handler \
+             panicked without returning, so nothing below the `dispatch` call \
+             ran: an unclaimed update here means `self.handled.mark(id)?` has \
+             moved after the dispatch, and the redelivery that follows this \
+             crash will answer the same message a second time — another paid \
+             `claude` session charged against the owner's daily budget, with \
+             nothing said about it."
+        );
+
+        // The restart proper: a fresh loop and an ordinary handler over the
+        // same database, handed the same update again.
+        let summary = f.build().poll_once().await.unwrap();
+        assert!(
+            f.handler.messages().is_empty(),
+            "a claimed update must not reach a handler a second time"
+        );
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(summary.handled, 0);
+        assert!(
+            f.source.sent().is_empty(),
+            "and the owner is not answered for a turn they never got an answer to"
+        );
+        assert_eq!(
+            f.offsets().get().unwrap(),
+            Some(12),
+            "the cursor still moves past it, or the loop would stick on it forever"
+        );
+    }
+
+    /// The mark is a high-water mark, not a set: claiming 11 spends
+    /// everything below it and nothing above it.
+    ///
+    /// Note what this does **not** test, despite what it was once called: it
+    /// reads `kv` only after `poll_once` has returned, so it passes whichever
+    /// side of `dispatch` the mark is written on. The ordering is pinned by
+    /// [`a_crash_inside_the_handler_leaves_the_update_already_claimed`].
+    #[tokio::test]
+    async fn a_handled_update_leaves_a_high_water_mark() {
         let f = Fixture::new(vec![Ok(vec![says(11, "hello")])]);
         let handled = HandledUpdates::new(KvStore::new(Arc::clone(&f.conn)));
         assert!(!handled.contains(11).unwrap());
