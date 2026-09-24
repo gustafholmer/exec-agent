@@ -41,6 +41,22 @@
 //! `users/me/messages/send`. `create_draft_never_touches_the_send_endpoint`
 //! pins this by asserting the request path contains `drafts` and not `send`.
 //!
+//! `to` and `subject` arrive from an LLM's `propose_action` tool call; the
+//! human in the loop approves a one-line preview in Telegram, never the raw
+//! RFC 822 headers this module writes into the draft. Two consequences:
+//!
+//! * [`build_rfc822`] **rejects** (never silently strips) a `to` or
+//!   `subject` containing `\r`, `\n`, or a NUL byte, before any network
+//!   call is made — a `\r\n` in either field would otherwise inject an
+//!   attacker-chosen header (a hidden `Bcc:`, say) into a message the
+//!   owner may send unread.
+//! * a non-ASCII `to` or `subject` (unremarkable for a Swedish company —
+//!   `Räksmörgås` is the common case, not an edge case) is RFC
+//!   2047-encoded as one or more `=?UTF-8?B?...?=` words, each within the
+//!   75-character-per-word limit and folded with `\r\n ` between words,
+//!   with `MIME-Version: 1.0` declared accordingly. A pure-ASCII value is
+//!   left untouched.
+//!
 //! # The list-then-get cost, and why `format=metadata` was not used
 //!
 //! `messages.list` returns only `{id, threadId}` pairs; the body, headers and
@@ -71,7 +87,7 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use reqwest::Url;
@@ -401,13 +417,15 @@ pub fn normalize(raw: &RawMessage, account: &str) -> Mail {
 
     // A message this poorly formed has never been observed from Gmail, but
     // `Mail::received_at` is not optional, so a message with no parseable
-    // `internalDate` gets the time it was normalised rather than failing the
-    // whole poll over one field.
+    // `internalDate` falls back to the Unix epoch rather than `Utc::now()`:
+    // "now" would sort a corrupt message to the *top* of a triage queue
+    // ordered by recency, displacing genuinely urgent mail, whereas the
+    // epoch sinks it to the bottom where a malformed field belongs.
     let received_at = raw
         .internal_date
         .as_deref()
         .and_then(parse_internal_date)
-        .unwrap_or_else(Utc::now);
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
 
     Mail {
         id: raw.id.clone().unwrap_or_default(),
@@ -539,8 +557,11 @@ impl GmailClient {
         subject: &str,
         body: &str,
     ) -> anyhow::Result<String> {
+        // Validate and build the message before touching the network at
+        // all — a header-injection attempt in `to`/`subject` must not even
+        // trigger a token fetch, let alone the draft POST.
+        let raw_message = build_rfc822(to, subject, body)?;
         let token = auth.access_token(account).await?;
-        let raw_message = build_rfc822(to, subject, body);
         let encoded = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
 
         let url = self
@@ -680,14 +701,83 @@ impl GmailClient {
     }
 }
 
-/// Build a minimal RFC 822 message. Plain text only, UTF-8; no MIME
-/// encoded-word support for a non-ASCII `to`/`subject` — out of scope for a
-/// connector whose only write path is drafting mail for the account owner to
-/// review before sending it themselves.
-fn build_rfc822(to: &str, subject: &str, body: &str) -> String {
-    format!(
-        "To: {to}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
-    )
+/// Build a minimal RFC 822 message. Plain text only, UTF-8 body.
+///
+/// `to` and `subject` are untrusted: they are the arguments an LLM's
+/// `propose_action` tool call supplies to [`create_draft`], and the human
+/// approving that call sees a one-line preview, not these headers. So this
+/// function refuses — rather than silently sanitising — a value containing
+/// `\r`, `\n`, or NUL, since a silently altered recipient is its own hazard
+/// and the caller needs to know the input was rejected, not guess that it
+/// was quietly changed. A non-ASCII value is RFC 2047-encoded so it survives
+/// a strict RFC 5322 parser instead of arriving as ambiguous raw UTF-8
+/// bytes; see [`encode_header_value`].
+fn build_rfc822(to: &str, subject: &str, body: &str) -> anyhow::Result<String> {
+    reject_header_injection("to", to)?;
+    reject_header_injection("subject", subject)?;
+
+    let to_header = encode_header_value(to);
+    let subject_header = encode_header_value(subject);
+
+    Ok(format!(
+        "MIME-Version: 1.0\r\nTo: {to_header}\r\nSubject: {subject_header}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
+    ))
+}
+
+/// Refuse a header value that could inject additional RFC 822 headers or
+/// terminate the header block early. `\r` and `\n` are how one header ends
+/// and the next begins (or the header block ends and the body begins); a
+/// bare NUL is refused too since it has no legitimate place in a header and
+/// some parsers treat it as a terminator. Named in the error so the caller
+/// (ultimately, whatever surfaced the LLM's malformed argument) knows which
+/// field to blame.
+fn reject_header_injection(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+        bail!(
+            "gmail: refusing to draft a message: the {field} field contains a carriage \
+             return, newline, or NUL byte, which could inject additional headers into the \
+             drafted message"
+        );
+    }
+    Ok(())
+}
+
+/// RFC 2047-encode a header value if (and only if) it contains non-ASCII
+/// bytes; a pure-ASCII value is returned unchanged so an ordinary subject
+/// stays human-readable in the raw message rather than being needlessly
+/// base64-wrapped.
+///
+/// Each `=?UTF-8?B?...?=` "encoded word" is kept within RFC 2047's
+/// 75-character-per-word limit: `=?UTF-8?B?` (10 chars) and `?=` (2 chars)
+/// are fixed overhead, leaving 63 characters of base64 text, i.e. at most 45
+/// raw bytes per word (`ceil(45/3)*4 == 60 <= 63`, with headroom to spare
+/// rather than cutting it exactly to the limit). A value that needs more
+/// than one word is split on UTF-8 character boundaries — never mid-codepoint
+/// — and the words are folded with `\r\n ` (CRLF + a single space) between
+/// them, ordinary RFC 5322 header folding, which a compliant parser treats
+/// as whitespace between adjacent encoded words when reassembling them.
+fn encode_header_value(value: &str) -> String {
+    if value.is_ascii() {
+        return value.to_string();
+    }
+
+    const MAX_BYTES_PER_WORD: usize = 45;
+
+    let mut words = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + MAX_BYTES_PER_WORD).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        words.push(format!(
+            "=?UTF-8?B?{}?=",
+            STANDARD.encode(&value[start..end])
+        ));
+        start = end;
+    }
+
+    words.join("\r\n ")
 }
 
 fn is_json(content_type: &str) -> bool {
@@ -946,6 +1036,17 @@ mod tests {
         let mail = normalize(&raw, "work");
         // 1700000000000 ms -> 1700000000 s since epoch.
         assert_eq!(mail.received_at.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn an_unparseable_internal_date_sinks_to_the_epoch_not_now() {
+        // A corrupt `internalDate` must sink a message to the bottom of a
+        // triage queue ordered by recency, not `Utc::now()` it to the top
+        // and displace genuinely urgent mail.
+        let mut raw = raw_message(vec![], None);
+        raw.internal_date = Some("not-a-timestamp".to_string());
+        let mail = normalize(&raw, "work");
+        assert_eq!(mail.received_at, DateTime::<Utc>::UNIX_EPOCH);
     }
 
     #[test]
@@ -1333,5 +1434,218 @@ mod tests {
             .create_draft(&auth, "work", "friend@example.com", "Hi", "Body")
             .await
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Header injection: `to`/`subject` arrive from an LLM's `propose_action`
+    // call and must never be able to smuggle extra RFC 822 headers into a
+    // draft the owner sends without reading raw headers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_rfc822_rejects_crlf_bcc_injection_in_to() {
+        let err = build_rfc822(
+            "victim@example.com\r\nBcc: attacker@example.com",
+            "Hi",
+            "Body",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("to"), "{err:#}");
+    }
+
+    #[test]
+    fn build_rfc822_rejects_crlf_bcc_injection_in_subject() {
+        let err = build_rfc822(
+            "victim@example.com",
+            "Hi\r\nBcc: attacker@example.com",
+            "Body",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("subject"), "{err:#}");
+    }
+
+    #[test]
+    fn build_rfc822_rejects_a_bare_lf_in_subject() {
+        assert!(build_rfc822("victim@example.com", "Hi\nthere", "Body").is_err());
+    }
+
+    #[test]
+    fn build_rfc822_rejects_a_bare_cr_in_to() {
+        assert!(build_rfc822("victim@example.com\rx", "Hi", "Body").is_err());
+    }
+
+    #[test]
+    fn build_rfc822_still_accepts_an_ordinary_value() {
+        let raw = build_rfc822("friend@example.com", "Lunch?", "See you at noon.").unwrap();
+        assert!(raw.contains("To: friend@example.com"));
+        assert!(raw.contains("Subject: Lunch?"));
+        assert!(raw.contains("See you at noon."));
+    }
+
+    #[tokio::test]
+    async fn create_draft_rejects_crlf_bcc_injection_in_to_and_makes_no_request() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        // Deliberately no mock is mounted: any request at all reaching the
+        // server (matched or not — `received_requests` records both) would
+        // prove the rejection happened too late.
+        let result = GmailClient::new(&server.uri())
+            .unwrap()
+            .create_draft(
+                &auth,
+                "work",
+                "victim@example.com\r\nBcc: attacker@example.com",
+                "Hi",
+                "Body",
+            )
+            .await;
+
+        assert!(result.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn create_draft_rejects_crlf_injection_in_subject_and_makes_no_request() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        let result = GmailClient::new(&server.uri())
+            .unwrap()
+            .create_draft(
+                &auth,
+                "work",
+                "friend@example.com",
+                "Hi\r\nBcc: attacker@example.com",
+                "Body",
+            )
+            .await;
+
+        assert!(result.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "{requests:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 2047: a non-ASCII `to`/`subject` must not become mojibake in the
+    // owner's drafts folder. `Räksmörgås` in a subject is the common case
+    // for a Swedish company, not an edge case.
+    // -----------------------------------------------------------------------
+
+    /// Reverse whatever mix of literal ASCII and folded `=?UTF-8?B?...?=`
+    /// encoded words a header value produced by this module contains, back
+    /// to the original string. Only as capable as this module's own encoder
+    /// needs to be verified against — not a general RFC 2047 decoder.
+    fn decode_rfc2047(header: &str) -> String {
+        header
+            .split("\r\n ")
+            .map(|word| {
+                let word = word.trim();
+                match word
+                    .strip_prefix("=?UTF-8?B?")
+                    .and_then(|rest| rest.strip_suffix("?="))
+                {
+                    Some(inner) => {
+                        let bytes = STANDARD.decode(inner).unwrap();
+                        String::from_utf8(bytes).unwrap()
+                    }
+                    None => word.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encode_header_value_leaves_ascii_unchanged() {
+        assert_eq!(encode_header_value("Meeting tomorrow"), "Meeting tomorrow");
+    }
+
+    #[test]
+    fn encode_header_value_encodes_and_round_trips_swedish_characters() {
+        let original = "Räksmörgås — åäö";
+        let encoded = encode_header_value(original);
+        assert_ne!(encoded, original);
+        assert!(encoded.starts_with("=?UTF-8?B?"));
+        assert_eq!(decode_rfc2047(&encoded), original);
+    }
+
+    #[test]
+    fn encode_header_value_folds_a_long_subject_correctly() {
+        // 200 repetitions of a 2-byte character comfortably exceeds one
+        // encoded word's 45-raw-byte budget, forcing a fold across several.
+        let original: String = "ö".repeat(200);
+        let encoded = encode_header_value(&original);
+
+        let words: Vec<&str> = encoded.split("\r\n ").collect();
+        assert!(
+            words.len() > 1,
+            "expected folding into multiple words, got one: {encoded}"
+        );
+        for word in &words {
+            assert!(
+                word.len() <= 75,
+                "encoded word exceeds RFC 2047's 75-character limit ({} chars): {word}",
+                word.len()
+            );
+            assert!(word.starts_with("=?UTF-8?B?") && word.ends_with("?="));
+        }
+
+        assert_eq!(decode_rfc2047(&encoded), original);
+    }
+
+    #[test]
+    fn build_rfc822_declares_mime_version() {
+        let raw = build_rfc822("friend@example.com", "Hi", "Body").unwrap();
+        assert!(raw.starts_with("MIME-Version: 1.0\r\n"), "{raw}");
+    }
+
+    #[test]
+    fn build_rfc822_encodes_a_non_ascii_to_header() {
+        let raw = build_rfc822("Räksmörgås <friend@example.com>", "Hi", "Body").unwrap();
+        assert!(raw.contains("=?UTF-8?B?"), "{raw}");
+        assert!(!raw.contains("Räksmörgås"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn create_draft_rfc2047_encodes_a_swedish_subject() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        Mock::given(method("POST"))
+            .and(path("/users/me/drafts"))
+            .respond_with(json(serde_json::json!({ "id": "draft-1" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let subject = "Räksmörgås — åäö";
+        GmailClient::new(&server.uri())
+            .unwrap()
+            .create_draft(
+                &auth,
+                "work",
+                "friend@example.com",
+                subject,
+                "Smaklig måltid.",
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let raw = sent["message"]["raw"].as_str().unwrap();
+        let decoded_bytes = URL_SAFE_NO_PAD.decode(raw).unwrap();
+        let decoded = String::from_utf8(decoded_bytes).unwrap();
+
+        assert!(decoded.contains("MIME-Version: 1.0"), "{decoded}");
+        assert!(decoded.contains("=?UTF-8?B?"), "{decoded}");
+
+        let after_subject = decoded.split("Subject: ").nth(1).unwrap();
+        let header_value = after_subject.split("\r\nContent-Type").next().unwrap();
+        assert_eq!(decode_rfc2047(header_value), subject);
     }
 }
