@@ -1,0 +1,29 @@
+[package]
+name = "ea-fortnox"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ea_fortnox"
+path = "src/lib.rs"
+
+[dependencies]
+ea-core = { path = "../ea-core" }
+anyhow.workspace = true
+calamine.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+rust_xlsxwriter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true

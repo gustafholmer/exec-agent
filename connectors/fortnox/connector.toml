@@ -1,0 +1,22 @@
+# Discovered by the daemon: a directory holding both connector.toml and
+# policy.toml is a connector. `command` is resolved against the running
+# executable's directory first, then $PATH, so a release build next to
+# ea-daemon needs no install step.
+#
+# `name` must equal this directory's basename, and no two connectors may claim
+# the same name — both are hard startup errors. See `ea_daemon::connectors`.
+name = "fortnox"
+command = "ea-fortnox-mcp"
+args = []
+
+# A day. Everything this connector watches moves on the scale of days at
+# best: a Swedish tax deadline is known months in advance, and an unpaid
+# invoice becomes overdue at midnight and stays that way. Polling hourly would
+# re-fetch every open invoice twenty-four times to learn the same thing once,
+# and Fortnox's rate limit is shared with every tool call a session makes.
+#
+# The cost of the long interval is bounded and acceptable: the worst case is
+# that a deadline or a newly-overdue invoice is reported up to a day late, and
+# `upcoming_deadlines` looks far enough ahead (see `deadlines::HORIZON_DAYS`)
+# that no deadline is ever first seen on the day it falls due.
+watch_interval_secs = 86400

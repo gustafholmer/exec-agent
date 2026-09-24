@@ -8,6 +8,8 @@ members = [
   "crates/ea-propose",
   "crates/ea-canvas",
   "crates/ea-google",
+  "crates/ea-fortnox",
+  "crates/ea-fortnox-mcp",
 ]
 
 [workspace.package]
@@ -26,7 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "3.4", features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
@@ -36,3 +38,6 @@ tempfile = "3"
 wiremock = "0.6"
 libc = "0.2"
 base64 = "0.22"
+calamine = { version = "0.36", features = ["dates"] }
+rust_xlsxwriter = "0.99"
+sha1 = "0.11"

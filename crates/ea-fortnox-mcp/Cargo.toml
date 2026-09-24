@@ -1,0 +1,39 @@
+[package]
+name = "ea-fortnox-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ea_fortnox_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ea-fortnox-mcp"
+path = "src/main.rs"
+
+# The one-shot consent flow. Named for `ea_fortnox::auth::AUTHORIZE_COMMAND`,
+# which every "re-authorise" message in the library prints.
+[[bin]]
+name = "ea-fortnox-authorize"
+path = "src/bin/authorize.rs"
+
+[dependencies]
+ea-core = { path = "../ea-core" }
+ea-fortnox = { path = "../ea-fortnox" }
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+wiremock.workspace = true
