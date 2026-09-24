@@ -36,7 +36,7 @@ steering — worth rewriting whichever way you decide.
 ## 3. `remember` has no second deterministic gate
 
 `propose_action` is gated twice: the CLI allowlist, then `Policy::decide`.
-`remember` has only the allowlist (`daemon.rs:552`, `session.rs:325`). Every
+`remember` has only the allowlist (`daemon.rs:676`, `session.rs:325`). Every
 session shares one `ea-propose` server on one socket with no per-session
 argument, so the allowlist is the only control. No defect today — triage
 sessions get no `--allowedTools` at all and so cannot call it. The fix, if the

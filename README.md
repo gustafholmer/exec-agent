@@ -508,9 +508,8 @@ because nothing was asking. They cannot be revived. Only re-consent through the 
 Portal can fix this, and it has to be you at the browser.
 
 The credentials for that are also not lying around: the old `dev0` project's
-`.env` (`~/dev/tryffle/dev0/apps/fortnox-mcp/.env`) declares
-`FORTNOX_CLIENT_ID` and `FORTNOX_CLIENT_SECRET` and leaves **both of them
-empty** — the lines are the key, an `=`, and nothing. So you supply your own:
+`.env` declares `FORTNOX_CLIENT_ID` and `FORTNOX_CLIENT_SECRET` and leaves
+**both of them empty** — the lines are the key, an `=`, and nothing. So you supply your own:
 open <https://developer.fortnox.se/>, open the existing integration (do not
 register a second one), copy its Client ID and Client Secret into
 `~/.config/exec-agent/fortnox/app.json` at mode `0600`, then run
