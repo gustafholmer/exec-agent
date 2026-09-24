@@ -377,9 +377,10 @@ impl GoogleServer {
                        array of { external_id, kind, payload }: one entry per upcoming calendar \
                        event (kind `calendar_event`), one per pair of overlapping events (kind \
                        `calendar_conflict`, computed across accounts), and one per unread \
-                       message (kind `mail`). Takes no arguments — it covers every account by \
-                       design. Called by the daemon on a timer; errors are reported rather than \
-                       swallowed, so a broken connector is visible."
+                       message (kind `mail`). An account that cannot be read contributes one \
+                       `connector_error` entry instead of failing the poll, so one lapsed \
+                       token does not silence the other accounts; if every account fails, the \
+                       poll errors. Takes no arguments — it covers every account by design."
     )]
     pub async fn watch_poll(&self) -> Result<String, String> {
         let entries = self.poll().await?;

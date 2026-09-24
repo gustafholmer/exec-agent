@@ -36,14 +36,41 @@
 //! whichever order it arrives in. `a_conflict_has_the_same_id_whichever_order_the_accounts_are_polled_in`
 //! pins it.
 //!
-//! # Why a failure is not an empty list
+//! # Why one dead account no longer silences the other
 //!
-//! Same reason as Canvas, and it matters more here because there are two
-//! accounts. Returning the healthy account's rows when the other one's token
-//! has lapsed produces a poll that *looks* complete: the daemon records it as
-//! a success, the breaker never trips, and `ea status` stays green while half
-//! the owner's mail goes unread. Every error in [`poll`] propagates, tagged
-//! with the account it came from.
+//! The first version of this module propagated the first error it met. The
+//! reasoning was Canvas's: a poll that returns the healthy account's rows when
+//! the other's token has lapsed *looks* complete, the daemon records a
+//! success, the breaker never trips, and `ea status` stays green while half
+//! the owner's mail goes unread.
+//!
+//! That reasoning assumed a lapsed token is rare. It is not: an OAuth client
+//! in Google's **Testing** publishing status has its refresh tokens expired
+//! every seven days, so `private` going dead is a weekly certainty, and a
+//! weekly certainty that takes `work` down with it — and escalates the
+//! scheduler's breaker to an hour's cooldown — is worse than a partial poll.
+//! A silent work inbox for a week beats nothing.
+//!
+//! So a poll is now per-account. Every account that answers contributes its
+//! rows; every account that fails contributes **one** synthetic row of
+//! [`KIND_CONNECTOR_ERROR`], under the stable id
+//! [`account_error_external_id`] — stable so that a grant that stays dead is
+//! one event the owner is told about once, not one event every two minutes.
+//! The payload is written to be *scored*, not merely recorded: it names the
+//! account, says what stopped, says what is invisible while it is down, and
+//! carries the exact command that fixes it. That row is now the only signal
+//! for a single dead account, because the breaker will not trip for one.
+//!
+//! The payload is also deliberately **stable across polls**: the daemon keys
+//! an event's identity on `(source, external_id)` and resets its triage state
+//! whenever the payload changes, so a message carrying a timestamp or a
+//! request id would re-notify the owner every two minutes. Nothing that
+//! varies between two identical failures goes in it.
+//!
+//! If **every** account fails, [`poll`] returns `Err`. That is not a partial
+//! poll, it is a connector that cannot do its job — a dead network, a deleted
+//! token directory, a revoked OAuth client — and the breaker is exactly the
+//! right thing to see it.
 //!
 //! # Why the mail body is truncated
 //!
@@ -68,6 +95,14 @@ pub const KIND_EVENT: &str = "calendar_event";
 pub const KIND_CONFLICT: &str = "calendar_conflict";
 /// The `kind` on an unread-mail row.
 pub const KIND_MAIL: &str = "mail";
+/// The `kind` on the synthetic row reporting an account this poll could not
+/// read. See the module docs.
+pub const KIND_CONNECTOR_ERROR: &str = "connector_error";
+
+/// What a failing account was being asked for, as it appears in an error
+/// row's payload.
+const SIGNAL_CALENDAR: &str = "calendar";
+const SIGNAL_MAIL: &str = "mail";
 
 /// How far ahead a poll looks on the calendar.
 ///
@@ -127,6 +162,18 @@ pub fn mail_external_id(account: &str, id: &str) -> String {
     format!("gmail:{account}:{id}")
 }
 
+/// `gerror:<account>` — the id of the synthetic row reporting that this
+/// account could not be read.
+///
+/// One per account, independent of *what* failed. A grant that dies takes
+/// both signals down together, and an id that varied with the failing signal
+/// would report calendar-and-mail as a second event after reporting
+/// calendar-only. The daemon dedups on it, so a persistently dead account is
+/// one row that stays in the event log rather than 720 rows a day.
+pub fn account_error_external_id(account: &str) -> String {
+    format!("gerror:{account}")
+}
+
 /// The stable id of an unordered pair of clashing events. See the module docs
 /// for why the sort is load-bearing rather than cosmetic.
 pub fn conflict_external_id(a: &CalEvent, b: &CalEvent) -> String {
@@ -175,31 +222,144 @@ pub async fn poll(
     }
 
     let mut events: Vec<CalEvent> = Vec::new();
+    let mut mail_rows: Vec<WatchEntry> = Vec::new();
+    let mut failures: Vec<AccountFailure> = Vec::new();
+
     for account in accounts {
-        let found = calendar_client
+        let mut failure = AccountFailure::new(account);
+
+        match calendar_client
             .list_events(auth, account, now, now + LOOKAHEAD)
             .await
-            .with_context(|| format!("polling the calendar of Google account {account:?}"))?;
-        events.extend(found);
+            .with_context(|| format!("polling the calendar of Google account {account:?}"))
+        {
+            Ok(found) => events.extend(found),
+            Err(err) => failure.note(SIGNAL_CALENDAR, &err),
+        }
+
+        match gmail_client
+            .list_recent(auth, account, UNREAD_QUERY, MAX_UNREAD)
+            .await
+            .with_context(|| format!("polling the unread mail of Google account {account:?}"))
+        {
+            Ok(mail) => mail_rows.extend(mail.iter().map(mail_entry)),
+            Err(err) => failure.note(SIGNAL_MAIL, &err),
+        }
+
+        if !failure.signals.is_empty() {
+            failures.push(failure);
+        }
+    }
+
+    // Not a partial poll: a connector that cannot read a single one of its
+    // accounts is down, and the breaker should see it.
+    if failures.len() == accounts.len() {
+        bail!(
+            "every authorised Google account failed this poll. {}",
+            failures
+                .iter()
+                .map(AccountFailure::summary)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 
     let mut entries: Vec<WatchEntry> = events.iter().map(event_entry).collect();
 
     // Over the merged list, deliberately: a work lecture against a private
-    // appointment is the clash worth knowing about.
+    // appointment is the clash worth knowing about. An account that failed
+    // contributes nothing here, so a clash involving it is simply not
+    // reported this poll — under-reporting a conflict is the harmless
+    // direction, and the error row says which account is missing.
     for (a, b) in calendar::find_conflicts(&events) {
         entries.push(conflict_entry(&a, &b));
     }
 
-    for account in accounts {
-        let mail = gmail_client
-            .list_recent(auth, account, UNREAD_QUERY, MAX_UNREAD)
-            .await
-            .with_context(|| format!("polling the unread mail of Google account {account:?}"))?;
-        entries.extend(mail.iter().map(mail_entry));
-    }
+    entries.extend(mail_rows);
+    entries.extend(failures.iter().map(AccountFailure::entry));
 
     Ok(entries)
+}
+
+/// What went wrong for one account during one poll.
+struct AccountFailure {
+    account: String,
+    /// The signals that failed, in the order they were attempted.
+    signals: Vec<&'static str>,
+    /// One rendered error per failed signal, deduplicated: a dead grant
+    /// produces the same sentence for the calendar and for the mail, and
+    /// saying it twice makes the payload worse, not more informative.
+    errors: Vec<String>,
+}
+
+impl AccountFailure {
+    fn new(account: &str) -> Self {
+        Self {
+            account: account.to_string(),
+            signals: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// `{err:#}` — the whole `anyhow` chain on one line. Never `{err:?}`:
+    /// that is a backtrace, and this text ends up in a triage prompt.
+    fn note(&mut self, signal: &'static str, err: &anyhow::Error) {
+        self.signals.push(signal);
+        let rendered = format!("{err:#}");
+        if !self.errors.contains(&rendered) {
+            self.errors.push(rendered);
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "Account {:?} ({}): {}",
+            self.account,
+            self.signals.join(" and "),
+            self.errors.join(" | ")
+        )
+    }
+
+    /// The synthetic row. Everything in it is derived from the account and
+    /// the error text, so two identical failures produce two identical
+    /// payloads and the daemon does not treat the second as news.
+    fn entry(&self) -> WatchEntry {
+        let signals = self.signals.join(" and ");
+        WatchEntry {
+            external_id: account_error_external_id(&self.account),
+            kind: KIND_CONNECTOR_ERROR.to_string(),
+            payload: serde_json::json!({
+                "account": self.account,
+                "failed": self.signals,
+                "error": self.errors.join(" | "),
+                // Written for a triage prompt, which scores what it can read.
+                // "A connector errored" is a 20; "you are not being told
+                // about anything sent to this account" is the truth and is a
+                // 90. The sentence has to carry the consequence, not the
+                // mechanism.
+                "summary": format!(
+                    "Google account {:?} could not be read this poll ({signals}), so nothing \
+                     arriving there is reaching you.",
+                    self.account
+                ),
+                "impact": format!(
+                    "While this lasts, no {signals} from the {:?} Google account appears in \
+                     triage at all: a meeting moved, an exam result, an invoice, a message \
+                     from a supervisor would all pass unseen. The other authorised accounts \
+                     are unaffected and were reported in this same poll.",
+                    self.account
+                ),
+                "remedy": format!(
+                    "If the error mentions invalid_grant or HTTP 401, the grant is gone and \
+                     only re-authorising restores it:\n  {}\nAn OAuth client left in \
+                     Google's Testing publishing status expires its refresh tokens every 7 \
+                     days, which is the usual cause. Anything else (a 5xx, a connection \
+                     failure) is likely transient and the next poll will clear it.",
+                    authorize_command(&self.account)
+                ),
+            }),
+        }
+    }
 }
 
 /// One upcoming event, as a watch row.
@@ -427,6 +587,21 @@ mod tests {
 
     async fn mount_no_mail(server: &MockServer, token: &str) {
         mount_mail(server, token, &[]).await;
+    }
+
+    /// Every endpoint refuses this account's bearer token: what a revoked
+    /// grant looks like from the outside. Paired with
+    /// [`both_accounts_revoked`], whose refresh also fails, so the forced
+    /// 401 refresh finds nothing to recover.
+    async fn mount_dead(server: &MockServer, token: &str) {
+        Mock::given(method("GET"))
+            .and(header("authorization", bearer(token).as_str()))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#,
+                "application/json",
+            ))
+            .mount(server)
+            .await;
     }
 
     fn timed(id: &str, summary: &str, start: &str, end: &str) -> serde_json::Value {
@@ -813,11 +988,12 @@ mod tests {
     // Failing loudly
     // -----------------------------------------------------------------------
 
-    /// The one that keeps the breaker honest, and the multi-account twist on
-    /// it: the healthy account's rows must not be handed over as if the poll
-    /// were complete.
+    /// The ruling this module was rewritten under. A Testing-status OAuth
+    /// client expires its refresh tokens weekly, so `private` dying is not an
+    /// edge case — and taking `work` down with it for a week is worse than
+    /// handing over a partial poll that says, loudly, which half is missing.
     #[tokio::test]
-    async fn one_accounts_failure_fails_the_whole_poll() {
+    async fn one_dead_account_still_reports_the_other_and_exactly_one_error_row() {
         let server = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let auth = both_accounts_revoked(tmp.path());
@@ -833,34 +1009,159 @@ mod tests {
             )]),
         )
         .await;
-        Mock::given(method("GET"))
-            .and(path_matcher("/calendars/primary/events"))
-            .and(header("authorization", bearer(PRIVATE_TOKEN).as_str()))
-            .respond_with(ResponseTemplate::new(401).set_body_raw(
-                r#"{"error":{"message":"Invalid Credentials"}}"#,
-                "application/json",
-            ))
-            .mount(&server)
-            .await;
+        mount_mail(&server, WORK_TOKEN, &[message("m1", "Exam", "Body one")]).await;
+        mount_dead(&server, PRIVATE_TOKEN).await;
+
+        let (cal, mail) = clients(&server);
+        let entries = poll(&auth, &cal, &mail, &accounts(&["work", "private"]), at(NOW))
+            .await
+            .expect("one dead account must not silence the healthy one");
+
+        let ids: BTreeSet<&str> = entries.iter().map(|e| e.external_id.as_str()).collect();
+        assert!(ids.contains("gcal:work:w1"), "{ids:?}");
+        assert!(ids.contains("gmail:work:m1"), "{ids:?}");
+
+        let errors = of_kind(&entries, KIND_CONNECTOR_ERROR);
+        assert_eq!(
+            errors.len(),
+            1,
+            "one dead account, one error row: {entries:#?}"
+        );
+        assert_eq!(errors[0].external_id, "gerror:private");
+        assert_eq!(errors[0].payload["account"], "private");
+        assert_eq!(
+            errors[0].payload["failed"],
+            serde_json::json!(["calendar", "mail"]),
+            "a dead grant takes both signals, and that is one row, not two"
+        );
+
+        let rendered = errors[0].payload.to_string();
+        assert!(rendered.contains("401"), "{rendered}");
+        assert!(
+            rendered.contains("ea-google-authorize private"),
+            "the payload must carry the command that fixes it: {rendered}"
+        );
+        assert!(
+            !rendered.contains(WORK_TOKEN) && !rendered.contains(PRIVATE_TOKEN),
+            "a token reached an event payload, which is a triage prompt: {rendered}"
+        );
+    }
+
+    /// The error row is the *only* signal now — the breaker will not trip for
+    /// one dead account — so it has to arrive once and stay put. The daemon
+    /// dedups on `(source, external_id)` and re-triages whenever a payload
+    /// changes, so a row whose id or payload churned would nag the owner
+    /// every two minutes until they learned to ignore it.
+    #[tokio::test]
+    async fn a_persistently_dead_account_reports_the_same_row_on_every_poll() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = both_accounts_revoked(tmp.path());
+
+        mount_events(&server, WORK_TOKEN, serde_json::json!([])).await;
         mount_no_mail(&server, WORK_TOKEN).await;
+        mount_dead(&server, PRIVATE_TOKEN).await;
+
+        let (cal, mail) = clients(&server);
+        let accounts = accounts(&["work", "private"]);
+
+        let first = poll(&auth, &cal, &mail, &accounts, at(NOW)).await.unwrap();
+        let second = poll(&auth, &cal, &mail, &accounts, at("2026-09-24T08:02:00Z"))
+            .await
+            .unwrap();
+
+        let first_errors = of_kind(&first, KIND_CONNECTOR_ERROR);
+        let second_errors = of_kind(&second, KIND_CONNECTOR_ERROR);
+        assert_eq!(first_errors.len(), 1);
+        assert_eq!(
+            second_errors.len(),
+            1,
+            "a second poll must not add a second error row: {second:#?}"
+        );
+        assert_eq!(
+            first_errors[0], second_errors[0],
+            "identical id AND identical payload, or the daemon treats the second as news"
+        );
+    }
+
+    /// Not a partial poll: a connector that cannot read any of its accounts
+    /// is down, and the breaker is exactly the right thing to see it.
+    #[tokio::test]
+    async fn every_account_failing_is_an_error_so_the_breaker_sees_it() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = both_accounts_revoked(tmp.path());
+
+        mount_dead(&server, WORK_TOKEN).await;
+        mount_dead(&server, PRIVATE_TOKEN).await;
 
         let (cal, mail) = clients(&server);
         let err = poll(&auth, &cal, &mail, &accounts(&["work", "private"]), at(NOW))
             .await
-            .expect_err("a half-read poll must not be reported as a complete one");
+            .expect_err("no account answered; that is a connector failure");
         let rendered = format!("{err:#}");
 
-        assert!(rendered.contains("401"), "{rendered}");
         assert!(
-            rendered.contains("private"),
-            "the error must name the account that failed: {rendered}"
+            rendered.contains("every authorised Google account"),
+            "{rendered}"
         );
+        assert!(rendered.contains("work"), "{rendered}");
+        assert!(rendered.contains("private"), "{rendered}");
         assert!(!rendered.contains(WORK_TOKEN), "{rendered}");
         assert!(!rendered.contains(PRIVATE_TOKEN), "{rendered}");
     }
 
+    /// Half an account is still a reported account: the calendar answered, so
+    /// `work` contributes its events *and* an error row saying the mail did
+    /// not.
     #[tokio::test]
-    async fn a_gmail_failure_after_a_clean_calendar_still_fails_the_poll() {
+    async fn one_signal_failing_reports_the_other_signal_and_says_which_is_missing() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = both_accounts(tmp.path());
+
+        mount_events(
+            &server,
+            WORK_TOKEN,
+            serde_json::json!([timed(
+                "w1",
+                "Lecture",
+                "2026-09-25T10:00:00Z",
+                "2026-09-25T12:00:00Z"
+            )]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/users/me/messages"))
+            .and(header("authorization", bearer(WORK_TOKEN).as_str()))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        mount_events(&server, PRIVATE_TOKEN, serde_json::json!([])).await;
+        mount_no_mail(&server, PRIVATE_TOKEN).await;
+
+        let (cal, mail) = clients(&server);
+        let entries = poll(&auth, &cal, &mail, &accounts(&["work", "private"]), at(NOW))
+            .await
+            .unwrap();
+
+        assert_eq!(of_kind(&entries, KIND_EVENT).len(), 1);
+        let errors = of_kind(&entries, KIND_CONNECTOR_ERROR);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].payload["failed"],
+            serde_json::json!(["mail"]),
+            "the calendar answered; only the mail is missing: {:#?}",
+            errors[0]
+        );
+        assert!(errors[0].payload["error"].as_str().unwrap().contains("500"));
+    }
+
+    /// The single-account case of the all-accounts rule: with one account
+    /// authorised, that account failing *is* every account failing, so the
+    /// poll errors rather than reporting a calendar with no mail beside it.
+    #[tokio::test]
+    async fn the_only_accounts_mail_failing_fails_the_whole_poll() {
         let server = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let auth = auth_for(tmp.path(), &[("work", WORK_TOKEN)]);

@@ -217,13 +217,14 @@ notification, you reading it — could tell.
 ### What `watch_poll` reports
 
 A JSON array of `{ external_id, kind, payload }`, covering three signals across
-**every** authorised account:
+**every** authorised account, plus one row per account that could not be read:
 
 | kind | external id | what |
 |---|---|---|
 | `calendar_event` | `gcal:<account>:<id>` | Each event in the next 7 days. |
 | `calendar_conflict` | `gconflict:<id>\|<id>` | Each overlapping pair, computed over the **merged** calendars of all accounts — except a meeting you accepted in two of them, which is one meeting, not a clash. |
 | `mail` | `gmail:<account>:<id>` | Each of the 25 most recent messages matching `is:unread -category:promotions -category:social newer_than:7d`, per account. |
+| `connector_error` | `gerror:<account>` | One row for an account this poll could not read. Names the account, what failed, the error, what is invisible while it lasts, and the command that fixes it. |
 
 The account is part of every id because the same event or message id can
 legitimately exist in two accounts, and those are two rows, not one.
@@ -255,13 +256,32 @@ back into a tier-1 triage prompt in batches, and one newsletter with a 200 KB
 body would cost more than the rest of the batch and say nothing the first two
 thousand characters did not.
 
-`watch_poll` **fails loudly**, and that matters more here than it does for a
-single-account connector. If one account's token has lapsed, the whole poll
-fails — it does **not** return the healthy account's rows. A half-poll that
-looks complete is worse than a visible failure: the daemon would record it as a
-success, the breaker would never trip, and `ea status` would stay green while
-half your mail went unread. A poll with *no* authorised accounts is an error for
-the same reason, not an empty list.
+### What happens when an account dies
+
+One dead account does **not** silence the others. Until recently it did: the
+poll stopped at the first error, on the grounds that a half-poll looking
+complete is worse than a visible failure. That is the right call when a lapsed
+token is rare — but on a Testing-status OAuth client it is a *weekly certainty*
+(see "Publish the app"), and a week of no work mail because the private grant
+expired is worse than a partial poll that says so.
+
+So: every account that answers contributes its rows, and every account that
+fails contributes exactly one `connector_error` row. Its id is
+`gerror:<account>`, and both id and payload are stable, so an account that
+stays dead is one event in your log — not one every two minutes.
+
+**How you find out.** The `connector_error` row goes through triage like any
+other event, and its payload is written to be scored highly: it says that
+nothing arriving at that account is reaching you, which is a 90-salience fact,
+not a footnote. Triage notifies you the way it notifies you about anything
+important, and the row carries the exact `ea-google-authorize <account>`
+command. Note what you have given up for that: the scheduler's breaker no
+longer trips for one dead account, so this row is the *only* signal. `ea
+status` shows the connector as healthy, because for the other account it is.
+
+If **every** account fails, the poll returns an error — that is a connector
+that cannot do its job, and the breaker should see it. A poll with *no*
+authorised accounts is an error for the same reason, not an empty list.
 
 ## Smoke test
 
