@@ -366,14 +366,14 @@ impl CalendarClient {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> anyhow::Result<Vec<CalEvent>> {
-        let token = auth.access_token(account).await?;
+        let mut token = auth.access_token(account).await?;
 
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
 
         for _ in 0..MAX_PAGES {
             let url = self.events_url(from, to, page_token.as_deref())?;
-            let (raw_items, next) = self.get_page(url, &token).await?;
+            let (raw_items, next) = self.get_page(auth, account, url, &mut token).await?;
             events.extend(raw_items.iter().filter_map(|raw| normalize(raw, account)));
 
             match next {
@@ -414,10 +414,17 @@ impl CalendarClient {
     }
 
     /// One `GET`, returning the decoded page's items and its `nextPageToken`.
+    ///
+    /// A 401 is retried **once**, against a token forced out of [`Auth`]
+    /// rather than waited for. `token` is updated in place so the remaining
+    /// pages of the same walk use the new one rather than each rediscovering
+    /// the 401 for themselves.
     async fn get_page(
         &self,
+        auth: &Auth,
+        account: &str,
         url: Url,
-        token: &str,
+        token: &mut String,
     ) -> anyhow::Result<(Vec<RawEvent>, Option<String>)> {
         // `whence` is the URL with its query stripped: enough to say which
         // endpoint failed (and which account's token was used to ask, via the
@@ -426,15 +433,28 @@ impl CalendarClient {
         let mut whence = url.clone();
         whence.set_query(None);
 
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|err| err.without_url())
-            .with_context(|| format!("google calendar: GET {whence} failed"))?;
+        let response = self.send(url.clone(), token, &whence).await?;
+
+        // Exactly one retry. The access token can be dead long before it
+        // expires — a password change or a session revoke kills every
+        // outstanding one — and without this the connector reports 401s for
+        // the rest of the hour. A *second* 401 means the fresh token is
+        // refused too, so retrying again would only hammer Google; the error
+        // below is what the reader gets instead.
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            *token = auth
+                .refresh_after_unauthorized(account, token)
+                .await
+                .with_context(|| {
+                    format!(
+                        "google calendar: GET {whence} was refused with HTTP 401 and the \
+                         forced token refresh for account {account:?} failed too"
+                    )
+                })?;
+            self.send(url, token, &whence).await?
+        } else {
+            response
+        };
 
         let status = response.status();
         let content_type = response
@@ -481,6 +501,18 @@ impl CalendarClient {
         })?;
 
         Ok((page.items, page.next_page_token))
+    }
+
+    /// One bearer-authenticated GET, with the URL kept out of the error.
+    async fn send(&self, url: Url, token: &str, whence: &Url) -> anyhow::Result<reqwest::Response> {
+        self.http
+            .get(url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| err.without_url())
+            .with_context(|| format!("google calendar: GET {whence} failed"))
     }
 }
 
@@ -547,7 +579,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::auth::{RefreshBackend, RefreshError, RefreshResponse, TokenStore, Tokens};
@@ -895,7 +927,73 @@ mod tests {
         }
     }
 
+    /// The access token a forced refresh hands back. Distinct from
+    /// [`ACCESS_TOKEN`] so a mock can tell the retry from the first attempt
+    /// by its `Authorization` header alone.
+    const RENEWED_TOKEN: &str = "ya29.CALENDAR-RENEWED-do-not-leak";
+
+    /// A backend that renews once per call and counts how often it was asked.
+    struct RenewingBackend {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RenewingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl RefreshBackend for RenewingBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(RefreshResponse {
+                    access_token: RENEWED_TOKEN.to_string(),
+                    expires_in: 3599,
+                    refresh_token: None,
+                    scope: None,
+                })
+            })
+        }
+    }
+
+    /// The weekly case: Google has forgotten the grant entirely.
+    struct RevokedBackend;
+
+    impl RefreshBackend for RevokedBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Err(RefreshError::InvalidGrant) })
+        }
+    }
+
     fn auth_with_healthy_token(dir: &std::path::Path, account: &str) -> Auth {
+        auth_with_backend(dir, account, Arc::new(UnusedBackend))
+    }
+
+    fn auth_with_backend(
+        dir: &std::path::Path,
+        account: &str,
+        backend: Arc<dyn RefreshBackend>,
+    ) -> Auth {
         let store = TokenStore::new(Some(dir.to_path_buf()));
         store
             .write(
@@ -908,7 +1006,7 @@ mod tests {
                 },
             )
             .unwrap();
-        Auth::with_backend(store, Arc::new(UnusedBackend))
+        Auth::with_backend(store, backend)
     }
 
     fn json_page(body: serde_json::Value) -> ResponseTemplate {
@@ -1077,11 +1175,119 @@ mod tests {
         );
     }
 
+    /// An access token can be dead long before it expires: a password change
+    /// or a session revoke invalidates every outstanding one at once. Without
+    /// a forced refresh the connector reports 401s for up to an hour, which
+    /// on a two-minute poll is thirty consecutive failed polls.
+    #[tokio::test]
+    async fn a_401_forces_one_refresh_and_retries_the_request_with_the_new_token() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = RenewingBackend::new();
+        let auth = auth_with_backend(
+            tmp.path(),
+            "work",
+            Arc::clone(&backend) as Arc<dyn RefreshBackend>,
+        );
+
+        // The stale token is refused; the renewed one is served. Matching on
+        // the header is what proves the retry carried the *new* token.
+        Mock::given(method("GET"))
+            .and(header(
+                "authorization",
+                format!("Bearer {ACCESS_TOKEN}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(header(
+                "authorization",
+                format!("Bearer {RENEWED_TOKEN}").as_str(),
+            ))
+            .respond_with(json_page(serde_json::json!({
+                "items": [{
+                    "id": "e1",
+                    "summary": "Lecture",
+                    "start": { "dateTime": "2026-10-01T10:00:00Z" },
+                    "end": { "dateTime": "2026-10-01T12:00:00Z" },
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let events = CalendarClient::new(&server.uri())
+            .unwrap()
+            .list_events(
+                &auth,
+                "work",
+                at("2026-09-01T00:00:00Z"),
+                at("2026-11-01T00:00:00Z"),
+            )
+            .await
+            .expect("the retry after the forced refresh must succeed");
+
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(backend.calls(), 1, "exactly one forced refresh");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "the original request and exactly one retry"
+        );
+    }
+
+    /// One retry, not a loop. A token Google refuses twice will be refused a
+    /// third time; Phase 1's Fortnox notes record what an unbounded retry
+    /// against a revoked grant costs.
+    #[tokio::test]
+    async fn a_second_401_after_the_forced_refresh_gives_up_rather_than_retrying_again() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = RenewingBackend::new();
+        let auth = auth_with_backend(
+            tmp.path(),
+            "work",
+            Arc::clone(&backend) as Arc<dyn RefreshBackend>,
+        );
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = CalendarClient::new(&server.uri())
+            .unwrap()
+            .list_events(
+                &auth,
+                "work",
+                at("2026-09-01T00:00:00Z"),
+                at("2026-11-01T00:00:00Z"),
+            )
+            .await
+            .expect_err("a token refused twice is an error");
+
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        assert_eq!(backend.calls(), 1, "exactly one forced refresh, not a loop");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "one retry only"
+        );
+    }
+
     #[tokio::test]
     async fn a_401_errors_naming_the_status_without_leaking_the_token() {
         let server = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let auth = auth_with_healthy_token(tmp.path(), "work");
+        // A 401 now forces a refresh, so this account's grant has to be dead
+        // for the call to fail at all — which is the realistic pairing.
+        let auth = auth_with_backend(tmp.path(), "work", Arc::new(RevokedBackend));
 
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(401).set_body_raw(

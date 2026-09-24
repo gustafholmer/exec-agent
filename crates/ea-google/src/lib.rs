@@ -19,6 +19,12 @@
 //!   `^[a-z0-9][a-z0-9_-]*$` before it constructs a path. Lower-case only:
 //!   the token files live on a case-insensitive volume, where `work` and
 //!   `Work` would be two labels sharing one file.
+//! * **A 401 is a reason to refresh, not only a reason to fail.** A token can
+//!   be dead long before it expires — a password change or a session revoke
+//!   kills every outstanding one — so the calendar and Gmail clients force a
+//!   refresh on `401` and retry the request exactly once. Once: a grant
+//!   Google has revoked answers the same way forever, and an unbounded retry
+//!   loop against it is how an integration gets rate limited.
 //! * **A refresh is persisted and serialised.** A refresh that lives only in
 //!   memory means the next daemon restart re-authorises; two tasks refreshing
 //!   at once means two grants and a wasted one. [`auth::Auth`] writes through

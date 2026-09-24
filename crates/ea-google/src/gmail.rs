@@ -536,11 +536,13 @@ impl GmailClient {
         let token = auth.access_token(account).await?;
         let capped = max.min(MAX_MESSAGES);
 
-        let ids = self.list_message_ids(&token, query, capped).await?;
+        let ids = self
+            .list_message_ids(auth, account, &token, query, capped)
+            .await?;
 
         let mut mail = Vec::with_capacity(ids.len());
         for id in ids {
-            let raw = self.get_message(&token, &id).await?;
+            let raw = self.get_message(auth, account, &token, &id).await?;
             mail.push(normalize(&raw, account));
         }
         Ok(mail)
@@ -558,7 +560,7 @@ impl GmailClient {
     pub async fn get(&self, auth: &Auth, account: &str, id: &str) -> anyhow::Result<Mail> {
         validate_message_id(id)?;
         let token = auth.access_token(account).await?;
-        let raw = self.get_message(&token, id).await?;
+        let raw = self.get_message(auth, account, &token, id).await?;
         Ok(normalize(&raw, account))
     }
 
@@ -590,15 +592,14 @@ impl GmailClient {
         let payload = serde_json::json!({ "message": { "raw": encoded } });
 
         let response = self
-            .http
-            .post(url)
-            .bearer_auth(&token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| err.without_url())
-            .with_context(|| format!("gmail: POST {whence} failed"))?;
+            .send_with_retry(auth, account, &token, &whence, |bearer| {
+                self.http
+                    .post(url.clone())
+                    .bearer_auth(bearer)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .json(&payload)
+            })
+            .await?;
 
         let draft: DraftResponse = self.read_json(response, &whence).await?;
         Ok(draft.id.unwrap_or_default())
@@ -606,6 +607,8 @@ impl GmailClient {
 
     async fn list_message_ids(
         &self,
+        auth: &Auth,
+        account: &str,
         token: &str,
         query: &str,
         max: usize,
@@ -622,20 +625,7 @@ impl GmailClient {
             pairs.append_pair("maxResults", &max.to_string());
         }
 
-        let mut whence = url.clone();
-        whence.set_query(None);
-
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|err| err.without_url())
-            .with_context(|| format!("gmail: GET {whence} failed"))?;
-
-        let page: MessagesPage = self.read_json(response, &whence).await?;
+        let page: MessagesPage = self.get_json(auth, account, token, url).await?;
         Ok(page
             .messages
             .unwrap_or_default()
@@ -644,27 +634,88 @@ impl GmailClient {
             .collect())
     }
 
-    async fn get_message(&self, token: &str, id: &str) -> anyhow::Result<RawMessage> {
+    async fn get_message(
+        &self,
+        auth: &Auth,
+        account: &str,
+        token: &str,
+        id: &str,
+    ) -> anyhow::Result<RawMessage> {
         let mut url = self
             .base
             .join(&format!("users/me/messages/{id}"))
             .context("building the Gmail messages.get URL")?;
         url.query_pairs_mut().append_pair("format", "full");
 
+        self.get_json(auth, account, token, url).await
+    }
+
+    /// One bearer-authenticated `GET`, decoded, with the 401 retry.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        auth: &Auth,
+        account: &str,
+        token: &str,
+        url: Url,
+    ) -> anyhow::Result<T> {
         let mut whence = url.clone();
         whence.set_query(None);
 
         let response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|err| err.without_url())
-            .with_context(|| format!("gmail: GET {whence} failed"))?;
+            .send_with_retry(auth, account, token, &whence, |bearer| {
+                self.http
+                    .get(url.clone())
+                    .bearer_auth(bearer)
+                    .header(reqwest::header::ACCEPT, "application/json")
+            })
+            .await?;
 
         self.read_json(response, &whence).await
+    }
+
+    /// Send a request, and if Google answers 401, force a token refresh and
+    /// send it **once** more.
+    ///
+    /// The access token can be dead long before it expires — a password
+    /// change or a session revoke invalidates every outstanding one — and
+    /// [`Auth::access_token`] only refreshes on local expiry, so without this
+    /// a revoked session produces 401s for up to an hour: thirty consecutive
+    /// failed polls at the daemon's two-minute cadence.
+    ///
+    /// Exactly one retry. A token Google refuses twice will be refused a
+    /// third time, and Phase 1's Fortnox notes record where an unbounded
+    /// retry against a dead grant ends: rate limited, for the whole
+    /// integration. [`Auth::refresh_after_unauthorized`] bounds the other
+    /// half of it — the concurrent `messages.get`s that all see the same 401
+    /// share one refresh rather than each buying their own.
+    ///
+    /// Re-sending is safe for everything this client does: a 401 means Google
+    /// rejected the request before acting on it, so the retried `POST` cannot
+    /// produce a second draft.
+    async fn send_with_retry(
+        &self,
+        auth: &Auth,
+        account: &str,
+        token: &str,
+        whence: &Url,
+        build: impl Fn(&str) -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        let response = send(build(token), whence).await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+
+        let fresh = auth
+            .refresh_after_unauthorized(account, token)
+            .await
+            .with_context(|| {
+                format!(
+                    "gmail: {whence} was refused with HTTP 401 and the forced token \
+                     refresh for account {account:?} failed too"
+                )
+            })?;
+
+        send(build(&fresh), whence).await
     }
 
     /// Shared response handling for every call this client makes: read the
@@ -715,6 +766,17 @@ impl GmailClient {
             )
         })
     }
+}
+
+/// Send one built request. `whence` is the URL with its query stripped: the
+/// `reqwest` error's own URL is dropped first, because a URL in an error is
+/// the one place a credential must never turn up.
+async fn send(request: reqwest::RequestBuilder, whence: &Url) -> anyhow::Result<reqwest::Response> {
+    request
+        .send()
+        .await
+        .map_err(|err| err.without_url())
+        .with_context(|| format!("gmail: the request to {whence} failed"))
 }
 
 /// Build a minimal RFC 822 message. Plain text only, UTF-8 body.
@@ -897,7 +959,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header as header_matcher, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::auth::{RefreshBackend, RefreshError, RefreshResponse, TokenStore, Tokens};
@@ -1134,7 +1196,73 @@ mod tests {
         }
     }
 
+    /// The access token a forced refresh hands back. Distinct from
+    /// [`ACCESS_TOKEN`] so a mock can tell the retry from the first attempt
+    /// by its `Authorization` header alone.
+    const RENEWED_TOKEN: &str = "ya29.GMAIL-RENEWED-do-not-leak";
+
+    /// A backend that renews once per call and counts how often it was asked.
+    struct RenewingBackend {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RenewingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl RefreshBackend for RenewingBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(RefreshResponse {
+                    access_token: RENEWED_TOKEN.to_string(),
+                    expires_in: 3599,
+                    refresh_token: None,
+                    scope: None,
+                })
+            })
+        }
+    }
+
+    /// The weekly case: Google has forgotten the grant entirely.
+    struct RevokedBackend;
+
+    impl RefreshBackend for RevokedBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Err(RefreshError::InvalidGrant) })
+        }
+    }
+
     fn auth_with_healthy_token(dir: &std::path::Path, account: &str) -> Auth {
+        auth_with_backend(dir, account, Arc::new(UnusedBackend))
+    }
+
+    fn auth_with_backend(
+        dir: &std::path::Path,
+        account: &str,
+        backend: Arc<dyn RefreshBackend>,
+    ) -> Auth {
         let store = TokenStore::new(Some(dir.to_path_buf()));
         store
             .write(
@@ -1147,7 +1275,7 @@ mod tests {
                 },
             )
             .unwrap();
-        Auth::with_backend(store, Arc::new(UnusedBackend))
+        Auth::with_backend(store, backend)
     }
 
     fn json(body: serde_json::Value) -> ResponseTemplate {
@@ -1233,11 +1361,100 @@ mod tests {
         );
     }
 
+    /// Gmail's half of the forced refresh. A revoked session invalidates
+    /// every outstanding access token at once, and `access_token` alone would
+    /// not notice for up to an hour.
+    #[tokio::test]
+    async fn a_401_forces_one_refresh_and_retries_the_request_with_the_new_token() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = RenewingBackend::new();
+        let auth = auth_with_backend(
+            tmp.path(),
+            "work",
+            Arc::clone(&backend) as Arc<dyn RefreshBackend>,
+        );
+
+        Mock::given(method("GET"))
+            .and(header_matcher(
+                "authorization",
+                format!("Bearer {ACCESS_TOKEN}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/users/me/messages"))
+            .and(header_matcher(
+                "authorization",
+                format!("Bearer {RENEWED_TOKEN}").as_str(),
+            ))
+            .respond_with(json(serde_json::json!({ "messages": [] })))
+            .mount(&server)
+            .await;
+
+        let mail = GmailClient::new(&server.uri())
+            .unwrap()
+            .list_recent(&auth, "work", "is:unread", 10)
+            .await
+            .expect("the retry after the forced refresh must succeed");
+
+        assert!(mail.is_empty());
+        assert_eq!(backend.calls(), 1, "exactly one forced refresh");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "the original request and exactly one retry"
+        );
+    }
+
+    /// One retry, not a loop: a token refused twice stays refused, and
+    /// hammering the token endpoint is how the whole integration gets rate
+    /// limited.
+    #[tokio::test]
+    async fn a_second_401_after_the_forced_refresh_gives_up_rather_than_retrying_again() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = RenewingBackend::new();
+        let auth = auth_with_backend(
+            tmp.path(),
+            "work",
+            Arc::clone(&backend) as Arc<dyn RefreshBackend>,
+        );
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = GmailClient::new(&server.uri())
+            .unwrap()
+            .list_recent(&auth, "work", "", 10)
+            .await
+            .expect_err("a token refused twice is an error");
+
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        assert_eq!(backend.calls(), 1, "exactly one forced refresh, not a loop");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "one retry only"
+        );
+    }
+
     #[tokio::test]
     async fn a_401_errors_naming_the_status_without_leaking_the_token() {
         let server = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let auth = auth_with_healthy_token(tmp.path(), "work");
+        // A 401 now forces a refresh, so this account's grant has to be dead
+        // for the call to fail at all — which is the realistic pairing.
+        let auth = auth_with_backend(tmp.path(), "work", Arc::new(RevokedBackend));
 
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(401).set_body_raw(

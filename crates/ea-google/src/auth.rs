@@ -59,6 +59,19 @@
 //! * The authorization *code* that arrives on the loopback redirect is a
 //!   one-time bearer of the whole grant. `bin/authorize.rs` parses it out of
 //!   the request line and never prints the request line.
+//! * Nothing here *retains* a credential it is not about to send. The one
+//!   long-lived piece of per-account memory, [`Auth::dead`], holds a
+//!   [`token_fingerprint`] rather than the token it is comparing against.
+//!
+//! # Two ways a token dies
+//!
+//! An access token expires on a clock, and [`Auth::access_token`] refreshes
+//! it a minute early. It can also simply *stop working*: a password change, a
+//! session revoke, or the owner removing the app at
+//! myaccount.google.com invalidates every outstanding access token at once,
+//! and nothing local knows. That failure looks like a 401 on an unexpired
+//! token, and [`Auth::refresh_after_unauthorized`] is the recovery — one
+//! forced refresh, which the caller retries its request against exactly once.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -788,6 +801,54 @@ pub struct Auth {
     /// cached-token read for `private`.
     locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     backend: Arc<dyn RefreshBackend>,
+    /// Accounts whose grant Google has said is *gone*, keyed by account.
+    ///
+    /// This is what keeps [`Auth::refresh_after_unauthorized`] from becoming
+    /// the retry loop Phase 1's Fortnox notes warn about. A revoked grant
+    /// answers `invalid_grant` to every refresh, and a poll issues up to
+    /// twenty-six requests per account — each of which would otherwise see a
+    /// 401, force a refresh, and be refused again. That is dozens of POSTs to
+    /// Google's token endpoint every two minutes for an account that will
+    /// never come back, which is how an integration gets rate limited.
+    ///
+    /// Only `invalid_grant` is remembered: it is the one answer that means
+    /// *this will not work again until a human re-authorises*. A connection
+    /// reset or a 500 is retried normally, because caching those would turn a
+    /// thirty-second outage into a permanently dead connector.
+    ///
+    /// The entry is keyed to the access token that was in the store when the
+    /// refresh failed, so re-authorising (which writes a new one) clears the
+    /// memo implicitly. It is stored as a hash, not the token: this struct
+    /// has no business retaining a credential it is not about to send.
+    dead: std::sync::Mutex<HashMap<String, DeadGrant>>,
+}
+
+/// One remembered `invalid_grant`. See [`Auth::dead`].
+struct DeadGrant {
+    /// [`token_fingerprint`] of the access token that was current when the
+    /// refresh was refused.
+    fingerprint: u64,
+    /// The exact error text to replay, so a dead account produces the *same*
+    /// message every poll rather than a slightly different one each time —
+    /// the daemon keys an event's identity on its payload, and a message that
+    /// churns would re-notify the owner every two minutes.
+    message: String,
+}
+
+/// A non-cryptographic fingerprint of an access token, used only to tell
+/// "the same token as last time" from "a different one".
+///
+/// A hash rather than the token itself because [`Auth`] keeps this for as
+/// long as the process lives, and a credential that is not about to be sent
+/// somewhere should not be sitting in a long-lived map. A collision would
+/// replay one stale error message for a token that might have worked; at
+/// 2^-64 against a value that changes hourly that is not a risk worth a
+/// SHA-2 dependency.
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Auth {
@@ -805,6 +866,7 @@ impl Auth {
             store,
             locks: tokio::sync::Mutex::new(HashMap::new()),
             backend,
+            dead: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -839,15 +901,82 @@ impl Auth {
             return Ok(tokens.access_token);
         }
 
+        self.refresh_locked(account, tokens, now).await
+    }
+
+    /// Refresh `account` *now*, because Google refused `rejected` with a 401,
+    /// and return the replacement.
+    ///
+    /// [`Auth::access_token`] alone cannot recover from this. It refreshes on
+    /// **local** expiry, and a token can be dead long before it expires: a
+    /// password change, a session revoke, or the owner removing the app at
+    /// myaccount.google.com invalidates every outstanding access token
+    /// immediately. Without this, every request for the rest of the hour
+    /// returns 401 and the connector simply reports failures until the clock
+    /// catches up.
+    ///
+    /// Exactly one refresh, and at most one: callers retry the request once
+    /// with what comes back and then give up, and this function itself never
+    /// loops.
+    ///
+    /// `rejected` is the token that got the 401. If the store no longer holds
+    /// it, some other in-flight request has already refreshed — which is the
+    /// common case when eight `messages.get`s go out together — and the fresh
+    /// token is returned without touching the network.
+    pub async fn refresh_after_unauthorized(
+        &self,
+        account: &str,
+        rejected: &str,
+    ) -> anyhow::Result<String> {
+        self.refresh_after_unauthorized_at(account, rejected, Utc::now())
+            .await
+    }
+
+    /// [`Auth::refresh_after_unauthorized`] against an explicit clock.
+    pub async fn refresh_after_unauthorized_at(
+        &self,
+        account: &str,
+        rejected: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<String> {
+        validate_account(account)?;
+
+        let lock = self.lock_for(account).await;
+        let _guard = lock.lock().await;
+
+        let tokens = self.store.read(account)?;
+        if tokens.access_token != rejected {
+            // Somebody already replaced the token Google refused. Handing
+            // back the new one costs nothing and is what the caller wanted.
+            return Ok(tokens.access_token);
+        }
+
+        self.refresh_locked(account, tokens, now).await
+    }
+
+    /// The refresh itself. The per-account lock is held by the caller, and
+    /// `tokens` was read from the store inside it.
+    async fn refresh_locked(
+        &self,
+        account: &str,
+        tokens: Tokens,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<String> {
+        if let Some(message) = self.remembered_invalid_grant(account, &tokens.access_token) {
+            bail!("{message}");
+        }
+
         let response = match self.backend.refresh(&tokens.refresh_token).await {
             Ok(response) => response,
             Err(RefreshError::InvalidGrant) => {
-                bail!(
+                let message = format!(
                     "Google rejected the stored refresh token for account {account:?} \
                      (invalid_grant): it has been revoked, expired, or was issued to a \
                      different OAuth client. Re-authorise with:\n  {}",
                     authorize_command(account)
                 );
+                self.remember_invalid_grant(account, &tokens.access_token, &message);
+                bail!("{message}");
             }
             // Deliberately unchanged, with no added context. A connection
             // reset is not a revoked grant, and dressing it up as one sends
@@ -870,8 +999,44 @@ impl Auth {
         // ever *does* rotate the refresh token, the rotated one would be lost
         // and the account would be dead.
         self.store.write(account, &refreshed)?;
+        self.forget_invalid_grant(account);
 
         Ok(refreshed.access_token)
+    }
+
+    /// The remembered `invalid_grant` message for `account`, if the store
+    /// still holds the same access token it held when the refresh was
+    /// refused. See [`Auth::dead`].
+    fn remembered_invalid_grant(&self, account: &str, current: &str) -> Option<String> {
+        let dead = match self.dead.lock() {
+            Ok(dead) => dead,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        dead.get(account)
+            .filter(|entry| entry.fingerprint == token_fingerprint(current))
+            .map(|entry| entry.message.clone())
+    }
+
+    fn remember_invalid_grant(&self, account: &str, current: &str, message: &str) {
+        let mut dead = match self.dead.lock() {
+            Ok(dead) => dead,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        dead.insert(
+            account.to_string(),
+            DeadGrant {
+                fingerprint: token_fingerprint(current),
+                message: message.to_string(),
+            },
+        );
+    }
+
+    fn forget_invalid_grant(&self, account: &str) {
+        let mut dead = match self.dead.lock() {
+            Ok(dead) => dead,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        dead.remove(account);
     }
 
     async fn lock_for(&self, account: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1324,6 +1489,268 @@ mod tests {
                     expires_in: 3600,
                     scope: None,
                 })
+            })
+        }
+    }
+
+    /// A revoked session, a changed password, or the owner removing the app
+    /// kills every outstanding access token *immediately*. Local expiry says
+    /// nothing about it, so without a forced refresh the connector spends up
+    /// to an hour reporting 401s — thirty consecutive failed polls.
+    #[tokio::test]
+    async fn a_401_forces_a_refresh_even_though_the_token_has_not_locally_expired() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = store_in(tmp.path());
+        // Half an hour of life left by the clock, and dead in fact.
+        store
+            .write(
+                "work",
+                &tokens_expiring_at(Utc::now() + chrono::Duration::minutes(30)),
+            )
+            .unwrap();
+        let backend = CountingBackend::new(Duration::ZERO);
+        let auth = Auth::with_backend(store, Arc::clone(&backend) as Arc<dyn RefreshBackend>);
+
+        assert_eq!(
+            auth.access_token("work").await.unwrap(),
+            ACCESS_TOKEN,
+            "the ordinary path must still trust local expiry"
+        );
+        assert_eq!(backend.calls(), 0);
+
+        let fresh = auth
+            .refresh_after_unauthorized("work", ACCESS_TOKEN)
+            .await
+            .unwrap();
+
+        assert_eq!(fresh, "refreshed-1");
+        assert_eq!(backend.calls(), 1);
+        assert_eq!(
+            auth.store().read("work").unwrap().access_token,
+            "refreshed-1",
+            "the refreshed token must be persisted, not just returned"
+        );
+    }
+
+    /// Eight `messages.get`s go out together; all eight see the same 401.
+    /// Only the first of them should cost a refresh — the rest present a
+    /// token the store has already replaced and get the replacement back.
+    #[tokio::test]
+    async fn a_401_on_a_token_that_was_already_replaced_costs_no_second_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = store_in(tmp.path());
+        store
+            .write(
+                "work",
+                &tokens_expiring_at(Utc::now() + chrono::Duration::minutes(30)),
+            )
+            .unwrap();
+        let backend = CountingBackend::new(Duration::ZERO);
+        let auth = Auth::with_backend(store, Arc::clone(&backend) as Arc<dyn RefreshBackend>);
+
+        for _ in 0..5 {
+            assert_eq!(
+                auth.refresh_after_unauthorized("work", ACCESS_TOKEN)
+                    .await
+                    .unwrap(),
+                "refreshed-1"
+            );
+        }
+
+        assert_eq!(
+            backend.calls(),
+            1,
+            "the token Google refused was replaced once; the other four callers take that result"
+        );
+    }
+
+    /// The failure mode Phase 1's Fortnox notes call out: a revoked grant
+    /// answers `invalid_grant` to every refresh, and a poll makes dozens of
+    /// requests. Retrying each one's 401 would be dozens of POSTs to the
+    /// token endpoint every two minutes, forever, which is how an integration
+    /// gets rate limited. The first answer is remembered and replayed.
+    #[tokio::test]
+    async fn a_revoked_grant_is_refreshed_once_and_then_remembered_verbatim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = store_in(tmp.path());
+        store
+            .write(
+                "work",
+                &tokens_expiring_at(Utc::now() + chrono::Duration::minutes(30)),
+            )
+            .unwrap();
+        let backend = RevokingBackend::new();
+        let auth = Auth::with_backend(store, Arc::clone(&backend) as Arc<dyn RefreshBackend>);
+
+        let mut messages = Vec::new();
+        for _ in 0..10 {
+            let err = auth
+                .refresh_after_unauthorized("work", ACCESS_TOKEN)
+                .await
+                .unwrap_err();
+            messages.push(format!("{err:#}"));
+        }
+
+        assert_eq!(
+            backend.calls(),
+            1,
+            "a revoked grant must be asked once, not once per request"
+        );
+        assert!(messages[0].contains("invalid_grant"), "{}", messages[0]);
+        assert!(
+            messages[0].contains("ea-google-authorize work"),
+            "{}",
+            messages[0]
+        );
+        assert!(
+            messages.iter().all(|m| *m == messages[0]),
+            "the replayed message must be identical every time, or the daemon \
+             re-notifies on a payload that only looks new: {messages:#?}"
+        );
+
+        // The local-expiry path shares the memo: an hour later, when the
+        // token really has expired, the account is still dead and still must
+        // not cost another POST.
+        let err = auth
+            .access_token_at("work", Utc::now() + chrono::Duration::hours(2))
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{err:#}"), messages[0]);
+        assert_eq!(backend.calls(), 1);
+    }
+
+    /// The memo is keyed to the token that was refused, so re-authorising —
+    /// which writes a new one — brings the account straight back without a
+    /// restart.
+    #[tokio::test]
+    async fn re_authorising_clears_the_remembered_invalid_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = store_in(tmp.path());
+        store
+            .write(
+                "work",
+                &tokens_expiring_at(Utc::now() + chrono::Duration::minutes(30)),
+            )
+            .unwrap();
+        let backend = RevokingBackend::new();
+        let auth = Auth::with_backend(store, Arc::clone(&backend) as Arc<dyn RefreshBackend>);
+
+        auth.refresh_after_unauthorized("work", ACCESS_TOKEN)
+            .await
+            .unwrap_err();
+
+        // `ea-google-authorize work` ran.
+        auth.store()
+            .write(
+                "work",
+                &Tokens {
+                    access_token: "ya29.RE-AUTHORISED".to_string(),
+                    refresh_token: REFRESH_TOKEN.to_string(),
+                    expiry: Utc::now() + chrono::Duration::minutes(30),
+                    scope: SCOPES.join(" "),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            auth.access_token("work").await.unwrap(),
+            "ya29.RE-AUTHORISED",
+            "a re-authorised account must not stay poisoned by the old memo"
+        );
+        assert_eq!(backend.calls(), 1);
+    }
+
+    /// A connection reset is not a revoked grant. Remembering a *transient*
+    /// failure would turn a thirty-second outage into a permanently dead
+    /// connector, so only `invalid_grant` is cached.
+    #[tokio::test]
+    async fn a_transient_refresh_failure_is_retried_rather_than_remembered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = store_in(tmp.path());
+        store
+            .write(
+                "work",
+                &tokens_expiring_at(Utc::now() + chrono::Duration::minutes(30)),
+            )
+            .unwrap();
+        let backend = FlakyBackend::new();
+        let auth = Auth::with_backend(store, Arc::clone(&backend) as Arc<dyn RefreshBackend>);
+
+        auth.refresh_after_unauthorized("work", ACCESS_TOKEN)
+            .await
+            .unwrap_err();
+        let recovered = auth
+            .refresh_after_unauthorized("work", ACCESS_TOKEN)
+            .await
+            .expect("the second attempt must be made, not answered from a memo");
+
+        assert_eq!(recovered, "refreshed-after-the-blip");
+        assert_eq!(backend.calls(), 2);
+    }
+
+    /// Always `invalid_grant`, and counts.
+    struct RevokingBackend {
+        calls: AtomicUsize,
+    }
+
+    impl RevokingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RefreshBackend for RevokingBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(RefreshError::InvalidGrant) })
+        }
+    }
+
+    /// Fails once with a transport error, then works.
+    struct FlakyBackend {
+        calls: AtomicUsize,
+    }
+
+    impl FlakyBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RefreshBackend for FlakyBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a>>
+        {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Err(RefreshError::Other(anyhow::anyhow!(
+                        "connection reset by peer"
+                    )))
+                } else {
+                    Ok(RefreshResponse {
+                        access_token: "refreshed-after-the-blip".to_string(),
+                        refresh_token: None,
+                        expires_in: 3600,
+                        scope: None,
+                    })
+                }
             })
         }
     }

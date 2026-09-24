@@ -321,6 +321,32 @@ mod tests {
     /// An `Auth` holding a healthy, distinct access token for each account, so
     /// a mock can tell the two apart by the `Authorization` header.
     fn auth_for(dir: &Path, accounts: &[(&str, &str)]) -> Auth {
+        auth_for_with_backend(dir, accounts, Arc::new(UnusedBackend))
+    }
+
+    /// The weekly case: Google has forgotten the grant. A 401 now forces a
+    /// refresh, so a test that wants a poll to *fail* has to say what the
+    /// refresh finds.
+    struct RevokedBackend;
+
+    impl RefreshBackend for RevokedBackend {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RefreshResponse, RefreshError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Err(RefreshError::InvalidGrant) })
+        }
+    }
+
+    fn auth_for_with_backend(
+        dir: &Path,
+        accounts: &[(&str, &str)],
+        backend: Arc<dyn RefreshBackend>,
+    ) -> Auth {
         let store = TokenStore::new(Some(dir.to_path_buf()));
         for (account, access_token) in accounts {
             store
@@ -335,11 +361,21 @@ mod tests {
                 )
                 .unwrap();
         }
-        Auth::with_backend(store, Arc::new(UnusedBackend))
+        Auth::with_backend(store, backend)
     }
 
     fn both_accounts(dir: &Path) -> Auth {
         auth_for(dir, &[("work", WORK_TOKEN), ("private", PRIVATE_TOKEN)])
+    }
+
+    /// Both accounts authorised, but Google has revoked the grants: the
+    /// state a Testing-status OAuth client reaches every seven days.
+    fn both_accounts_revoked(dir: &Path) -> Auth {
+        auth_for_with_backend(
+            dir,
+            &[("work", WORK_TOKEN), ("private", PRIVATE_TOKEN)],
+            Arc::new(RevokedBackend),
+        )
     }
 
     fn json(body: serde_json::Value) -> ResponseTemplate {
@@ -779,7 +815,7 @@ mod tests {
     async fn one_accounts_failure_fails_the_whole_poll() {
         let server = MockServer::start().await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let auth = both_accounts(tmp.path());
+        let auth = both_accounts_revoked(tmp.path());
 
         mount_events(
             &server,
