@@ -16,18 +16,29 @@ path = "src/lib.rs"
 name = "ea-google-authorize"
 path = "src/bin/authorize.rs"
 
+# The connector binary itself: the stdio MCP server the daemon spawns. Named
+# for the connector, because `connectors/google/connector.toml` resolves
+# `command` against the directory holding `ea-daemon` and then $PATH.
+[[bin]]
+name = "ea-google"
+path = "src/main.rs"
+
 [dependencies]
 ea-core = { path = "../ea-core" }
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+toml.workspace = true
 wiremock.workspace = true

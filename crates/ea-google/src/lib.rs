@@ -33,3 +33,5 @@
 pub mod auth;
 pub mod calendar;
 pub mod gmail;
+pub mod tools;
+pub mod watch;

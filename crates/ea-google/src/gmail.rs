@@ -546,6 +546,22 @@ impl GmailClient {
         Ok(mail)
     }
 
+    /// One message by id, normalised.
+    ///
+    /// `id` is validated before it is interpolated into a path. It reaches
+    /// this function from a tool argument a language model wrote, and the URL
+    /// is built with `Url::join` on a relative string: an id of `../../foo`
+    /// would otherwise walk out of `users/me/messages/` and issue a
+    /// bearer-authenticated GET against a path nobody asked for. Gmail's own
+    /// ids are lower-case hex, so the character class below is generous
+    /// rather than restrictive.
+    pub async fn get(&self, auth: &Auth, account: &str, id: &str) -> anyhow::Result<Mail> {
+        validate_message_id(id)?;
+        let token = auth.access_token(account).await?;
+        let raw = self.get_message(&token, id).await?;
+        Ok(normalize(&raw, account))
+    }
+
     /// Create a draft addressed to `to` with `subject` and `body`, and
     /// return its id. Posts to `users/me/drafts`; never touches
     /// `users/me/messages/send` — see the module docs.
@@ -833,6 +849,31 @@ pub async fn list_recent(
 ) -> anyhow::Result<Vec<Mail>> {
     GmailClient::new(GOOGLE_GMAIL_BASE)?
         .list_recent(auth, account, query, max)
+        .await
+}
+
+/// A Gmail message id is safe to interpolate into a URL path only if it
+/// cannot contain a separator or a dot segment. See [`GmailClient::get`].
+fn validate_message_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty() {
+        bail!("gmail: a message id must not be empty");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!(
+            "gmail: message id {id:?} is not a Gmail message id (expected letters, \
+             digits, '-' and '_' only)"
+        );
+    }
+    Ok(())
+}
+
+/// `get(auth, account, id)` against the real Gmail API.
+pub async fn get(auth: &Auth, account: &str, id: &str) -> anyhow::Result<Mail> {
+    GmailClient::new(GOOGLE_GMAIL_BASE)?
+        .get(auth, account, id)
         .await
 }
 
@@ -1594,6 +1635,77 @@ mod tests {
         }
 
         assert_eq!(decode_rfc2047(&encoded), original);
+    }
+
+    // -----------------------------------------------------------------------
+    // get: one message by id
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_fetches_and_normalises_one_message() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        Mock::given(method("GET"))
+            .and(path("/users/me/messages/msg-7"))
+            .respond_with(json(serde_json::json!({
+                "id": "msg-7",
+                "threadId": "t-7",
+                "labelIds": ["INBOX", "UNREAD"],
+                "snippet": "A snippet",
+                "internalDate": "1700000000000",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        { "name": "From", "value": "prof@kth.se" },
+                        { "name": "Subject", "value": "Exam" },
+                    ],
+                    "body": { "data": encode("The whole body.") },
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mail = GmailClient::new(&server.uri())
+            .unwrap()
+            .get(&auth, "work", "msg-7")
+            .await
+            .unwrap();
+
+        assert_eq!(mail.id, "msg-7");
+        assert_eq!(mail.account, "work");
+        assert_eq!(mail.subject, "Exam");
+        assert_eq!(mail.body, "The whole body.");
+    }
+
+    /// The id arrives from a tool argument a language model wrote, and the URL
+    /// is built by joining a relative string onto the base. Without this
+    /// check, `../` would walk out of `users/me/messages/` carrying the
+    /// bearer token.
+    #[tokio::test]
+    async fn get_refuses_a_message_id_that_could_walk_the_url_path() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        // No mocks mounted at all: reaching the network is itself the failure.
+        let client = GmailClient::new(&server.uri()).unwrap();
+        for id in ["../../users/me/settings", "msg/../other", "", "a?b", "a b"] {
+            let err = client
+                .get(&auth, "work", id)
+                .await
+                .expect_err("a non-id must be refused before any request");
+            assert!(
+                err.to_string().contains("message id"),
+                "id {id:?} gave {err:#}"
+            );
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a rejected id must not reach the network"
+        );
     }
 
     #[test]

@@ -1,0 +1,17 @@
+# Discovered by the daemon: a directory holding both connector.toml and
+# policy.toml is a connector. `command` is resolved against the running
+# executable's directory first, then $PATH, so a release build next to
+# ea-daemon needs no install step.
+#
+# `name` must equal this directory's basename, and no two connectors may claim
+# the same name — both are hard startup errors. See `ea_daemon::connectors`.
+name = "google"
+command = "ea-google"
+args = []
+
+# Two minutes: the tighter of the two watchers this connector merges. Mail is
+# the signal with a human waiting on the other end of it, and two minutes is
+# the interval the plan set for Gmail. The calendar work inside `watch_poll`
+# is one request per account per poll, cheap enough to run at the same
+# cadence, and one interval per connector keeps the daemon simple.
+watch_interval_secs = 120
