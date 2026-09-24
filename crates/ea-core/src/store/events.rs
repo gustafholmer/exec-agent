@@ -25,6 +25,7 @@ pub struct RecordInput {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone)]
 pub struct EventStore {
     conn: Arc<Mutex<Connection>>,
 }

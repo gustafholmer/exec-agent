@@ -72,6 +72,7 @@ pub struct ProposeInput {
     pub ttl: Duration,
 }
 
+#[derive(Clone)]
 pub struct ActionStore {
     conn: Arc<Mutex<Connection>>,
 }

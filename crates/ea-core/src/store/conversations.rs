@@ -26,6 +26,7 @@ fn hydrate_message(row: &Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+#[derive(Clone)]
 pub struct ConversationStore {
     conn: Arc<Mutex<Connection>>,
 }

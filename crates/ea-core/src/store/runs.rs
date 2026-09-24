@@ -19,6 +19,7 @@ pub struct Run {
     pub finished_at: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct RunStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -125,6 +126,42 @@ impl RunStore {
         }
         self.get(id)?.ok_or_else(|| anyhow!("run {id} vanished"))
     }
+
+    /// The `limit` most recent runs, newest first. What `ea log` shows.
+    pub fn recent(&self, limit: i64) -> anyhow::Result<Vec<Run>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM runs ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit.max(0)], hydrate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many runs started at or after `since`, optionally ignoring one
+    /// `kind`.
+    ///
+    /// This is what the daily session budget is counted from, and the
+    /// exclusion is why it takes a kind at all: the executor writes a `runs`
+    /// row for every connector call, and those are not sessions and cost no
+    /// model tokens. Counting them would exhaust the budget on a day the
+    /// daemon merely approved a lot of actions.
+    ///
+    /// `started_at` is stored as RFC 3339 produced by
+    /// `chrono::Utc::now().to_rfc3339()`, so every row carries the same
+    /// `+00:00` offset and the same field widths; string comparison is
+    /// therefore chronological comparison here.
+    pub fn count_since(
+        &self,
+        since: DateTime<Utc>,
+        exclude_kind: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs
+             WHERE started_at >= ?1 AND (?2 IS NULL OR kind <> ?2)",
+            params![since.to_rfc3339(), exclude_kind],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +237,34 @@ mod tests {
         let (_dir, conn) = temp_store();
         let store = RunStore::new(conn);
         assert!(store.finish(999, "ok", None, &[], None).is_err());
+    }
+
+    #[test]
+    fn recent_returns_the_newest_runs_first() {
+        let (_dir, conn) = temp_store();
+        let store = RunStore::new(conn);
+        for i in 0..5 {
+            store.start("session", &format!("run {i}"), &[]).unwrap();
+        }
+        let recent = store.recent(3).unwrap();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].prompt, "run 4");
+        assert_eq!(recent[2].prompt, "run 2");
+    }
+
+    #[test]
+    fn count_since_ignores_the_excluded_kind_and_older_rows() {
+        let (_dir, conn) = temp_store();
+        let store = RunStore::new(conn);
+        store.start("triage.tier1", "a", &[]).unwrap();
+        store.start("execute", "canvas.list_courses", &[]).unwrap();
+        store.start("chat", "b", &[]).unwrap();
+
+        let midnight = Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(store.count_since(midnight, None).unwrap(), 3);
+        assert_eq!(store.count_since(midnight, Some("execute")).unwrap(), 2);
+
+        let tomorrow = Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(store.count_since(tomorrow, None).unwrap(), 0);
     }
 }
