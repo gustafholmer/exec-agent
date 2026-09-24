@@ -51,7 +51,9 @@
 
 use std::path::{Path, PathBuf};
 
-use rust_xlsxwriter::{Color, ExcelDateTime, Format, Workbook, Worksheet, XlsxError};
+use rust_xlsxwriter::{
+    Color, DocProperties, ExcelDateTime, Format, Workbook, Worksheet, XlsxError,
+};
 
 /// `U+00A0`, the thousands separator a Swedish bank export actually writes.
 const NBSP: char = '\u{00A0}';
@@ -81,6 +83,25 @@ fn main() -> Result<(), XlsxError> {
     Ok(())
 }
 
+/// Fixed document properties, so the output is byte-stable.
+///
+/// `rust_xlsxwriter` stamps `docProps/core.xml` with the current time by
+/// default, so regenerating the fixtures rewrote both `.xlsx` binaries with no
+/// content change and dirtied `git status` every time. Pinning the creation
+/// date makes the committed binaries reproducible from the committed
+/// generator, which is the claim §3 of the task report makes about them: run
+/// this and `git status --porcelain` stays empty unless a *cell* changed.
+///
+/// The date is the day the fixtures were first written; it is not meaningful
+/// beyond being a constant.
+fn fixed_properties() -> Result<DocProperties, XlsxError> {
+    Ok(DocProperties::new()
+        .set_creation_datetime(&ExcelDateTime::from_ymd(2026, 9, 23)?)
+        .set_title("ea-fortnox bank-import fixture")
+        .set_author("make_bank_fixture")
+        .set_company(""))
+}
+
 fn header_format() -> Format {
     Format::new()
         .set_bold()
@@ -99,6 +120,7 @@ fn write_headers(sheet: &mut Worksheet, names: &[&str]) -> Result<(), XlsxError>
 
 fn write_sample(path: &Path) -> Result<(), XlsxError> {
     let mut wb = Workbook::new();
+    wb.set_properties(&fixed_properties()?);
     let date_fmt = Format::new().set_num_format("yyyy-mm-dd");
 
     {
@@ -179,6 +201,7 @@ fn write_sample(path: &Path) -> Result<(), XlsxError> {
 /// Both input sheets, headers only. "No transactions" must read as no rows.
 fn write_empty(path: &Path) -> Result<(), XlsxError> {
     let mut wb = Workbook::new();
+    wb.set_properties(&fixed_properties()?);
 
     let s = wb.add_worksheet();
     s.set_name("SEB")?;
