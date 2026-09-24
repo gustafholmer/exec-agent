@@ -54,7 +54,16 @@ Everything is optional; a missing file means defaults.
 ```bash
 mkdir -p ~/.config/exec-agent
 cat > ~/.config/exec-agent/config.toml <<'TOML'
-# Sessions a day, across triage and chat. A ceiling on spend, not a target.
+# Sessions a day, counted from the `runs` table over *your* day (the
+# `[notify] time_zone` below), so a restart does not refund what the day
+# already spent. A ceiling on spend, not a target.
+#
+# What it does when it runs out: triage drops to tier 0 and keeps filtering
+# for free, the briefings are skipped and say so, and `ea chat` answers you
+# anyway with a note — refusing the owner's own typed message is the one
+# failure this budget must not cause. Chat still counts against it, so a
+# chatty day shuts down the background work first. `ea status` shows
+# `sessions_today: 7/60`.
 daily_session_budget = 60
 
 # The model `ea chat` runs on. Set explicitly on purpose: left unset, the CLI
@@ -162,7 +171,7 @@ script, it refuses rather than installing a daemon that cannot think.
 
 | command | what it does |
 |---|---|
-| `ea status` | up? paused? how many proposals are waiting? which jobs have tripped, and why; how many events triage gave up on |
+| `ea status` | up? paused? how many proposals are waiting? which jobs have tripped, and why; how many events triage gave up on; `sessions_today: 7/60` and `digest_pending: 4` |
 | `ea queue` | the proposals waiting for a decision |
 | `ea approve <id>` | approve one and run it |
 | `ea reject <id> [--reason "..."]` | reject one; nothing is called |
@@ -230,11 +239,13 @@ two claims — an in-memory one against a double tap, and a conditional `UPDATE`
 in SQLite that is never released — so an action can reach a connector at most
 once even across a crash.
 
-**The control socket has no method that calls a connector.** Ten methods:
+**The control socket has no method that calls a connector.** Thirteen methods:
 `status`, `queue` and `log` read local state; `pause`, `resume` and
 `resume_job` set flags in the scheduler; `reject` is a status transition;
-`approve` and `propose` go through the executor; `chat` starts a session whose
-only write tool comes back through `propose`. A method
+`approve` and `propose` go through the executor; `remember`, `facts` and
+`forget` read and write the local `facts` table and touch nothing else; `chat`
+starts a session whose only write tools are `propose_action`, which comes back
+through `propose` and the gate, and `remember`. A method
 named something like `connectors.call` was on this socket once and was removed
 for exactly this reason. Do not add it back: anything that can reach the socket
 could then call any tool on any connector with the gate bypassed.
