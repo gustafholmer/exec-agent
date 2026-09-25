@@ -18,6 +18,7 @@ pub mod chat;
 pub mod config;
 pub mod connectors;
 pub mod daemon;
+pub mod database;
 pub mod executor;
 pub mod ipc;
 pub mod jobs;

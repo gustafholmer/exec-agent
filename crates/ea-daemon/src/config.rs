@@ -89,6 +89,8 @@ pub struct DaemonConfig {
     pub connectors_dir: PathBuf,
     /// Present only when the `[telegram]` block was written out in full.
     pub telegram: Option<TelegramSettings>,
+    /// Where the Postgres state database is, and how its credential is read.
+    pub database: crate::database::DatabaseSettings,
 }
 
 /// The `[retention]` block: what the daily prune keeps, and how large the
@@ -180,6 +182,8 @@ struct RawConfig {
     connectors_dir: Option<PathBuf>,
     #[serde(default)]
     telegram: Option<TelegramSettings>,
+    #[serde(default)]
+    database: crate::database::DatabaseSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -294,6 +298,7 @@ impl Default for DaemonConfig {
             retention: RetentionSettings::default(),
             connectors_dir: default_connectors_dir(),
             telegram: None,
+            database: crate::database::DatabaseSettings::default(),
         }
     }
 }
@@ -393,6 +398,7 @@ impl DaemonConfig {
             retention: raw.retention.into_settings(),
             connectors_dir: raw.connectors_dir.unwrap_or_else(default_connectors_dir),
             telegram: raw.telegram,
+            database: raw.database,
         })
     }
 }

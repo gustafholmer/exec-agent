@@ -105,6 +105,13 @@ async fn main() -> anyhow::Result<()> {
         || format!("opening the state database at {}", db_path.display()),
     )?));
 
+    // Both stores are live during the migration: `conn` for modules not yet
+    // converted, `pool` for those that are. Task 12 deletes `conn`.
+    let database_url = config.database.resolve()?;
+    let pool = ea_core::db::connect_with_retry(&database_url, std::time::Duration::from_secs(60))
+        .await
+        .context("the state database is not reachable")?;
+
     let registry = Arc::new(Registry::new(manifests.clone()));
     let executor = Arc::new(Executor::new(
         ActionStore::new(Arc::clone(&conn)),
