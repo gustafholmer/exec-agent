@@ -412,7 +412,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).unwrap_or_default(),
             "daily_session_budget": self.chat.budget().limit(),
             "chat_model": self.chat.model(),
-            "facts": self.chat.facts().all().map(|f| f.len()).unwrap_or_default(),
+            "facts": self.chat.facts().all().await.map(|f| f.len()).unwrap_or_default(),
             "started_at": self.started_at.to_rfc3339(),
         }))
     }
@@ -677,13 +677,17 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// [`ea_core::store::facts`].
     pub async fn remember(&self, params: Value) -> anyhow::Result<Value> {
         let params: RememberParams = parse_params("remember", params)?;
-        let fact = self.chat.facts().remember(&params.topic, &params.body)?;
+        let fact = self
+            .chat
+            .facts()
+            .remember(&params.topic, &params.body)
+            .await?;
         serde_json::to_value(fact).context("remember: serialising the fact")
     }
 
     /// `facts` — everything the assistant has been told to remember.
     pub async fn facts(&self, _params: Value) -> anyhow::Result<Value> {
-        let facts = self.chat.facts().all()?;
+        let facts = self.chat.facts().all().await?;
         serde_json::to_value(facts).context("facts: serialising the facts")
     }
 
@@ -691,7 +695,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// rather than reporting a deletion that did not happen.
     pub async fn forget(&self, params: Value) -> anyhow::Result<Value> {
         let params: IdParams = parse_params("forget", params)?;
-        let existed = self.chat.facts().forget(params.id)?;
+        let existed = self.chat.facts().forget(params.id).await?;
         Ok(json!({ "id": params.id, "forgotten": existed }))
     }
 
@@ -903,7 +907,7 @@ record_voucher = "approve"
             }));
             let pusher = Arc::new(FakePusher::default());
             let conversations = ConversationStore::new(pool.clone());
-            let facts = FactStore::new(Arc::clone(&conn));
+            let facts = FactStore::new(pool.clone());
             let chat = Arc::new(ChatService::new(
                 conversations.clone(),
                 facts.clone(),
@@ -2186,9 +2190,11 @@ record_voucher = "approve"
         let f = Fixture::new(pool);
         f.facts
             .remember("tenta", "the databases tenta is on the 14th")
+            .await
             .unwrap();
         f.facts
             .remember("invoicing", "invoices go to Ekonomi AB")
+            .await
             .unwrap();
 
         f.call("chat", json!({ "message": "when is the tenta?" }))

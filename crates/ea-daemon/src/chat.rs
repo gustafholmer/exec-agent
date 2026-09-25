@@ -280,7 +280,7 @@ impl ChatService {
             return Ok(None);
         };
 
-        let relevant = self.facts.matching(message)?;
+        let relevant = self.facts.matching(message).await?;
         let now = Utc::now().with_timezone(&self.time_zone);
         let mut request = SessionRequest::new(
             CHAT_RUN_KIND,
@@ -445,7 +445,7 @@ mod tests {
             id: 1,
             topic: topic.to_string(),
             body: body.to_string(),
-            created_at: "2026-09-24T09:00:00Z".to_string(),
+            created_at: "2026-09-24T09:00:00Z".parse().unwrap(),
             updated_at: None,
         }
     }
@@ -703,8 +703,8 @@ mod tests {
 
     fn harness(pool: sqlx::PgPool, sessions: Arc<FakeSessions>) -> Harness {
         let (dir, conn) = temp_store();
-        let conversations = ConversationStore::new(pool);
-        let facts = FactStore::new(Arc::clone(&conn));
+        let conversations = ConversationStore::new(pool.clone());
+        let facts = FactStore::new(pool);
         let service = Arc::new(ChatService::new(
             conversations.clone(),
             facts.clone(),
@@ -924,9 +924,11 @@ mod tests {
         let h = harness(pool, FakeSessions::new("ok"));
         h.facts
             .remember("tenta", "the databases tenta is on the 14th")
+            .await
             .unwrap();
         h.facts
             .remember("invoicing", "invoices go to Ekonomi AB")
+            .await
             .unwrap();
 
         h.service
@@ -949,7 +951,7 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_conversation_matching_no_facts_gets_no_facts_block(pool: sqlx::PgPool) {
         let h = harness(pool, FakeSessions::new("ok"));
-        h.facts.remember("tenta", "on the 14th").unwrap();
+        h.facts.remember("tenta", "on the 14th").await.unwrap();
 
         h.service.say(SURFACE_CLI, "hello there").await.unwrap();
 
@@ -972,10 +974,10 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn without_a_session_runner_the_message_is_still_recorded(pool: sqlx::PgPool) {
         let (_dir, conn) = temp_store();
-        let conversations = ConversationStore::new(pool);
+        let conversations = ConversationStore::new(pool.clone());
         let service = ChatService::new(
             conversations.clone(),
-            FactStore::new(Arc::clone(&conn)),
+            FactStore::new(pool),
             None,
             Budget::new(
                 RunStore::new(Arc::clone(&conn)),

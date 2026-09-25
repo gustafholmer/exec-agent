@@ -1513,7 +1513,7 @@ mod end_to_end {
             ea_core::store::conversations::ConversationStore::new(pool.clone());
         let chat = Arc::new(crate::chat::ChatService::new(
             conversations.clone(),
-            ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
+            ea_core::store::facts::FactStore::new(pool.clone()),
             Some(Arc::new(CannedSessions) as Arc<dyn crate::triage::SessionBoundary>),
             crate::budget::Budget::new(
                 RunStore::new(Arc::clone(&conn)),

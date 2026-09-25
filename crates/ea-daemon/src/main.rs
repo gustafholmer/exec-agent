@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let chat = Arc::new(ChatService::new(
         ConversationStore::new(pool.clone()),
-        FactStore::new(Arc::clone(&conn)),
+        FactStore::new(pool.clone()),
         sessions.clone(),
         budget.clone(),
         config.chat_model.clone(),
