@@ -588,7 +588,7 @@ async fn deliver<C: ToolCaller>(
         tracing::warn!(briefing = kind, "no session runner; skipping");
         return Ok(outcome);
     };
-    if !deps.budget.try_consume(Utc::now())? {
+    if !deps.budget.try_consume(Utc::now()).await? {
         outcome.note = Some(format!(
             "{}, so there is no briefing",
             deps.budget.spent_note()
@@ -785,7 +785,6 @@ mod tests {
     use ea_core::store::events::RecordInput;
     use ea_core::store::kv::KvStore;
     use ea_core::store::runs::RunStore;
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::*;
@@ -922,7 +921,6 @@ record_voucher = "approve"
 
     struct Fixture {
         _dir: TempDir,
-        conn: Arc<Mutex<Connection>>,
         pool: sqlx::PgPool,
         events: EventStore,
         log: NotificationLog,
@@ -953,11 +951,10 @@ record_voucher = "approve"
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            budget: Budget::new(RunStore::new(Arc::clone(&conn)), 60, Stockholm),
+            budget: Budget::new(RunStore::new(pool.clone()), 60, Stockholm),
         };
         Fixture {
             _dir: dir,
-            conn,
             pool,
             events,
             log,
@@ -1439,7 +1436,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_spent_budget_skips_the_briefing_without_failing_it(pool: sqlx::PgPool) {
         let mut f = fixture(pool);
-        f.deps.budget = Budget::new(RunStore::new(Arc::clone(&f.conn)), 0, Stockholm);
+        f.deps.budget = Budget::new(RunStore::new(f.pool.clone()), 0, Stockholm);
         // Non-empty material, so the short-line path is not what is being
         // measured here: this is the session that must not start.
         f.log.push_digest("something worth a briefing").await.unwrap();
@@ -1649,7 +1646,7 @@ record_voucher = "approve"
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            budget: Budget::new(RunStore::new(Arc::clone(&f.conn)), 60, Stockholm),
+            budget: Budget::new(RunStore::new(f.pool.clone()), 60, Stockholm),
         };
 
         let outcome = run_vat_prep(&deps, utc("2026-10-01T07:00:00Z"))

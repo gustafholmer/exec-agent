@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(Registry::new(manifests.clone()));
     let executor = Arc::new(Executor::new(
         ActionStore::new(Arc::clone(&conn)),
-        RunStore::new(Arc::clone(&conn)),
+        RunStore::new(pool.clone()),
         policy.clone(),
         Arc::clone(&registry),
     ));
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // approvals and the whole gate still work, and only the thinking stops.
     // Saying so loudly beats refusing to start.
     let sessions: Option<Arc<dyn SessionBoundary>> = match SessionRunner::discover(
-        RunStore::new(Arc::clone(&conn)),
+        RunStore::new(pool.clone()),
         state_dir.join(SESSION_DIR),
         manifests.clone(),
     ) {
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     // not refund the day's spend, and bounded by the owner's midnight rather
     // than UTC's. See `ea_daemon::budget`.
     let budget = Budget::new(
-        RunStore::new(Arc::clone(&conn)),
+        RunStore::new(pool.clone()),
         config.daily_session_budget,
         config.notify.time_zone,
     );
@@ -290,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
         executor,
         actions: ActionStore::new(Arc::clone(&conn)),
         events: EventStore::new(Arc::clone(&conn)),
-        runs: RunStore::new(Arc::clone(&conn)),
+        runs: RunStore::new(pool.clone()),
         scheduler: Arc::clone(&scheduler),
         schedules: schedule_store,
         time_zone: config.notify.time_zone,

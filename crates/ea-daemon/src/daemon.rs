@@ -408,8 +408,8 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // scoring and the briefings have stopped writing, and a digest
             // that keeps climbing past a day means the briefing that drains
             // it is not running.
-            "sessions_today": self.chat.budget().status_line(Utc::now()),
-            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).unwrap_or_default(),
+            "sessions_today": self.chat.budget().status_line(Utc::now()).await,
+            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).await.unwrap_or_default(),
             "daily_session_budget": self.chat.budget().limit(),
             "chat_model": self.chat.model(),
             "facts": self.chat.facts().all().await.map(|f| f.len()).unwrap_or_default(),
@@ -468,7 +468,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             .n
             .unwrap_or(DEFAULT_LOG_LIMIT)
             .clamp(1, MAX_LOG_LIMIT);
-        let runs = self.runs.recent(n)?;
+        let runs = self.runs.recent(n).await?;
         serde_json::to_value(runs).context("log: serialising the runs")
     }
 
@@ -799,13 +799,15 @@ mod tests {
 
     impl SessionBoundary for FakeSessions {
         fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
-            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let async_req = req.clone();
             self.seen.lock().unwrap().push(req);
             let reply = self.reply.clone();
             let session_id = self.session_id.clone();
             let runs = self.runs.clone();
             Box::pin(async move {
-                runs.finish(run_id, "ok", Some(&reply), &[], Some(0.001))?;
+                let run_id = runs.start(&async_req.kind, &async_req.prompt, &[]).await?;
+                runs.finish(run_id, "ok", Some(&reply), &[], Some(0.001))
+                    .await?;
                 Ok(SessionOutcome {
                     text: reply,
                     structured: None,
@@ -888,13 +890,13 @@ record_voucher = "approve"
                 ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
             ));
             let sessions = with_sessions.then(|| {
-                FakeSessions::new("here is your answer", RunStore::new(Arc::clone(&conn)))
+                FakeSessions::new("here is your answer", RunStore::new(pool.clone()))
             });
             let caller = SpyCaller::default();
             let log = Arc::clone(&caller.calls);
             let executor = Arc::new(Executor::new(
                 ActionStore::new(Arc::clone(&conn)),
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool.clone()),
                 policy(),
                 caller,
             ));
@@ -913,7 +915,7 @@ record_voucher = "approve"
                 facts.clone(),
                 sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
                 Budget::new(
-                    RunStore::new(Arc::clone(&conn)),
+                    RunStore::new(pool.clone()),
                     budget,
                     crate::notify::policy::DEFAULT_TIME_ZONE,
                 ),
@@ -925,7 +927,7 @@ record_voucher = "approve"
                 executor,
                 actions: ActionStore::new(Arc::clone(&conn)),
                 events: EventStore::new(Arc::clone(&conn)),
-                runs: RunStore::new(Arc::clone(&conn)),
+                runs: RunStore::new(pool.clone()),
                 scheduler: Arc::clone(&scheduler),
                 schedules: ScheduleStore::new(pool.clone()),
                 time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,

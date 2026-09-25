@@ -1,9 +1,7 @@
-use std::sync::{Arc, Mutex};
-
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, Row};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+use sqlx::{types::Json, FromRow, PgPool};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Run {
@@ -15,37 +13,75 @@ pub struct Run {
     pub action_ids: Vec<i64>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<i64>,
-    pub started_at: String,
-    pub finished_at: Option<String>,
+    // Serialized explicitly as RFC 3339 (rather than left to chrono's default
+    // `Serialize`, which renders a UTC offset as `Z`) so that `ea log` and the
+    // daemon's `log` IPC response keep the exact timestamp format the old
+    // SQLite-backed store produced with `Utc::now().to_rfc3339()`.
+    #[serde(serialize_with = "serialize_rfc3339")]
+    pub started_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_rfc3339_opt")]
+    pub finished_at: Option<DateTime<Utc>>,
 }
+
+fn serialize_rfc3339<S: Serializer>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&dt.to_rfc3339())
+}
+
+fn serialize_rfc3339_opt<S: Serializer>(
+    dt: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match dt {
+        Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// The row shape as it comes back from Postgres. `action_ids` decodes as
+/// `JSONB` here and is unwrapped into the plain `Vec<i64>` [`Run`] holds --
+/// callers should never have to think about the `Json` wrapper.
+#[derive(FromRow)]
+struct RunRow {
+    id: i64,
+    kind: String,
+    prompt: String,
+    outcome: String,
+    detail: Option<String>,
+    action_ids: Json<Vec<i64>>,
+    cost_usd: Option<f64>,
+    duration_ms: Option<i64>,
+    started_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+impl From<RunRow> for Run {
+    fn from(row: RunRow) -> Self {
+        Run {
+            id: row.id,
+            kind: row.kind,
+            prompt: row.prompt,
+            outcome: row.outcome,
+            detail: row.detail,
+            action_ids: row.action_ids.0,
+            cost_usd: row.cost_usd,
+            duration_ms: row.duration_ms,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+        }
+    }
+}
+
+const RUN_COLUMNS: &str =
+    "id, kind, prompt, outcome, detail, action_ids, cost_usd, duration_ms, started_at, finished_at";
 
 #[derive(Clone)]
 pub struct RunStore {
-    conn: Arc<Mutex<Connection>>,
-}
-
-fn hydrate(row: &Row<'_>) -> rusqlite::Result<Run> {
-    let action_ids: Option<String> = row.get("action_ids")?;
-    let action_ids = action_ids
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    Ok(Run {
-        id: row.get("id")?,
-        kind: row.get("kind")?,
-        prompt: row.get("prompt")?,
-        outcome: row.get("outcome")?,
-        detail: row.get("detail")?,
-        action_ids,
-        cost_usd: row.get("cost_usd")?,
-        duration_ms: row.get("duration_ms")?,
-        started_at: row.get("started_at")?,
-        finished_at: row.get("finished_at")?,
-    })
+    pool: PgPool,
 }
 
 impl RunStore {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Starts a run, recording it as `running`. Returns the new run's id, so
@@ -61,30 +97,38 @@ impl RunStore {
     /// instead of a shrug. Pass `&[]` for runs that are not about a specific
     /// action (a scheduled agent session, say); `finish` overwrites the column
     /// with whatever the run actually touched.
-    pub fn start(&self, kind: &str, prompt: &str, action_ids: &[i64]) -> anyhow::Result<i64> {
-        let action_ids_json = serde_json::to_string(action_ids)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO runs (kind, prompt, outcome, action_ids, started_at)
-             VALUES (?1,?2,'running',?3,?4)",
-            params![kind, prompt, action_ids_json, Utc::now().to_rfc3339()],
-        )?;
-        Ok(conn.last_insert_rowid())
+    pub async fn start(&self, kind: &str, prompt: &str, action_ids: &[i64]) -> anyhow::Result<i64> {
+        sqlx::query_scalar(
+            "INSERT INTO runs (kind, prompt, outcome, action_ids)
+             VALUES ($1, $2, 'running', $3) RETURNING id",
+        )
+        .bind(kind)
+        .bind(prompt)
+        .bind(Json(action_ids))
+        .fetch_one(&self.pool)
+        .await
+        .context("starting a run")
     }
 
-    pub fn get(&self, id: i64) -> anyhow::Result<Option<Run>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM runs WHERE id = ?1")?;
-        let mut rows = stmt.query_map(params![id], hydrate)?;
-        Ok(match rows.next() {
-            Some(row) => Some(row?),
-            None => None,
-        })
+    pub async fn get(&self, id: i64) -> anyhow::Result<Option<Run>> {
+        let row = sqlx::query_as::<_, RunRow>(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("reading a run")?;
+        Ok(row.map(Run::from))
     }
 
     /// Closes out a run: records the outcome, freeform detail, the action ids
     /// it touched, its cost, and a `duration_ms` computed from `started_at`.
-    pub fn finish(
+    ///
+    /// One statement: the update and the duration computation both happen in
+    /// Postgres (`now() - started_at`, clamped at zero) and the closed row
+    /// comes back via `RETURNING`, rather than reading `started_at` back into
+    /// Rust and writing a second statement.
+    pub async fn finish(
         &self,
         id: i64,
         outcome: &str,
@@ -92,47 +136,35 @@ impl RunStore {
         action_ids: &[i64],
         cost_usd: Option<f64>,
     ) -> anyhow::Result<Run> {
-        let started_at: String = {
-            let conn = self.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT started_at FROM runs WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow!("run {id} does not exist"))?
-        };
-        let started: DateTime<Utc> = started_at
-            .parse()
-            .map_err(|e| anyhow!("run {id} has an unparseable started_at: {e}"))?;
-        let now = Utc::now();
-        let duration_ms = (now - started).num_milliseconds().max(0);
-        let action_ids_json = serde_json::to_string(action_ids)?;
-
-        {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE runs SET outcome = ?1, detail = ?2, action_ids = ?3, cost_usd = ?4,
-                 duration_ms = ?5, finished_at = ?6 WHERE id = ?7",
-                params![
-                    outcome,
-                    detail,
-                    action_ids_json,
-                    cost_usd,
-                    duration_ms,
-                    now.to_rfc3339(),
-                    id,
-                ],
-            )?;
-        }
-        self.get(id)?.ok_or_else(|| anyhow!("run {id} vanished"))
+        let row = sqlx::query_as::<_, RunRow>(&format!(
+            "UPDATE runs SET outcome = $2, detail = $3, action_ids = $4, cost_usd = $5,
+                    duration_ms = GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::bigint,
+                    finished_at = now()
+             WHERE id = $1
+             RETURNING {RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(outcome)
+        .bind(detail)
+        .bind(Json(action_ids))
+        .bind(cost_usd)
+        .fetch_optional(&self.pool)
+        .await
+        .context("finishing a run")?;
+        row.map(Run::from)
+            .ok_or_else(|| anyhow!("run {id} does not exist"))
     }
 
     /// The `limit` most recent runs, newest first. What `ea log` shows.
-    pub fn recent(&self, limit: i64) -> anyhow::Result<Vec<Run>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM runs ORDER BY id DESC LIMIT ?1")?;
-        let rows = stmt.query_map(params![limit.max(0)], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    pub async fn recent(&self, limit: i64) -> anyhow::Result<Vec<Run>> {
+        let rows = sqlx::query_as::<_, RunRow>(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs ORDER BY id DESC LIMIT $1"
+        ))
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .context("listing recent runs")?;
+        Ok(rows.into_iter().map(Run::from).collect())
     }
 
     /// How many runs started at or after `since`, optionally ignoring one
@@ -143,38 +175,32 @@ impl RunStore {
     /// row for every connector call, and those are not sessions and cost no
     /// model tokens. Counting them would exhaust the budget on a day the
     /// daemon merely approved a lot of actions.
-    ///
-    /// `started_at` is stored as RFC 3339 produced by
-    /// `chrono::Utc::now().to_rfc3339()`, so every row carries the same
-    /// `+00:00` offset and the same field widths; string comparison is
-    /// therefore chronological comparison here.
-    pub fn count_since(
+    pub async fn count_since(
         &self,
         since: DateTime<Utc>,
         exclude_kind: Option<&str>,
     ) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
+        sqlx::query_scalar(
             "SELECT COUNT(*) FROM runs
-             WHERE started_at >= ?1 AND (?2 IS NULL OR kind <> ?2)",
-            params![since.to_rfc3339(), exclude_kind],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+             WHERE started_at >= $1 AND ($2::text IS NULL OR kind <> $2)",
+        )
+        .bind(since)
+        .bind(exclude_kind)
+        .fetch_one(&self.pool)
+        .await
+        .context("counting runs")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::test_support::temp_store;
 
-    #[test]
-    fn start_records_a_running_run() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas", &[]).unwrap();
-        let run = store.get(id).unwrap().unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn start_records_a_running_run(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        let id = store.start("scheduled", "check canvas", &[]).await.unwrap();
+        let run = store.get(id).await.unwrap().unwrap();
         assert_eq!(run.kind, "scheduled");
         assert_eq!(run.prompt, "check canvas");
         assert_eq!(run.outcome, "running");
@@ -183,16 +209,16 @@ mod tests {
         assert!(run.action_ids.is_empty());
     }
 
-    #[test]
-    fn start_records_the_action_ids_before_finish_runs() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn start_records_the_action_ids_before_finish_runs(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
         let id = store
             .start("execute", "fortnox.record_voucher", &[7])
+            .await
             .unwrap();
 
         // Nothing has finished; this is the state a crash mid-call leaves.
-        let run = store.get(id).unwrap().unwrap();
+        let run = store.get(id).await.unwrap().unwrap();
         assert_eq!(run.outcome, "running");
         assert!(run.finished_at.is_none());
         assert_eq!(
@@ -202,11 +228,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finish_records_outcome_detail_actions_and_cost() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas", &[]).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn finish_records_outcome_detail_actions_and_cost(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        let id = store.start("scheduled", "check canvas", &[]).await.unwrap();
         let run = store
             .finish(
                 id,
@@ -215,6 +240,7 @@ mod tests {
                 &[1, 2],
                 Some(0.014),
             )
+            .await
             .unwrap();
         assert_eq!(run.outcome, "ok");
         assert_eq!(run.detail.as_deref(), Some("found 2 new assignments"));
@@ -223,48 +249,80 @@ mod tests {
         assert!(run.finished_at.is_some());
     }
 
-    #[test]
-    fn finish_computes_a_nonnegative_duration() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
-        let id = store.start("scheduled", "check canvas", &[]).unwrap();
-        let run = store.finish(id, "ok", None, &[], None).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn finish_computes_a_nonnegative_duration(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        let id = store.start("scheduled", "check canvas", &[]).await.unwrap();
+        let run = store.finish(id, "ok", None, &[], None).await.unwrap();
         assert!(run.duration_ms.unwrap() >= 0);
     }
 
-    #[test]
-    fn finishing_an_unknown_run_fails() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
-        assert!(store.finish(999, "ok", None, &[], None).is_err());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn finishing_an_unknown_run_fails(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        assert!(store.finish(999, "ok", None, &[], None).await.is_err());
     }
 
-    #[test]
-    fn recent_returns_the_newest_runs_first() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn recent_returns_the_newest_runs_first(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
         for i in 0..5 {
-            store.start("session", &format!("run {i}"), &[]).unwrap();
+            store
+                .start("session", &format!("run {i}"), &[])
+                .await
+                .unwrap();
         }
-        let recent = store.recent(3).unwrap();
+        let recent = store.recent(3).await.unwrap();
         assert_eq!(recent.len(), 3);
         assert_eq!(recent[0].prompt, "run 4");
         assert_eq!(recent[2].prompt, "run 2");
     }
 
-    #[test]
-    fn count_since_ignores_the_excluded_kind_and_older_rows() {
-        let (_dir, conn) = temp_store();
-        let store = RunStore::new(conn);
-        store.start("triage.tier1", "a", &[]).unwrap();
-        store.start("execute", "canvas.list_courses", &[]).unwrap();
-        store.start("chat", "b", &[]).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn count_since_ignores_the_excluded_kind_and_older_rows(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        store.start("triage.tier1", "a", &[]).await.unwrap();
+        store.start("execute", "canvas.list_courses", &[]).await.unwrap();
+        store.start("chat", "b", &[]).await.unwrap();
 
         let midnight = Utc::now() - chrono::Duration::hours(1);
-        assert_eq!(store.count_since(midnight, None).unwrap(), 3);
-        assert_eq!(store.count_since(midnight, Some("execute")).unwrap(), 2);
+        assert_eq!(store.count_since(midnight, None).await.unwrap(), 3);
+        assert_eq!(
+            store.count_since(midnight, Some("execute")).await.unwrap(),
+            2
+        );
 
         let tomorrow = Utc::now() + chrono::Duration::hours(1);
-        assert_eq!(store.count_since(tomorrow, None).unwrap(), 0);
+        assert_eq!(store.count_since(tomorrow, None).await.unwrap(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn action_ids_round_trip_through_jsonb(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        let id = store.start("triage", "prompt", &[7, 9]).await.unwrap();
+        let run = store.get(id).await.unwrap().unwrap();
+        assert_eq!(run.action_ids, vec![7, 9]);
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_run_with_no_actions_reads_back_as_an_empty_list(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool);
+        let id = store.start("triage", "prompt", &[]).await.unwrap();
+        assert!(store.get(id).await.unwrap().unwrap().action_ids.is_empty());
+    }
+
+    /// `count_since` is what `daily_session_budget` is enforced from, counted
+    /// over the owner's own day. A run started exactly at the boundary counts.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn count_since_includes_a_run_at_the_boundary(pool: sqlx::PgPool) {
+        let store = RunStore::new(pool.clone());
+        let id = store.start("triage", "p", &[]).await.unwrap();
+        let started: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT started_at FROM runs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(store.count_since(started, None).await.unwrap() >= 1);
     }
 }

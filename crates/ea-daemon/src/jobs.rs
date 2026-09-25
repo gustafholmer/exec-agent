@@ -305,7 +305,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
         return Ok(summary);
     };
 
-    if !deps.budget.try_consume(now)? {
+    if !deps.budget.try_consume(now).await? {
         // Degraded, not stopped. Tier 0 has already run above: the mute list
         // and the keyword rescue cost nothing and keep working. What stops is
         // the Haiku scoring pass, so events stay unranked rather than unseen.
@@ -604,12 +604,13 @@ mod tests {
 
     impl SessionBoundary for FakeTier1 {
         fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
-            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let async_req = req.clone();
             self.seen.lock().unwrap().push(req);
             let structured = serde_json::json!({ "scores": self.scores });
             let runs = self.runs.clone();
             Box::pin(async move {
-                runs.finish(run_id, "ok", None, &[], Some(0.002))?;
+                let run_id = runs.start(&async_req.kind, &async_req.prompt, &[]).await?;
+                runs.finish(run_id, "ok", None, &[], Some(0.002)).await?;
                 Ok(SessionOutcome {
                     text: String::new(),
                     structured: Some(structured),
@@ -830,7 +831,7 @@ mod tests {
         let conn = db(&dir);
         let events = EventStore::new(Arc::clone(&conn));
         let actions = ActionStore::new(Arc::clone(&conn));
-        let runs = RunStore::new(Arc::clone(&conn));
+        let runs = RunStore::new(pool.clone());
         let log = NotificationLog::new(KvStore::new(pool.clone()));
         let pusher = Arc::new(SpyPusher {
             sent: Mutex::new(Vec::new()),
@@ -1114,7 +1115,7 @@ mod tests {
 
     impl SessionBoundary for ScoringTier1 {
         fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
-            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let async_req = req.clone();
             let scores: Vec<Salience> = req
                 .prompt
                 .lines()
@@ -1126,7 +1127,8 @@ mod tests {
             let structured = serde_json::json!({ "scores": scores });
             let runs = self.runs.clone();
             Box::pin(async move {
-                runs.finish(run_id, "ok", None, &[], Some(0.002))?;
+                let run_id = runs.start(&async_req.kind, &async_req.prompt, &[]).await?;
+                runs.finish(run_id, "ok", None, &[], Some(0.002)).await?;
                 Ok(SessionOutcome {
                     text: String::new(),
                     structured: Some(structured),
@@ -1150,7 +1152,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let events = EventStore::new(Arc::clone(&conn));
-        let runs = RunStore::new(Arc::clone(&conn));
+        let runs = RunStore::new(pool.clone());
         let sessions = ScoringTier1::new(runs.clone());
         let pusher = Arc::new(SpyPusher {
             sent: Mutex::new(Vec::new()),
@@ -1252,7 +1254,6 @@ mod tests {
 
     impl SessionBoundary for PartialTier1 {
         fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
-            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
             let submitted = Self::ids_in(&req.prompt);
             self.batches.lock().unwrap().push(submitted.clone());
             let answered: Vec<Salience> = match &self.scores_ids {
@@ -1266,7 +1267,8 @@ mod tests {
             let structured = serde_json::json!({ "scores": answered });
             let runs = self.runs.clone();
             Box::pin(async move {
-                runs.finish(run_id, "ok", None, &[], Some(0.002))?;
+                let run_id = runs.start(&req.kind, &req.prompt, &[]).await?;
+                runs.finish(run_id, "ok", None, &[], Some(0.002)).await?;
                 Ok(SessionOutcome {
                     text: String::new(),
                     structured: Some(structured),

@@ -254,11 +254,14 @@ impl<C: ToolCaller> Executor<C> {
             );
         }
 
-        let run_id = self.runs.start(
-            RUN_KIND,
-            &format!("{}.{}", action.connector, action.tool),
-            &[id],
-        )?;
+        let run_id = self
+            .runs
+            .start(
+                RUN_KIND,
+                &format!("{}.{}", action.connector, action.tool),
+                &[id],
+            )
+            .await?;
 
         // The last thing before the side effect, and the only thing between
         // this line and the connector call.
@@ -268,7 +271,8 @@ impl<C: ToolCaller> Executor<C> {
                  (approved with a non-null executed_at); refusing to call the connector again"
             );
             self.runs
-                .finish(run_id, "error", Some(&detail), &[id], None)?;
+                .finish(run_id, "error", Some(&detail), &[id], None)
+                .await?;
             bail!(detail);
         }
 
@@ -293,7 +297,8 @@ impl<C: ToolCaller> Executor<C> {
         // action still leaves a closed run row behind rather than a `running`
         // one that never resolves.
         self.runs
-            .finish(run_id, outcome, Some(&detail), &[id], None)?;
+            .finish(run_id, outcome, Some(&detail), &[id], None)
+            .await?;
         updated
     }
 
@@ -355,11 +360,14 @@ mod tests {
         /// Held across the await so two concurrent executions genuinely
         /// overlap in the concurrency test.
         delay: Duration,
-        /// The database, for the two tests that need to look at it — or break
-        /// it — from *inside* the connector call. That instant is the one the
-        /// findings are about: the side effect has landed and nothing has been
+        /// The sqlite actions store, for the test that needs to break it --
+        /// from *inside* the connector call. That instant is the one the
+        /// finding is about: the side effect has landed and nothing has been
         /// recorded yet.
         db: Option<Arc<Mutex<Connection>>>,
+        /// The Postgres pool backing `runs`, for the test that needs to see
+        /// the `running` row mid-call.
+        runs_pool: Option<sqlx::PgPool>,
         /// `runs` rows as they looked mid-call: (outcome, action_ids).
         runs_mid_call: Mutex<Vec<(String, Vec<i64>)>>,
         /// Flip the connection read-only just before returning, so every store
@@ -382,6 +390,7 @@ mod tests {
                 behaviour,
                 delay: Duration::ZERO,
                 db: None,
+                runs_pool: None,
                 runs_mid_call: Mutex::new(Vec::new()),
                 poison_db: false,
             }
@@ -393,13 +402,13 @@ mod tests {
         }
 
         /// Snapshot the `runs` table while the call is in flight.
-        fn watching_db(mut self, conn: Arc<Mutex<Connection>>) -> Self {
-            self.db = Some(conn);
+        fn watching_db(mut self, pool: sqlx::PgPool) -> Self {
+            self.runs_pool = Some(pool);
             self
         }
 
-        /// Snapshot the `runs` table, then make the database read-only, so the
-        /// store writes that follow a *successful* call all fail.
+        /// Make the actions store read-only, so the store writes that follow
+        /// a *successful* call all fail.
         fn poisoning_db(mut self, conn: Arc<Mutex<Connection>>) -> Self {
             self.db = Some(conn);
             self.poison_db = true;
@@ -422,27 +431,24 @@ mod tests {
                 .unwrap()
                 .push((connector.to_string(), tool.to_string(), args));
 
-            if let Some(db) = &self.db {
-                let conn = db.lock().unwrap();
-                let mut stmt = conn
-                    .prepare("SELECT outcome, action_ids FROM runs ORDER BY id")
-                    .unwrap();
-                let rows: Vec<(String, Vec<i64>)> = stmt
-                    .query_map([], |row| {
-                        let ids: Option<String> = row.get(1)?;
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            ids.and_then(|s| serde_json::from_str(&s).ok())
-                                .unwrap_or_default(),
-                        ))
-                    })
-                    .unwrap()
-                    .map(Result::unwrap)
+            if let Some(pool) = &self.runs_pool {
+                let rows: Vec<(String, sqlx::types::Json<Vec<i64>>)> =
+                    sqlx::query_as("SELECT outcome, action_ids FROM runs ORDER BY id")
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                *self.runs_mid_call.lock().unwrap() = rows
+                    .into_iter()
+                    .map(|(outcome, ids)| (outcome, ids.0))
                     .collect();
-                drop(stmt);
-                *self.runs_mid_call.lock().unwrap() = rows;
-                if self.poison_db {
-                    conn.pragma_update(None, "query_only", true).unwrap();
+            }
+
+            if self.poison_db {
+                if let Some(db) = &self.db {
+                    db.lock()
+                        .unwrap()
+                        .pragma_update(None, "query_only", true)
+                        .unwrap();
                 }
             }
 
@@ -491,43 +497,37 @@ record_voucher = "approve"
         _dir: TempDir,
         actions: ActionStore,
         conn: Arc<Mutex<Connection>>,
+        pool: sqlx::PgPool,
     }
 
-    fn harness() -> (Harness, ActionStore, RunStore) {
+    fn harness(pool: sqlx::PgPool) -> (Harness, ActionStore, RunStore) {
         let (dir, conn) = temp_store();
         let h = Harness {
             _dir: dir,
             actions: ActionStore::new(conn.clone()),
             conn: conn.clone(),
+            pool: pool.clone(),
         };
-        (h, ActionStore::new(conn.clone()), RunStore::new(conn))
+        (h, ActionStore::new(conn), RunStore::new(pool))
     }
 
     impl Harness {
         /// Every `runs` row, newest last, as (kind, outcome, action_ids).
-        fn runs_rows(&self) -> Vec<(String, String, Vec<i64>)> {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT kind, outcome, action_ids FROM runs ORDER BY id")
-                .unwrap();
-            let rows = stmt
-                .query_map([], |row| {
-                    let ids: Option<String> = row.get(2)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        ids.and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                    ))
-                })
-                .unwrap();
-            rows.map(Result::unwrap).collect()
+        async fn runs_rows(&self) -> Vec<(String, String, Vec<i64>)> {
+            let rows: Vec<(String, String, sqlx::types::Json<Vec<i64>>)> =
+                sqlx::query_as("SELECT kind, outcome, action_ids FROM runs ORDER BY id")
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap();
+            rows.into_iter()
+                .map(|(kind, outcome, ids)| (kind, outcome, ids.0))
+                .collect()
         }
     }
 
-    #[tokio::test]
-    async fn an_auto_tool_executes_and_calls_the_connector_once() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_auto_tool_executes_and_calls_the_connector_once(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (action, executed) = ex.submit(input("canvas", "list_courses")).await.unwrap();
@@ -547,9 +547,9 @@ record_voucher = "approve"
         assert_eq!(calls[0].2["term"], "HT26");
     }
 
-    #[tokio::test]
-    async fn an_approve_tool_stays_proposed_and_never_reaches_the_connector() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_approve_tool_stays_proposed_and_never_reaches_the_connector(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (action, executed) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
@@ -562,14 +562,14 @@ record_voucher = "approve"
         );
         assert_eq!(h.actions.pending().unwrap().len(), 1);
         assert!(
-            h.runs_rows().is_empty(),
+            h.runs_rows().await.is_empty(),
             "nothing ran, so nothing to record"
         );
     }
 
-    #[tokio::test]
-    async fn a_deny_tool_is_rejected_with_the_policy_reason_and_never_called() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_deny_tool_is_rejected_with_the_policy_reason_and_never_called(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (action, executed) = ex
@@ -589,12 +589,12 @@ record_voucher = "approve"
             ex.caller().calls().is_empty(),
             "a denied action must never reach the connector"
         );
-        assert!(h.runs_rows().is_empty());
+        assert!(h.runs_rows().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn an_unlisted_tool_queues_rather_than_auto_running() {
-        let (_h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_unlisted_tool_queues_rather_than_auto_running(pool: sqlx::PgPool) {
+        let (_h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (action, executed) = ex.submit(input("canvas", "invented_tool")).await.unwrap();
@@ -611,9 +611,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn a_connector_error_fails_the_action_without_erroring_out() {
-        let (_h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_connector_error_fails_the_action_without_erroring_out(pool: sqlx::PgPool) {
+        let (_h, actions, runs) = harness(pool);
         let ex = Executor::new(
             actions,
             runs,
@@ -637,9 +637,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn a_connector_timeout_fails_the_action_with_the_message_preserved() {
-        let (_h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_connector_timeout_fails_the_action_with_the_message_preserved(pool: sqlx::PgPool) {
+        let (_h, actions, runs) = harness(pool);
         let ex = Executor::new(
             actions,
             runs,
@@ -658,37 +658,37 @@ record_voucher = "approve"
         assert!(reason.contains("30000ms"), "{reason}");
     }
 
-    #[tokio::test]
-    async fn a_successful_execution_writes_a_run_row() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_successful_execution_writes_a_run_row(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (action, _) = ex.submit(input("canvas", "list_courses")).await.unwrap();
 
-        let rows = h.runs_rows();
+        let rows = h.runs_rows().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "execute");
         assert_eq!(rows[0].1, "ok");
         assert_eq!(rows[0].2, vec![action.id]);
     }
 
-    #[tokio::test]
-    async fn a_failed_execution_also_writes_a_run_row() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_execution_also_writes_a_run_row(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::failing("boom"));
 
         let (action, _) = ex.submit(input("canvas", "list_courses")).await.unwrap();
 
-        let rows = h.runs_rows();
+        let rows = h.runs_rows().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "execute");
         assert_eq!(rows[0].1, "error");
         assert_eq!(rows[0].2, vec![action.id]);
     }
 
-    #[tokio::test]
-    async fn execute_approved_runs_a_queued_action_once_a_human_approves() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn execute_approved_runs_a_queued_action_once_a_human_approves(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (queued, executed) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
@@ -704,9 +704,9 @@ record_voucher = "approve"
         assert_eq!(ex.caller().calls().len(), 1);
     }
 
-    #[tokio::test]
-    async fn execute_approved_refuses_an_action_no_human_approved() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn execute_approved_refuses_an_action_no_human_approved(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
@@ -727,9 +727,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn execute_approved_refuses_an_action_the_policy_already_rejected() {
-        let (_h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn execute_approved_refuses_an_action_the_policy_already_rejected(pool: sqlx::PgPool) {
+        let (_h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (denied, _) = ex
@@ -740,9 +740,9 @@ record_voucher = "approve"
         assert!(ex.caller().calls().is_empty());
     }
 
-    #[tokio::test]
-    async fn execute_approved_refuses_an_action_whose_durable_claim_is_taken() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn execute_approved_refuses_an_action_whose_durable_claim_is_taken(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
@@ -768,7 +768,7 @@ record_voucher = "approve"
             "and the refusal must not rewrite the half-state"
         );
 
-        let rows = h.runs_rows();
+        let rows = h.runs_rows().await;
         assert_eq!(rows.len(), 1, "the refusal is itself worth recording");
         assert_eq!(rows[0].1, "error");
         assert_eq!(rows[0].2, vec![queued.id]);
@@ -778,9 +778,9 @@ record_voucher = "approve"
     /// action is left `approved` — the status it had before — and the old code
     /// released its only claim on the way out, so the next retry posted the
     /// voucher again.
-    #[tokio::test]
-    async fn a_store_fault_after_a_successful_call_does_not_make_the_action_claimable_again() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_store_fault_after_a_successful_call_does_not_make_the_action_claimable_again(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(
             actions,
             runs,
@@ -842,9 +842,9 @@ record_voucher = "approve"
     /// Finding 2. A later caller wraps the execution in a timeout. The `run`
     /// future is dropped mid-call, which releases the in-memory claim while the
     /// connector call may already have landed.
-    #[tokio::test]
-    async fn a_dropped_execution_stays_claimed_and_cannot_be_retried() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_dropped_execution_stays_claimed_and_cannot_be_retried(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(
             actions,
             runs,
@@ -897,14 +897,14 @@ record_voucher = "approve"
     /// Finding 3. A crash mid-call leaves only the `running` row behind. If it
     /// does not name the action, nothing can tie `"fortnox.record_voucher"`
     /// back to the money it was spending.
-    #[tokio::test]
-    async fn a_run_row_carries_the_action_id_before_finish_runs() {
-        let (h, actions, runs) = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_run_row_carries_the_action_id_before_finish_runs(pool: sqlx::PgPool) {
+        let (h, actions, runs) = harness(pool);
         let ex = Executor::new(
             actions,
             runs,
             policy(),
-            FakeCaller::ok().watching_db(h.conn.clone()),
+            FakeCaller::ok().watching_db(h.pool.clone()),
         );
 
         let (action, _) = ex.submit(input("canvas", "list_courses")).await.unwrap();
@@ -920,9 +920,24 @@ record_voucher = "approve"
     }
 
     /// A double-tapped Telegram button. Two taps, one voucher.
+    ///
+    /// `#[sqlx::test]` does not support a non-default runtime flavor, and
+    /// this test genuinely needs `multi_thread` for the race it exercises, so
+    /// it connects to `DATABASE_URL` directly instead (same pattern as
+    /// `database.rs`'s dead-server test). That connection is the real,
+    /// shared `exec_agent_test` database rather than an isolated per-test
+    /// one, and the sqlite-backed action id this test submits is always `1`,
+    /// so the final assertion also bounds `started_at` to this test's own
+    /// run rather than trusting the action id alone to tell it apart from
+    /// rows an earlier run of this same test left behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_concurrent_executions_make_exactly_one_connector_call() {
-        let (h, actions, runs) = harness();
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = ea_core::db::connect(&url).await.expect("a live database");
+        let before = chrono::Utc::now();
+        let (h, actions, runs) = harness(pool);
         let ex = Arc::new(Executor::new(
             actions,
             runs,
@@ -958,8 +973,16 @@ record_voucher = "approve"
             h.actions.get(queued.id).unwrap().unwrap().status,
             ActionStatus::Executed
         );
-        let rows = h.runs_rows();
-        assert_eq!(rows.len(), 1, "one execution, one run row");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+             WHERE action_ids @> $1::jsonb AND started_at >= $2",
+        )
+        .bind(sqlx::types::Json(&[queued.id]))
+        .bind(before)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "one execution, one run row");
     }
 
     // -- the deadline seam --------------------------------------------------

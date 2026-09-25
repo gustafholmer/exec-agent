@@ -240,7 +240,7 @@ impl ChatService {
         let outcome = self.reply_to(conversation_id, surface, &message).await;
 
         let (reply, note) = match outcome {
-            Ok(Some(reply)) => (Some(reply), self.over_budget_note()),
+            Ok(Some(reply)) => (Some(reply), self.over_budget_note().await),
             Ok(None) => (None, Some(self.why_no_reply())),
             // Not swallowed into a note: the caller asked a question and did
             // not get an answer, and a turn that failed must not leave an
@@ -332,8 +332,8 @@ impl ChatService {
     /// Read *after* the turn, so the session this turn just spent is included
     /// in the count: the note on the turn that crosses the line says so on
     /// that turn, not on the next one.
-    fn over_budget_note(&self) -> Option<String> {
-        match self.budget.is_spent(Utc::now()) {
+    async fn over_budget_note(&self) -> Option<String> {
+        match self.budget.is_spent(Utc::now()).await {
             Ok(false) => None,
             Ok(true) => Some(format!(
                 "answered anyway, but {} — background triage and the briefings \
@@ -428,17 +428,6 @@ mod tests {
     use super::*;
     use crate::session::SessionOutcome;
     use crate::triage::BoxedSession;
-
-    /// A database in a temp dir. `ea_core`'s own `test_support` is
-    /// crate-private, so this crate keeps its own two lines of it.
-    fn temp_store() -> (
-        tempfile::TempDir,
-        Arc<std::sync::Mutex<rusqlite::Connection>>,
-    ) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(std::sync::Mutex::new(conn)))
-    }
 
     fn a_fact(topic: &str, body: &str) -> Fact {
         Fact {
@@ -702,15 +691,17 @@ mod tests {
     }
 
     fn harness(pool: sqlx::PgPool, sessions: Arc<FakeSessions>) -> Harness {
-        let (dir, conn) = temp_store();
+        // `_dir` is a plain scratch directory now that every store `harness`
+        // builds is on Postgres; kept only because `Harness` still holds one.
+        let dir = tempfile::TempDir::new().unwrap();
         let conversations = ConversationStore::new(pool.clone());
-        let facts = FactStore::new(pool);
+        let facts = FactStore::new(pool.clone());
         let service = Arc::new(ChatService::new(
             conversations.clone(),
             facts.clone(),
             Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             Budget::new(
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool),
                 60,
                 chrono_tz::Europe::Stockholm,
             ),
@@ -973,14 +964,13 @@ mod tests {
 
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn without_a_session_runner_the_message_is_still_recorded(pool: sqlx::PgPool) {
-        let (_dir, conn) = temp_store();
         let conversations = ConversationStore::new(pool.clone());
         let service = ChatService::new(
             conversations.clone(),
-            FactStore::new(pool),
+            FactStore::new(pool.clone()),
             None,
             Budget::new(
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool),
                 60,
                 chrono_tz::Europe::Stockholm,
             ),

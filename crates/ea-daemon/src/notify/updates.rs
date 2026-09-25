@@ -1505,7 +1505,7 @@ mod end_to_end {
         let calls = Arc::clone(&caller.calls);
         let executor = Arc::new(Executor::new(
             ActionStore::new(Arc::clone(&conn)),
-            RunStore::new(Arc::clone(&conn)),
+            RunStore::new(pool.clone()),
             Policy::parse("[fortnox]\nrecord_voucher = \"approve\"\n").unwrap(),
             caller,
         ));
@@ -1516,7 +1516,7 @@ mod end_to_end {
             ea_core::store::facts::FactStore::new(pool.clone()),
             Some(Arc::new(CannedSessions) as Arc<dyn crate::triage::SessionBoundary>),
             crate::budget::Budget::new(
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool.clone()),
                 60,
                 crate::notify::policy::DEFAULT_TIME_ZONE,
             ),

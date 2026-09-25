@@ -635,7 +635,7 @@ impl SessionRunner {
         let mcp = McpConfig::for_session(&self.propose, &self.connectors, &req.connectors)?;
         let argv = build_argv(&req, &mcp);
 
-        let run_id = self.runs.start(&req.kind, &req.prompt, &[])?;
+        let run_id = self.runs.start(&req.kind, &req.prompt, &[]).await?;
         let result = self
             .spawn(&argv)
             .await
@@ -643,13 +643,15 @@ impl SessionRunner {
 
         match result {
             Ok(outcome) => {
-                self.runs.finish(
-                    run_id,
-                    "ok",
-                    Some(&truncate_detail(&outcome.text)),
-                    &[],
-                    outcome.cost_usd,
-                )?;
+                self.runs
+                    .finish(
+                        run_id,
+                        "ok",
+                        Some(&truncate_detail(&outcome.text)),
+                        &[],
+                        outcome.cost_usd,
+                    )
+                    .await?;
                 Ok(outcome)
             }
             Err(err) => {
@@ -657,7 +659,8 @@ impl SessionRunner {
                 // Recorded before the error is returned: a caller that drops
                 // the error still leaves a closed row behind.
                 self.runs
-                    .finish(run_id, "error", Some(&detail), &[], None)?;
+                    .finish(run_id, "error", Some(&detail), &[], None)
+                    .await?;
                 Err(err)
             }
         }
@@ -768,12 +771,12 @@ mod tests {
 
     use crate::executor::{Executor, ToolCaller};
 
-    fn temp_store() -> (TempDir, RunStore) {
+    /// `dir` is a plain scratch directory for the fake `claude` script and
+    /// session cwd; `runs` no longer needs a file of its own now that it is
+    /// on Postgres, but every caller still wants a directory to write into.
+    fn temp_store(pool: sqlx::PgPool) -> (TempDir, RunStore) {
         let dir = TempDir::new().unwrap();
-        let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        (dir, RunStore::new(conn))
+        (dir, RunStore::new(pool))
     }
 
     fn manifest(name: &str) -> ConnectorManifest {
@@ -1339,9 +1342,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn a_successful_session_records_a_run_row_with_its_cost() {
-        let (dir, store) = temp_store();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_successful_session_records_a_run_row_with_its_cost(pool: sqlx::PgPool) {
+        let (dir, store) = temp_store(pool);
         let body = success_json();
         let claude = fake_claude(
             dir.path(),
@@ -1353,16 +1356,16 @@ mod tests {
         let outcome = runner.run(request()).await.unwrap();
         assert_eq!(outcome.text, "ok");
 
-        let run = runner.runs.get(1).unwrap().unwrap();
+        let run = runner.runs.get(1).await.unwrap().unwrap();
         assert_eq!(run.kind, "triage");
         assert_eq!(run.outcome, "ok");
         assert_eq!(run.cost_usd, Some(0.0092345));
         assert_eq!(run.detail.as_deref(), Some("ok"));
     }
 
-    #[tokio::test]
-    async fn unparseable_output_records_a_failed_run() {
-        let (dir, store) = temp_store();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn unparseable_output_records_a_failed_run(pool: sqlx::PgPool) {
+        let (dir, store) = temp_store(pool);
         let claude = fake_claude(
             dir.path(),
             "claude-banner",
@@ -1373,15 +1376,15 @@ mod tests {
         let err = runner.run(request()).await.unwrap_err();
         assert!(err.to_string().contains("not JSON"), "{err}");
 
-        let run = runner.runs.get(1).unwrap().unwrap();
+        let run = runner.runs.get(1).await.unwrap().unwrap();
         assert_eq!(run.outcome, "error");
         assert_eq!(run.cost_usd, None);
         assert!(run.detail.unwrap().contains("not JSON"));
     }
 
-    #[tokio::test]
-    async fn a_silent_failure_reports_what_stderr_said() {
-        let (dir, store) = temp_store();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_silent_failure_reports_what_stderr_said(pool: sqlx::PgPool) {
+        let (dir, store) = temp_store(pool);
         let claude = fake_claude(
             dir.path(),
             "claude-silent",
@@ -1391,14 +1394,14 @@ mod tests {
 
         let err = runner.run(request()).await.unwrap_err();
         assert!(err.to_string().contains("--frobnicate"), "{err}");
-        assert_eq!(runner.runs.get(1).unwrap().unwrap().outcome, "error");
+        assert_eq!(runner.runs.get(1).await.unwrap().unwrap().outcome, "error");
     }
 
-    #[tokio::test]
-    async fn a_non_zero_exit_fails_the_run_even_with_parseable_stdout() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_non_zero_exit_fails_the_run_even_with_parseable_stdout(pool: sqlx::PgPool) {
         // The failure mode this closes: a CLI that prints a plausible document
         // and then exits non-zero was recorded `ok`, cost and all.
-        let (dir, store) = temp_store();
+        let (dir, store) = temp_store(pool);
         let body = success_json();
         let claude = fake_claude(
             dir.path(),
@@ -1410,14 +1413,14 @@ mod tests {
         let err = runner.run(request()).await.unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
 
-        let run = runner.runs.get(1).unwrap().unwrap();
+        let run = runner.runs.get(1).await.unwrap().unwrap();
         assert_eq!(run.outcome, "error");
         assert_eq!(run.cost_usd, None, "a failed session must not book a cost");
     }
 
-    #[tokio::test]
-    async fn an_overrunning_session_is_interrupted_before_it_is_terminated() {
-        let (dir, store) = temp_store();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_overrunning_session_is_interrupted_before_it_is_terminated(pool: sqlx::PgPool) {
+        let (dir, store) = temp_store(pool);
         let witness = dir.path().join("got-sigint");
         // Traps SIGINT, records that it arrived, and exits cleanly -- the same
         // "end the turn" behaviour the real CLI has.
@@ -1442,14 +1445,14 @@ mod tests {
             "the child must get SIGINT first: SIGTERM alone leaves the turn unfinished"
         );
 
-        let run = runner.runs.get(1).unwrap().unwrap();
+        let run = runner.runs.get(1).await.unwrap().unwrap();
         assert_eq!(run.outcome, "error");
         assert!(run.detail.unwrap().contains("timed out"));
     }
 
-    #[tokio::test]
-    async fn a_session_that_ignores_sigint_is_still_taken_apart() {
-        let (dir, store) = temp_store();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_session_that_ignores_sigint_is_still_taken_apart(pool: sqlx::PgPool) {
+        let (dir, store) = temp_store(pool);
         let claude = fake_claude(
             dir.path(),
             "claude-stubborn",
@@ -1561,7 +1564,7 @@ mod tests {
         let actions = ActionStore::new(Arc::clone(&conn));
         let executor = Executor::new(
             ActionStore::new(Arc::clone(&conn)),
-            RunStore::new(Arc::clone(&conn)),
+            RunStore::new(pool.clone()),
             Policy::parse("[notes]\nadd_note = \"approve\"\n").unwrap(),
             NeverCalls,
         );
@@ -1570,7 +1573,7 @@ mod tests {
             executor: Arc::new(executor),
             actions: ActionStore::new(Arc::clone(&conn)),
             events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
-            runs: RunStore::new(Arc::clone(&conn)),
+            runs: RunStore::new(pool.clone()),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
             schedules: ea_core::store::schedules::ScheduleStore::new(pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
@@ -1579,7 +1582,7 @@ mod tests {
                 ea_core::store::facts::FactStore::new(pool.clone()),
                 None,
                 crate::budget::Budget::new(
-                    RunStore::new(Arc::clone(&conn)),
+                    RunStore::new(pool.clone()),
                     60,
                     crate::notify::policy::DEFAULT_TIME_ZONE,
                 ),
@@ -1590,7 +1593,7 @@ mod tests {
             notify_log: crate::notify::log::NotificationLog::new(
                 ea_core::store::kv::KvStore::new(pool.clone()),
             ),
-            kv: ea_core::store::kv::KvStore::new(pool),
+            kv: ea_core::store::kv::KvStore::new(pool.clone()),
             connectors: Vec::new(),
         })
         .register(&mut server);
@@ -1598,7 +1601,7 @@ mod tests {
 
         let cwd = dir.path().join("session-cwd");
         let runner = SessionRunner::new(
-            RunStore::new(Arc::clone(&conn)),
+            RunStore::new(pool.clone()),
             resolve_command(CLAUDE_BIN).expect("locating the claude CLI"),
             propose,
             cwd.clone(),
@@ -1647,7 +1650,7 @@ mod tests {
         );
 
         assert!(outcome.session_id.is_some(), "a session id must come back");
-        let run = runner.runs.get(1).unwrap().unwrap();
+        let run = runner.runs.recent(1).await.unwrap().into_iter().next().unwrap();
         assert_eq!(run.outcome, "ok");
         let cost = run.cost_usd.expect("the run row must record a cost");
         assert!(cost > 0.0, "cost should be positive, got {cost}");
