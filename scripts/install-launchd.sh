@@ -25,6 +25,20 @@ fi
 # Homebrew's rustc is broken on this machine; rustup's is not. Prefer it.
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# The daemon refuses to start without a reachable Postgres, so a build that
+# would just die on first launch is caught here rather than after a five
+# minute release compile.
+if ! pg_isready -q; then
+  echo "error: Postgres is not accepting connections." >&2
+  echo "  brew services start postgresql@17" >&2
+  exit 1
+fi
+if ! psql -d exec_agent -c 'SELECT 1' >/dev/null 2>&1; then
+  echo "error: cannot reach the 'exec_agent' database." >&2
+  echo "  createuser --createdb ea && createdb -O ea exec_agent" >&2
+  exit 1
+fi
+
 echo "==> Building (release)"
 cd "$REPO"
 cargo build --release
