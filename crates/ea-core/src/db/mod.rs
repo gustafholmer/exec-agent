@@ -73,4 +73,37 @@ mod tests {
             .expect("a connected pool must answer a trivial query");
         assert_eq!(one, 1);
     }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn creates_every_table(pool: sqlx::PgPool) {
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for table in [
+            "events", "actions", "conversations", "messages",
+            "facts", "runs", "schedules", "kv",
+        ] {
+            assert!(names.contains(&table.to_string()), "missing {table}");
+        }
+    }
+
+    /// Review Focus #4 belongs to Task 10, but the constraint itself is created
+    /// here, so its shape is pinned here too.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn the_status_check_rejects_an_unknown_status(pool: sqlx::PgPool) {
+        let err = sqlx::query(
+            "INSERT INTO actions (connector, tool, args, preview, rationale, status, expires_at)
+             VALUES ('x','y','{}','p','r','nonsense', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("an unknown status must be refused by the database");
+        assert!(
+            format!("{err}").contains("actions_status_check"),
+            "expected the CHECK constraint to be named in the error, got: {err}"
+        );
+    }
 }
