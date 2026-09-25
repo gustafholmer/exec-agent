@@ -101,12 +101,14 @@ async fn main() -> anyhow::Result<()> {
 
     // --- state -------------------------------------------------------------
     let db_path = ea_core::paths::database_path();
-    let conn = Arc::new(Mutex::new(ea_core::db::sqlite::open(&db_path).with_context(
+    // No production code reaches for this handle any more — every store has
+    // moved to `pool` as of Task 11 — but Task 12 is what removes the SQLite
+    // opener itself, so the open (and its error handling) stays here until
+    // then. Prefixed `_` because nothing else in this function reads it.
+    let _conn = Arc::new(Mutex::new(ea_core::db::sqlite::open(&db_path).with_context(
         || format!("opening the state database at {}", db_path.display()),
     )?));
 
-    // Both stores are live during the migration: `conn` for modules not yet
-    // converted, `pool` for those that are. Task 12 deletes `conn`.
     let database_url = config.database.resolve()?;
     let pool = ea_core::db::connect_with_retry(&database_url, std::time::Duration::from_secs(60))
         .await
@@ -276,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
     scheduler.add(retention_job(
         config.retention.interval,
         Arc::new(RetentionDeps {
-            store: RetentionStore::new(Arc::clone(&conn)),
+            store: RetentionStore::new(pool.clone()),
             policy: config.retention.policy,
             // Where the plist points StandardOutPath and StandardErrorPath.
             log_dir: state_dir.clone(),
