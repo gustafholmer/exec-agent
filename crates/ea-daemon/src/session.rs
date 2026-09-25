@@ -771,7 +771,7 @@ mod tests {
     fn temp_store() -> (TempDir, RunStore) {
         let dir = TempDir::new().unwrap();
         let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         (dir, RunStore::new(conn))
     }
@@ -1548,7 +1548,7 @@ mod tests {
         );
 
         let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
-            ea_core::db::open(&state.join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&state.join("state.db")).unwrap(),
         ));
         let actions = ActionStore::new(Arc::clone(&conn));
         let executor = Executor::new(

@@ -228,7 +228,7 @@ mod tests {
     }
 
     fn open(path: &std::path::Path) -> Conn {
-        Arc::new(std::sync::Mutex::new(ea_core::db::open(path).unwrap()))
+        Arc::new(std::sync::Mutex::new(ea_core::db::sqlite::open(path).unwrap()))
     }
 
     /// A `runs` row with a chosen `started_at`.

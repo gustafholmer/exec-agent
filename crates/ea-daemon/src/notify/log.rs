@@ -189,7 +189,7 @@ mod tests {
 
     fn store(dir: &TempDir) -> NotificationLog {
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         NotificationLog::new(KvStore::new(conn))
     }

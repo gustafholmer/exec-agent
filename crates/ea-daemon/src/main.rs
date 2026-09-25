@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- state -------------------------------------------------------------
     let db_path = ea_core::paths::database_path();
-    let conn = Arc::new(Mutex::new(ea_core::db::open(&db_path).with_context(
+    let conn = Arc::new(Mutex::new(ea_core::db::sqlite::open(&db_path).with_context(
         || format!("opening the state database at {}", db_path.display()),
     )?));
 

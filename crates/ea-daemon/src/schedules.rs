@@ -451,7 +451,7 @@ mod tests {
 
     fn temp_store() -> (TempDir, Arc<Mutex<Connection>>) {
         let dir = TempDir::new().unwrap();
-        let conn = ea_core::db::open(&dir.path().join("state.db")).unwrap();
+        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
         (dir, Arc::new(Mutex::new(conn)))
     }
 

@@ -912,7 +912,7 @@ mod tests {
         fn new(replies: Vec<anyhow::Result<Vec<Update>>>) -> Self {
             let dir = TempDir::new().unwrap();
             let conn = Arc::new(Mutex::new(
-                ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+                ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
             ));
             Self {
                 _dir: dir,
@@ -1355,7 +1355,7 @@ mod tests {
     fn the_offset_never_moves_backwards() {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         let offsets = OffsetStore::new(KvStore::new(conn));
         offsets.set(50).unwrap();
@@ -1369,7 +1369,7 @@ mod tests {
     async fn a_long_reply_is_cut_to_telegrams_limit() {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         let source = ScriptedSource::with(vec![Ok(vec![tap(1, "approve:1")])]);
         let lp = UpdateLoop::new(
@@ -1505,7 +1505,7 @@ mod end_to_end {
     fn harness() -> Harness {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         let caller = SpyCaller::default();
         let calls = Arc::clone(&caller.calls);

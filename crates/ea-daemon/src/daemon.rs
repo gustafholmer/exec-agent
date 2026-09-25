@@ -880,7 +880,7 @@ record_voucher = "approve"
         fn build(with_sessions: bool, budget: u32) -> Self {
             let dir = TempDir::new().unwrap();
             let conn = Arc::new(Mutex::new(
-                ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+                ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
             ));
             let sessions = with_sessions.then(|| {
                 FakeSessions::new("here is your answer", RunStore::new(Arc::clone(&conn)))

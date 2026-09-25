@@ -433,7 +433,7 @@ mod tests {
         Arc<std::sync::Mutex<rusqlite::Connection>>,
     ) {
         let dir = tempfile::TempDir::new().unwrap();
-        let conn = ea_core::db::open(&dir.path().join("state.db")).unwrap();
+        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
         (dir, Arc::new(std::sync::Mutex::new(conn)))
     }
 

@@ -938,7 +938,7 @@ record_voucher = "approve"
     fn build(pusher: Arc<SpyPusher>, caller: Arc<SpyCaller>) -> Fixture {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         let events = EventStore::new(Arc::clone(&conn));
         let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));

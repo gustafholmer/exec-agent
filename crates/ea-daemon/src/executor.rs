@@ -331,10 +331,11 @@ mod tests {
     /// `ea_core::store::test_support::temp_store` is `#[cfg(test)]
     /// pub(crate)`, so it does not exist in the compiled `ea-core` this crate
     /// links against. Rather than widen ea-core's public surface for a test
-    /// helper, this is the same three lines against the public `db::open`.
+    /// helper, this is the same three lines against the public
+    /// `db::sqlite::open`.
     fn temp_store() -> (TempDir, Arc<Mutex<Connection>>) {
         let dir = TempDir::new().unwrap();
-        let conn = ea_core::db::open(&dir.path().join("state.db")).unwrap();
+        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
         (dir, Arc::new(Mutex::new(conn)))
     }
 

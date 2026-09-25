@@ -182,7 +182,7 @@ mod tests {
 
     fn deps(dir: &TempDir, max_bytes: u64) -> (Arc<Mutex<Connection>>, RetentionDeps) {
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
         let deps = RetentionDeps {
             store: RetentionStore::new(Arc::clone(&conn)),

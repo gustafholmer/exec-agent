@@ -1110,7 +1110,7 @@ record_voucher = "approve"
     fn fixture_with_delay(delay: Duration) -> Fixture {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ));
 
         let transport = FakeTransport::default();

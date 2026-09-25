@@ -154,7 +154,7 @@ mod tests {
 
     fn db(dir: &TempDir) -> Arc<Mutex<Connection>> {
         Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
+            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
         ))
     }
 

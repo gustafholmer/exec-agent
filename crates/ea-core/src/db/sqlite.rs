@@ -1,10 +1,18 @@
+//! The transitional SQLite store.
+//!
+//! This is the pre-migration state database: rusqlite, `schema.sql`, and the
+//! ad hoc column/index migrations below. It exists alongside `ea_core::db`'s
+//! Postgres pool while the eight store modules convert one at a time, and it
+//! is deleted -- along with `rusqlite` and `schema.sql` -- in Task 12, once
+//! every store is on Postgres.
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::Context;
 use rusqlite::Connection;
 
-const SCHEMA: &str = include_str!("schema.sql");
+const SCHEMA: &str = include_str!("../schema.sql");
 
 /// Opens (creating if needed) the state database with WAL and a busy timeout,
 /// applying the schema idempotently.
