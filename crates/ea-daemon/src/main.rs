@@ -188,8 +188,8 @@ async fn main() -> anyhow::Result<()> {
             poller,
             Arc::clone(&notifier),
             credentials.chat_id,
-            OffsetStore::new(KvStore::new(Arc::clone(&conn))),
-            HandledUpdates::new(KvStore::new(Arc::clone(&conn))),
+            OffsetStore::new(KvStore::new(pool.clone())),
+            HandledUpdates::new(KvStore::new(pool.clone())),
         ));
         pusher = Some(notifier as Arc<dyn Pusher>);
         tracing::info!(owner = %credentials.owner_id, "telegram configured");
@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     // `recovery`.
     ea_daemon::recovery::sweep_stranded(
         &ActionStore::new(Arc::clone(&conn)),
-        &NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        &NotificationLog::new(KvStore::new(pool.clone())),
         pusher.as_ref(),
     )
     .await?;
@@ -239,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             actions: ActionStore::new(Arc::clone(&conn)),
             sessions: sessions.clone(),
             pusher: pusher.clone(),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            log: NotificationLog::new(KvStore::new(pool.clone())),
             notify: NotificationPolicy::new(config.notify.clone()),
             rules: config.tier0.clone(),
             budget: budget.clone(),
@@ -253,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     schedules::register_built_ins(&schedule_store, chrono::Utc::now())?;
     let briefings = Arc::new(BriefingDeps {
         events: EventStore::new(Arc::clone(&conn)),
-        log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        log: NotificationLog::new(KvStore::new(pool.clone())),
         sessions: sessions.clone(),
         pusher: pusher.clone(),
         caller: Arc::clone(&registry),
@@ -296,8 +296,8 @@ async fn main() -> anyhow::Result<()> {
         time_zone: config.notify.time_zone,
         chat,
         pusher,
-        notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
-        kv: KvStore::new(Arc::clone(&conn)),
+        notify_log: NotificationLog::new(KvStore::new(pool.clone())),
+        kv: KvStore::new(pool.clone()),
         connectors: connector_names,
     });
 
@@ -314,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
     // paused for. Applied before `start`, so no tick can slip through in
     // between. The write side lives in `Daemon::pause`/`resume`, never in
     // `Scheduler::pause` -- the shutdown drain below calls that one.
-    let pause = daemon::restore_pause(&KvStore::new(Arc::clone(&conn)), &scheduler);
+    let pause = daemon::restore_pause(&KvStore::new(pool.clone()), &scheduler).await;
     if pause.paused {
         tracing::warn!(
             since = ?pause.since,

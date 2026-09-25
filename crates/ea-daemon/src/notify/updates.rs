@@ -282,21 +282,22 @@ impl OffsetStore {
         Self { kv }
     }
 
-    pub fn get(&self) -> anyhow::Result<Option<i64>> {
+    pub async fn get(&self) -> anyhow::Result<Option<i64>> {
         Ok(self
             .kv
-            .get(OFFSET_KEY)?
+            .get(OFFSET_KEY)
+            .await?
             .and_then(|raw| raw.trim().parse::<i64>().ok()))
     }
 
     /// Record the next offset. Monotonic: a lower value is ignored, so a
     /// reordered or duplicated batch cannot rewind the cursor and replay taps
     /// that were already acted on.
-    pub fn set(&self, offset: i64) -> anyhow::Result<()> {
-        if self.get()?.is_some_and(|current| current >= offset) {
+    pub async fn set(&self, offset: i64) -> anyhow::Result<()> {
+        if self.get().await?.is_some_and(|current| current >= offset) {
             return Ok(());
         }
-        self.kv.set(OFFSET_KEY, &offset.to_string())
+        self.kv.set(OFFSET_KEY, &offset.to_string()).await
     }
 }
 
@@ -324,18 +325,20 @@ impl HandledUpdates {
     }
 
     /// The highest claimed `update_id`, or `None` on a fresh database.
-    pub fn high_water(&self) -> anyhow::Result<Option<i64>> {
+    pub async fn high_water(&self) -> anyhow::Result<Option<i64>> {
         Ok(self
             .kv
-            .get(HANDLED_KEY)?
+            .get(HANDLED_KEY)
+            .await?
             .and_then(|raw| raw.trim().parse::<i64>().ok()))
     }
 
     /// Whether `update_id` has already been claimed — and so must not be
     /// acted on a second time.
-    pub fn contains(&self, update_id: i64) -> anyhow::Result<bool> {
+    pub async fn contains(&self, update_id: i64) -> anyhow::Result<bool> {
         Ok(self
-            .high_water()?
+            .high_water()
+            .await?
             .is_some_and(|claimed| claimed >= update_id))
     }
 
@@ -344,11 +347,11 @@ impl HandledUpdates {
     /// Monotonic, like [`OffsetStore::set`] and for the same reason: a
     /// redelivered or reordered batch must never lower the mark and make an
     /// update claimable again.
-    pub fn mark(&self, update_id: i64) -> anyhow::Result<()> {
-        if self.contains(update_id)? {
+    pub async fn mark(&self, update_id: i64) -> anyhow::Result<()> {
+        if self.contains(update_id).await? {
             return Ok(());
         }
-        self.kv.set(HANDLED_KEY, &update_id.to_string())
+        self.kv.set(HANDLED_KEY, &update_id.to_string()).await
     }
 }
 
@@ -438,7 +441,7 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
     /// is redelivered. See the module docs for why the two marks are written
     /// at opposite ends.
     pub async fn poll_once(&self) -> anyhow::Result<PollSummary> {
-        let offset = self.offsets.get()?;
+        let offset = self.offsets.get().await?;
         let updates = self
             .source
             .get_updates(offset, self.poll_timeout_secs)
@@ -455,13 +458,13 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
 
             // Telegram redelivers until the offset is confirmed, so this is
             // the ordinary shape of a crash recovery, not an anomaly.
-            if self.handled.contains(id)? {
+            if self.handled.contains(id).await? {
                 tracing::info!(
                     update = id,
                     "skipping a telegram update this daemon has already answered"
                 );
                 summary.duplicates += 1;
-                self.offsets.set(id + 1)?;
+                self.offsets.set(id + 1).await?;
                 continue;
             }
 
@@ -470,7 +473,7 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
             // restart. Marked-but-not-answered costs the owner a re-send or a
             // second tap, which they can see and redo; charged twice for one
             // sentence is silent. See the module docs.
-            self.handled.mark(id)?;
+            self.handled.mark(id).await?;
 
             match self.dispatch(update).await {
                 Dispatched::Handled => summary.handled += 1,
@@ -480,7 +483,7 @@ impl<S: UpdateSource, H: CallbackHandler + MessageHandler> UpdateLoop<S, H> {
             // After the effect, so that a batch interrupted halfway through is
             // redelivered rather than lost; the claim above is what keeps the
             // redelivery from being acted on twice.
-            self.offsets.set(id + 1)?;
+            self.offsets.set(id + 1).await?;
         }
 
         Ok(summary)
@@ -776,7 +779,6 @@ mod tests_support {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::tests_support::ScriptedSource;
@@ -903,31 +905,31 @@ mod tests {
 
     struct Fixture {
         _dir: TempDir,
-        conn: Arc<Mutex<Connection>>,
+        pool: sqlx::PgPool,
         source: Arc<ScriptedSource>,
         handler: Arc<SpyHandler>,
     }
 
     impl Fixture {
-        fn new(replies: Vec<anyhow::Result<Vec<Update>>>) -> Self {
+        fn new(pool: sqlx::PgPool, replies: Vec<anyhow::Result<Vec<Update>>>) -> Self {
+            // `OffsetStore`/`HandledUpdates` are on Postgres now; the temp
+            // directory is kept only as a harmless placeholder so this
+            // fixture's shape does not otherwise change.
             let dir = TempDir::new().unwrap();
-            let conn = Arc::new(Mutex::new(
-                ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-            ));
             Self {
                 _dir: dir,
-                conn,
+                pool,
                 source: ScriptedSource::with(replies),
                 handler: Arc::new(SpyHandler::default()),
             }
         }
 
         fn offsets(&self) -> OffsetStore {
-            OffsetStore::new(KvStore::new(Arc::clone(&self.conn)))
+            OffsetStore::new(KvStore::new(self.pool.clone()))
         }
 
         fn handled(&self) -> HandledUpdates {
-            HandledUpdates::new(KvStore::new(Arc::clone(&self.conn)))
+            HandledUpdates::new(KvStore::new(self.pool.clone()))
         }
 
         /// A fresh loop over the same source, handler and database — which is
@@ -954,9 +956,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_callback_reaches_the_handler_with_the_sender_id() {
-        let f = Fixture::new(vec![Ok(vec![tap(7, "approve:3")])]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_callback_reaches_the_handler_with_the_sender_id(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![tap(7, "approve:3")])]);
         let summary = f.build().poll_once().await.unwrap();
 
         assert_eq!(summary.received, 1);
@@ -974,9 +976,9 @@ mod tests {
     /// The review focus of the whole module. `message.chat.id` is in the same
     /// payload and would compile in place of `from.id`; getting it wrong
     /// authorises whoever the bot happens to be talking to.
-    #[tokio::test]
-    async fn the_identity_is_from_id_and_never_chat_id() {
-        let f = Fixture::new(vec![Ok(vec![callback(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_identity_is_from_id_and_never_chat_id(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![callback(
             1,
             OWNER_USER,
             Some(OWNER_CHAT),
@@ -998,9 +1000,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_callback_from_another_chat_never_reaches_the_handler() {
-        let f = Fixture::new(vec![Ok(vec![callback(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_callback_from_another_chat_never_reaches_the_handler(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![callback(
             2,
             OWNER_USER,
             Some(999_999),
@@ -1017,9 +1019,9 @@ mod tests {
         assert_eq!(f.source.answers()[0].1, UNRECOGNISED_REPLY);
     }
 
-    #[tokio::test]
-    async fn a_callback_with_no_data_is_refused_politely() {
-        let f = Fixture::new(vec![Ok(vec![callback(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_callback_with_no_data_is_refused_politely(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![callback(
             3,
             OWNER_USER,
             Some(OWNER_CHAT),
@@ -1033,9 +1035,9 @@ mod tests {
 
     /// A callback whose message Telegram no longer has still carries `from`,
     /// which is the only field the decision needs.
-    #[tokio::test]
-    async fn a_callback_with_no_message_is_still_handled() {
-        let f = Fixture::new(vec![Ok(vec![callback(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_callback_with_no_message_is_still_handled(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![callback(
             4,
             OWNER_USER,
             None,
@@ -1050,9 +1052,9 @@ mod tests {
     /// is in the same object, is also an `i64`, and would compile — and in the
     /// owner's own DM it is *nearly* the right number, which is what makes the
     /// mistake survivable long enough to ship.
-    #[tokio::test]
-    async fn a_message_reaches_the_handler_with_from_id_and_the_reply_goes_to_the_chat() {
-        let f = Fixture::new(vec![Ok(vec![says(12, "when is the tenta?")])]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_reaches_the_handler_with_from_id_and_the_reply_goes_to_the_chat(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![says(12, "when is the tenta?")])]);
         let summary = f.build().poll_once().await.unwrap();
 
         assert_eq!(
@@ -1074,15 +1076,15 @@ mod tests {
             "the answer goes back to the chat it came from"
         );
         assert!(f.handler.seen().is_empty(), "no callback was involved");
-        assert_eq!(f.offsets().get().unwrap(), Some(13));
+        assert_eq!(f.offsets().get().await.unwrap(), Some(13));
     }
 
     /// A message in some other chat the bot was added to is not this daemon's
     /// business — and it gets no reply at all, so the assistant does not
     /// announce itself in a room nobody configured.
-    #[tokio::test]
-    async fn a_message_from_an_unconfigured_chat_is_refused_silently() {
-        let f = Fixture::new(vec![Ok(vec![message(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_from_an_unconfigured_chat_is_refused_silently(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![message(
             13,
             OWNER_USER,
             OWNER_CHAT + 1,
@@ -1094,7 +1096,7 @@ mod tests {
         assert!(f.handler.messages().is_empty());
         assert!(f.source.sent().is_empty());
         assert_eq!(
-            f.offsets().get().unwrap(),
+            f.offsets().get().await.unwrap(),
             Some(14),
             "the offset still advances"
         );
@@ -1102,15 +1104,15 @@ mod tests {
 
     /// Two bots in one group answering each other is a cost bug with no
     /// ceiling.
-    #[tokio::test]
-    async fn a_message_from_a_bot_is_ignored() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_from_a_bot_is_ignored(pool: sqlx::PgPool) {
         let mut update = says(14, "beep");
         if let Some(message) = update.message.as_mut() {
             if let Some(from) = message.from.as_mut() {
                 from.is_bot = true;
             }
         }
-        let f = Fixture::new(vec![Ok(vec![update])]);
+        let f = Fixture::new(pool, vec![Ok(vec![update])]);
         let summary = f.build().poll_once().await.unwrap();
 
         assert_eq!((summary.handled, summary.refused), (0, 0));
@@ -1121,9 +1123,9 @@ mod tests {
     /// A message with no text — a sticker, a photo — still belongs to the
     /// owner, so the handler decides what to say about it rather than the loop
     /// dropping it.
-    #[tokio::test]
-    async fn a_message_with_no_text_still_reaches_the_handler() {
-        let f = Fixture::new(vec![Ok(vec![message(15, OWNER_USER, OWNER_CHAT, None)])]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_with_no_text_still_reaches_the_handler(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![message(15, OWNER_USER, OWNER_CHAT, None)])]);
         f.build().poll_once().await.unwrap();
         assert_eq!(
             f.handler.messages(),
@@ -1132,13 +1134,13 @@ mod tests {
     }
 
     /// A channel post has no author, so there is nobody to authorise.
-    #[tokio::test]
-    async fn a_message_with_no_sender_is_ignored() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_with_no_sender_is_ignored(pool: sqlx::PgPool) {
         let mut update = says(16, "posted");
         if let Some(message) = update.message.as_mut() {
             message.from = None;
         }
-        let f = Fixture::new(vec![Ok(vec![update])]);
+        let f = Fixture::new(pool, vec![Ok(vec![update])]);
         let summary = f.build().poll_once().await.unwrap();
         assert_eq!((summary.handled, summary.refused), (0, 0));
         assert!(f.handler.messages().is_empty());
@@ -1146,9 +1148,9 @@ mod tests {
 
     /// An update kind this build has never heard of must advance the offset
     /// rather than wedging the loop on it forever.
-    #[tokio::test]
-    async fn a_non_callback_update_is_ignored_but_still_advances_the_offset() {
-        let f = Fixture::new(vec![Ok(vec![Update {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_non_callback_update_is_ignored_but_still_advances_the_offset(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![Update {
             update_id: 11,
             callback_query: None,
             message: None,
@@ -1158,12 +1160,12 @@ mod tests {
             (summary.received, summary.handled, summary.refused),
             (1, 0, 0)
         );
-        assert_eq!(f.offsets().get().unwrap(), Some(12));
+        assert_eq!(f.offsets().get().await.unwrap(), Some(12));
     }
 
-    #[tokio::test]
-    async fn the_offset_advances_so_the_same_tap_is_not_processed_twice() {
-        let f = Fixture::new(vec![
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_offset_advances_so_the_same_tap_is_not_processed_twice(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![
             Ok(vec![tap(7, "approve:3")]),
             // Telegram's answer once the offset has confirmed update 7.
             Ok(vec![]),
@@ -1182,9 +1184,9 @@ mod tests {
 
     /// The offset is in the database, not in memory: a restart must not
     /// re-ask Telegram for taps that were already acted on.
-    #[tokio::test]
-    async fn the_offset_survives_a_restart() {
-        let f = Fixture::new(vec![Ok(vec![tap(20, "approve:1")])]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_offset_survives_a_restart(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![tap(20, "approve:1")])]);
         f.build().poll_once().await.unwrap();
 
         // A brand-new loop over the same database.
@@ -1203,9 +1205,9 @@ mod tests {
     /// same message back after the restart. A free-text message costs a
     /// `claude` session, charged against the daily budget, so answering it
     /// twice charges the owner twice for the same sentence.
-    #[tokio::test]
-    async fn a_redelivered_message_is_answered_once_across_a_restart() {
-        let f = Fixture::new(vec![
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_redelivered_message_is_answered_once_across_a_restart(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![
             Ok(vec![says(7, "when is the tenta?")]),
             Ok(vec![says(7, "when is the tenta?")]),
         ]);
@@ -1215,8 +1217,9 @@ mod tests {
 
         // The crash: the reply went out, the offset write never landed, so
         // the restarted daemon asks Telegram for update 7 again.
-        KvStore::new(Arc::clone(&f.conn))
+        KvStore::new(f.pool.clone())
             .set(OFFSET_KEY, "7")
+            .await
             .unwrap();
 
         let summary = f.build().poll_once().await.unwrap();
@@ -1235,7 +1238,7 @@ mod tests {
             "and the owner is not answered twice either"
         );
         // The cursor still moves past it, or the loop would stick on it.
-        assert_eq!(f.offsets().get().unwrap(), Some(8));
+        assert_eq!(f.offsets().get().await.unwrap(), Some(8));
     }
 
     /// The ordering the whole module is shaped around, pinned at the only
@@ -1261,9 +1264,9 @@ mod tests {
     /// Moving `self.handled.mark(id)?` below the `dispatch` call must fail
     /// this test. That is the only thing it is here for; it is not a
     /// duplicate of either neighbour.
-    #[tokio::test]
-    async fn a_crash_inside_the_handler_leaves_the_update_already_claimed() {
-        let f = Fixture::new(vec![
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_crash_inside_the_handler_leaves_the_update_already_claimed(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![
             Ok(vec![says(11, "when is the tenta?")]),
             // The restart: the offset was never confirmed, so Telegram hands
             // the very same update back.
@@ -1289,14 +1292,14 @@ mod tests {
             "the handler must have been entered, or there was no crash to survive"
         );
         assert_eq!(
-            f.offsets().get().unwrap(),
+            f.offsets().get().await.unwrap(),
             None,
             "the crash must land before the offset is confirmed, or this is a \
              completed poll being simulated rather than an interrupted one"
         );
 
         assert!(
-            f.handled().contains(11).unwrap(),
+            f.handled().contains(11).await.unwrap(),
             "update 11 must be claimed BEFORE the handler runs. The handler \
              panicked without returning, so nothing below the `dispatch` call \
              ran: an unclaimed update here means `self.handled.mark(id)?` has \
@@ -1320,7 +1323,7 @@ mod tests {
             "and the owner is not answered for a turn they never got an answer to"
         );
         assert_eq!(
-            f.offsets().get().unwrap(),
+            f.offsets().get().await.unwrap(),
             Some(12),
             "the cursor still moves past it, or the loop would stick on it forever"
         );
@@ -1333,59 +1336,51 @@ mod tests {
     /// reads `kv` only after `poll_once` has returned, so it passes whichever
     /// side of `dispatch` the mark is written on. The ordering is pinned by
     /// [`a_crash_inside_the_handler_leaves_the_update_already_claimed`].
-    #[tokio::test]
-    async fn a_handled_update_leaves_a_high_water_mark() {
-        let f = Fixture::new(vec![Ok(vec![says(11, "hello")])]);
-        let handled = HandledUpdates::new(KvStore::new(Arc::clone(&f.conn)));
-        assert!(!handled.contains(11).unwrap());
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_handled_update_leaves_a_high_water_mark(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Ok(vec![says(11, "hello")])]);
+        let handled = HandledUpdates::new(KvStore::new(f.pool.clone()));
+        assert!(!handled.contains(11).await.unwrap());
 
         f.build().poll_once().await.unwrap();
 
-        assert!(handled.contains(11).unwrap());
+        assert!(handled.contains(11).await.unwrap());
         assert!(
-            handled.contains(10).unwrap(),
+            handled.contains(10).await.unwrap(),
             "the mark is a high-water mark: everything below it is spent too"
         );
-        assert!(!handled.contains(12).unwrap());
+        assert!(!handled.contains(12).await.unwrap());
     }
 
     /// A reordered or duplicated batch must not rewind the cursor and replay
     /// taps that have already been acted on.
-    #[test]
-    fn the_offset_never_moves_backwards() {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        let offsets = OffsetStore::new(KvStore::new(conn));
-        offsets.set(50).unwrap();
-        offsets.set(20).unwrap();
-        assert_eq!(offsets.get().unwrap(), Some(50));
-        offsets.set(51).unwrap();
-        assert_eq!(offsets.get().unwrap(), Some(51));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_offset_never_moves_backwards(pool: sqlx::PgPool) {
+        let offsets = OffsetStore::new(KvStore::new(pool));
+        offsets.set(50).await.unwrap();
+        offsets.set(20).await.unwrap();
+        assert_eq!(offsets.get().await.unwrap(), Some(50));
+        offsets.set(51).await.unwrap();
+        assert_eq!(offsets.get().await.unwrap(), Some(51));
     }
 
-    #[tokio::test]
-    async fn a_long_reply_is_cut_to_telegrams_limit() {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_long_reply_is_cut_to_telegrams_limit(pool: sqlx::PgPool) {
         let source = ScriptedSource::with(vec![Ok(vec![tap(1, "approve:1")])]);
         let lp = UpdateLoop::new(
             Arc::clone(&source),
             LongWinded,
             OWNER_CHAT,
-            OffsetStore::new(KvStore::new(Arc::clone(&conn))),
-            HandledUpdates::new(KvStore::new(conn)),
+            OffsetStore::new(KvStore::new(pool.clone())),
+            HandledUpdates::new(KvStore::new(pool)),
         );
         lp.poll_once().await.unwrap();
         assert_eq!(source.answers()[0].1.chars().count(), CALLBACK_TEXT_LIMIT);
     }
 
-    #[tokio::test]
-    async fn a_failed_poll_is_an_error_the_caller_sees() {
-        let f = Fixture::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_poll_is_an_error_the_caller_sees(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![Err(anyhow::anyhow!("connection reset"))]);
         let err = f.build().poll_once().await.unwrap_err();
         assert!(format!("{err:#}").contains("connection reset"));
     }
@@ -1393,9 +1388,9 @@ mod tests {
     /// Addition 1's durability requirement: the loop must survive a network
     /// failure and resume, rather than exiting and leaving the owner's buttons
     /// dead until the next restart.
-    #[tokio::test]
-    async fn the_loop_survives_a_network_failure_and_resumes() {
-        let f = Fixture::new(vec![
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_loop_survives_a_network_failure_and_resumes(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![
             Err(anyhow::anyhow!("dns failure")),
             Err(anyhow::anyhow!("connection reset by peer")),
             Ok(vec![tap(31, "approve:5")]),
@@ -1425,15 +1420,15 @@ mod tests {
             vec![(TelegramUserId(OWNER_USER), "approve:5".to_string())]
         );
         assert_eq!(
-            f.offsets().get().unwrap(),
+            f.offsets().get().await.unwrap(),
             Some(32),
             "the recovered poll must still confirm its update"
         );
     }
 
-    #[tokio::test]
-    async fn the_loop_stops_when_shutdown_is_signalled_before_it_starts() {
-        let f = Fixture::new(vec![]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_loop_stops_when_shutdown_is_signalled_before_it_starts(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool, vec![]);
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), f.build().run(rx))
@@ -1457,7 +1452,6 @@ mod end_to_end {
     use ea_core::policy::Policy;
     use ea_core::store::actions::{ActionStore, ProposeInput};
     use ea_core::store::runs::RunStore;
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::tests_support::*;
@@ -1478,7 +1472,7 @@ mod end_to_end {
         actions: ActionStore,
         calls: Arc<Mutex<Vec<(String, String)>>>,
         notifier: Arc<Notifier<RecordingTransport, SpyCaller>>,
-        conn: Arc<Mutex<Connection>>,
+        pool: sqlx::PgPool,
         conversations: ea_core::store::conversations::ConversationStore,
     }
 
@@ -1502,7 +1496,7 @@ mod end_to_end {
         }
     }
 
-    fn harness() -> Harness {
+    fn harness(pool: sqlx::PgPool) -> Harness {
         let dir = TempDir::new().unwrap();
         let conn = Arc::new(Mutex::new(
             ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
@@ -1543,7 +1537,7 @@ mod end_to_end {
             actions: ActionStore::new(Arc::clone(&conn)),
             calls,
             notifier,
-            conn,
+            pool,
             conversations,
         }
     }
@@ -1569,8 +1563,8 @@ mod end_to_end {
                 Arc::clone(&source),
                 Arc::clone(&self.notifier),
                 CHAT,
-                OffsetStore::new(KvStore::new(Arc::clone(&self.conn))),
-                HandledUpdates::new(KvStore::new(Arc::clone(&self.conn))),
+                OffsetStore::new(KvStore::new(self.pool.clone())),
+                HandledUpdates::new(KvStore::new(self.pool.clone())),
             );
             (source, lp)
         }
@@ -1626,9 +1620,9 @@ mod end_to_end {
     /// End to end over the real notifier and a real conversation store: a
     /// message on the phone becomes two rows in the thread and an answer sent
     /// back to the chat it came from.
-    #[tokio::test]
-    async fn the_owners_message_becomes_a_turn_in_the_shared_conversation() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owners_message_becomes_a_turn_in_the_shared_conversation(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let (source, lp) = h.drive(vec![writes(1, OWNER, "when is the tenta?")]);
 
         lp.poll_once().await.unwrap();
@@ -1653,9 +1647,9 @@ mod end_to_end {
     /// The whole point of the owner check, end to end: a stranger's message
     /// must not start a session, must not touch the thread, and must get the
     /// same sentence a stranger's button press gets.
-    #[tokio::test]
-    async fn a_strangers_message_starts_no_session_and_leaves_no_trace() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_strangers_message_starts_no_session_and_leaves_no_trace(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let (source, lp) = h.drive(vec![writes(1, STRANGER, "when is the tenta?")]);
 
         lp.poll_once().await.unwrap();
@@ -1674,9 +1668,9 @@ mod end_to_end {
         );
     }
 
-    #[tokio::test]
-    async fn the_owners_tap_approves_and_executes() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owners_tap_approves_and_executes(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let id = h.propose();
         let (source, lp) = h.drive(vec![press(1, OWNER, &format!("approve:{id}"))]);
 
@@ -1696,9 +1690,9 @@ mod end_to_end {
         );
     }
 
-    #[tokio::test]
-    async fn a_strangers_tap_changes_nothing_and_says_nothing() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_strangers_tap_changes_nothing_and_says_nothing(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let id = h.propose();
         let (source, lp) = h.drive(vec![press(1, STRANGER, &format!("approve:{id}"))]);
 
@@ -1720,9 +1714,9 @@ mod end_to_end {
         );
     }
 
-    #[tokio::test]
-    async fn the_owners_reject_never_calls_the_connector() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owners_reject_never_calls_the_connector(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let id = h.propose();
         let (_source, lp) = h.drive(vec![press(1, OWNER, &format!("reject:{id}"))]);
 
@@ -1738,9 +1732,9 @@ mod end_to_end {
     /// second line of defence for the genuinely double *tap* (two presses,
     /// two `update_id`s); see
     /// `telegram::tests::a_double_tapped_approve_executes_exactly_once`.
-    #[tokio::test]
-    async fn a_redelivered_tap_does_not_execute_twice() {
-        let h = harness();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_redelivered_tap_does_not_execute_twice(pool: sqlx::PgPool) {
+        let h = harness(pool);
         let id = h.propose();
         let data = format!("approve:{id}");
         let (source, lp) = h.drive(vec![press(1, OWNER, &data), press(1, OWNER, &data)]);

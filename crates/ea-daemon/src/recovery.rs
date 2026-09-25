@@ -82,7 +82,8 @@ pub async fn sweep_stranded(
             "[recovery] #{} {}.{} was interrupted mid-execution by a daemon restart; \
              the outcome is unknown and it was not retried",
             action.id, action.connector, action.tool
-        ))?;
+        ))
+        .await?;
         resolved.push(action);
     }
 
@@ -177,12 +178,12 @@ mod tests {
         action.id
     }
 
-    #[tokio::test]
-    async fn a_stranded_action_is_resolved_visibly_and_not_re_run() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_stranded_action_is_resolved_visibly_and_not_re_run(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         let id = strand(&actions);
 
         let pusher: Arc<dyn Pusher> = Arc::new(SpyPusher::default());
@@ -201,18 +202,18 @@ mod tests {
             "nothing was called, so there is no result to record"
         );
 
-        let digest = log.digest().unwrap();
+        let digest = log.digest().await.unwrap();
         assert_eq!(digest.len(), 1);
         assert!(digest[0].contains("#1"), "{:?}", digest[0]);
         assert!(digest[0].contains("not retried"), "{:?}", digest[0]);
     }
 
-    #[tokio::test]
-    async fn the_owner_is_told_on_their_phone() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owner_is_told_on_their_phone(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         strand(&actions);
 
         let spy = Arc::new(SpyPusher::default());
@@ -225,12 +226,12 @@ mod tests {
         assert!(sent[0].contains("none was retried"), "{}", sent[0]);
     }
 
-    #[tokio::test]
-    async fn a_clean_start_resolves_nothing_and_says_nothing() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_clean_start_resolves_nothing_and_says_nothing(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
 
         // A proposal waiting for a human, and an action already executed:
         // neither is stranded.
@@ -248,7 +249,7 @@ mod tests {
             .is_empty());
 
         assert!(spy.sent.lock().unwrap().is_empty());
-        assert!(log.digest().unwrap().is_empty());
+        assert!(log.digest().await.unwrap().is_empty());
         assert_eq!(
             actions.get(waiting.id).unwrap().unwrap().status,
             ActionStatus::Proposed,
@@ -260,12 +261,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_sweep_works_without_a_notifier() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_sweep_works_without_a_notifier(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         let id = strand(&actions);
 
         let resolved = sweep_stranded(&actions, &log, None).await.unwrap();
@@ -279,12 +280,12 @@ mod tests {
 
     /// The second start must find nothing: the sweep is not a recurring
     /// announcement of the same crash.
-    #[tokio::test]
-    async fn sweeping_twice_resolves_nothing_the_second_time() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn sweeping_twice_resolves_nothing_the_second_time(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         strand(&actions);
 
         assert_eq!(sweep_stranded(&actions, &log, None).await.unwrap().len(), 1);
@@ -292,6 +293,6 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(log.digest().unwrap().len(), 1);
+        assert_eq!(log.digest().await.unwrap().len(), 1);
     }
 }

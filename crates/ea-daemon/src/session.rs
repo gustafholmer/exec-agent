@@ -1550,6 +1550,14 @@ mod tests {
         let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
             ea_core::db::sqlite::open(&state.join("state.db")).unwrap(),
         ));
+        // `kv` is on Postgres; the rest of this test's stores are still on the
+        // transitional sqlite database above. See `common-context.md`'s
+        // `DATABASE_URL` for how this is reached when the test is run.
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set to run this ignored test");
+        let pool = ea_core::db::connect(&database_url)
+            .await
+            .expect("connecting to the state database");
         let actions = ActionStore::new(Arc::clone(&conn));
         let executor = Executor::new(
             ActionStore::new(Arc::clone(&conn)),
@@ -1579,10 +1587,10 @@ mod tests {
                 crate::notify::policy::DEFAULT_TIME_ZONE,
             )),
             pusher: None,
-            notify_log: crate::notify::log::NotificationLog::new(ea_core::store::kv::KvStore::new(
-                Arc::clone(&conn),
-            )),
-            kv: ea_core::store::kv::KvStore::new(Arc::clone(&conn)),
+            notify_log: crate::notify::log::NotificationLog::new(
+                ea_core::store::kv::KvStore::new(pool.clone()),
+            ),
+            kv: ea_core::store::kv::KvStore::new(pool),
             connectors: Vec::new(),
         })
         .register(&mut server);

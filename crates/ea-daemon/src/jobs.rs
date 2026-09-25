@@ -365,9 +365,9 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
                 attempts,
                 "triage gave up on this event; it will not be scored or notified about"
             );
-            deps.log.push_digest(format!(
-                "[triage] gave up on event {id}: {UNSCORABLE_REASON}"
-            ))?;
+            deps.log
+                .push_digest(format!("[triage] gave up on event {id}: {UNSCORABLE_REASON}"))
+                .await?;
         } else {
             tracing::debug!(
                 event = id,
@@ -380,7 +380,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
     // Read once, then extended locally as sends happen: the rate limit has to
     // apply *within* one batch as well as across restarts, and re-reading the
     // store per score would be both slower and no more correct.
-    let mut recent = deps.log.recent(now)?;
+    let mut recent = deps.log.recent(now).await?;
 
     for score in scores {
         deps.events
@@ -393,7 +393,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
             match deps.pusher.as_ref() {
                 Some(pusher) => match pusher.notify(&line).await {
                     Ok(()) => {
-                        deps.log.record(now)?;
+                        deps.log.record(now).await?;
                         recent.push(now);
                         summary.sent += 1;
                         tracing::info!(event = score.event_id, reason = verdict.reason, "notified");
@@ -419,7 +419,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
             tracing::debug!(event = score.event_id, reason = verdict.reason, "held back");
         }
 
-        deps.log.push_digest(line)?;
+        deps.log.push_digest(line).await?;
         summary.digested += 1;
     }
 
@@ -808,7 +808,7 @@ mod tests {
 
     struct TriageFixture {
         _dir: TempDir,
-        conn: Arc<Mutex<Connection>>,
+        pool: sqlx::PgPool,
         deps: TriageDeps,
         runs: RunStore,
         events: EventStore,
@@ -819,6 +819,7 @@ mod tests {
     }
 
     fn build_triage(
+        pool: sqlx::PgPool,
         scores: Vec<Salience>,
         rules: Tier0Rules,
         budget: u32,
@@ -830,7 +831,7 @@ mod tests {
         let events = EventStore::new(Arc::clone(&conn));
         let actions = ActionStore::new(Arc::clone(&conn));
         let runs = RunStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         let pusher = Arc::new(SpyPusher {
             sent: Mutex::new(Vec::new()),
             fail: failing_pusher,
@@ -842,7 +843,7 @@ mod tests {
             actions: actions.clone(),
             sessions: tier1.clone().map(|t| t as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            log: NotificationLog::new(KvStore::new(pool.clone())),
             notify: NotificationPolicy::new(NotifyConfig::default()),
             rules,
             budget: Budget::new(runs.clone(), budget, chrono_tz::Europe::Stockholm),
@@ -850,7 +851,7 @@ mod tests {
 
         TriageFixture {
             _dir: dir,
-            conn,
+            pool,
             deps,
             runs,
             events,
@@ -889,9 +890,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn triage_expires_stale_proposals_first() {
-        let f = build_triage(Vec::new(), Tier0Rules::default(), 60, true, false);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn triage_expires_stale_proposals_first(pool: sqlx::PgPool) {
+        let f = build_triage(pool, Vec::new(), Tier0Rules::default(), 60, true, false);
         let action = f
             .actions
             .propose(ProposeInput {
@@ -917,13 +918,13 @@ mod tests {
     /// A muted event must leave the scan window, or after a few weeks of
     /// newsletters the 200-row window holds nothing else and a real deadline
     /// is never looked at.
-    #[tokio::test]
-    async fn tier0_drops_muted_events_and_stamps_them_so_they_stop_coming_back() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn tier0_drops_muted_events_and_stamps_them_so_they_stop_coming_back(pool: sqlx::PgPool) {
         let rules = Tier0Rules {
             muted_sources: vec!["newsletter".to_string()],
             ..Tier0Rules::default()
         };
-        let f = build_triage(Vec::new(), rules, 60, true, false);
+        let f = build_triage(pool, Vec::new(), rules, 60, true, false);
         record(&f.events, "n1", "newsletter", "email", "50% off");
         let kept = record(&f.events, "a1", "canvas", "assignment", "Essay");
 
@@ -941,9 +942,9 @@ mod tests {
 
     /// The brief: **one** tier-1 session per pass, on the cheap model, over
     /// the tier-0 survivors.
-    #[tokio::test]
-    async fn triage_runs_exactly_one_tier1_session_on_the_cheap_model() {
-        let f = build_triage(Vec::new(), Tier0Rules::default(), 60, true, false);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn triage_runs_exactly_one_tier1_session_on_the_cheap_model(pool: sqlx::PgPool) {
+        let f = build_triage(pool, Vec::new(), Tier0Rules::default(), 60, true, false);
         for i in 0..5 {
             record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay");
         }
@@ -962,10 +963,10 @@ mod tests {
         assert!(seen[0].connectors.is_empty(), "tier 1 does not fetch");
     }
 
-    #[tokio::test]
-    async fn a_high_score_is_sent_and_a_low_one_is_held_for_the_digest() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_high_score_is_sent_and_a_low_one_is_held_for_the_digest(pool: sqlx::PgPool) {
         let dir_scores = |a: i64, b: i64| vec![score(a, 90), score(b, 10)];
-        let f = build_triage(dir_scores(1, 2), Tier0Rules::default(), 60, true, false);
+        let f = build_triage(pool, dir_scores(1, 2), Tier0Rules::default(), 60, true, false);
         let high = record(&f.events, "a1", "canvas", "assignment", "Essay due");
         let low = record(&f.events, "a2", "canvas", "assignment", "Reading");
         assert_eq!((high, low), (1, 2), "ids the fake scores were built with");
@@ -981,7 +982,7 @@ mod tests {
             "{:?}",
             f.pusher.sent()
         );
-        assert!(f.log.digest().unwrap()[0].contains("Reading"));
+        assert!(f.log.digest().await.unwrap()[0].contains("Reading"));
 
         // And the scores were written back.
         assert_eq!(f.events.get(high).unwrap().unwrap().salience, Some(90));
@@ -991,10 +992,10 @@ mod tests {
 
     /// Addition 3, in the loop rather than in the store: the rate limit has to
     /// bite *within* one batch too, not only across passes.
-    #[tokio::test]
-    async fn the_rate_limit_bites_inside_one_batch_and_the_rest_go_to_the_digest() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_rate_limit_bites_inside_one_batch_and_the_rest_go_to_the_digest(pool: sqlx::PgPool) {
         let scores = (1..=5).map(|id| score(id, 95)).collect();
-        let f = build_triage(scores, Tier0Rules::default(), 60, true, false);
+        let f = build_triage(pool, scores, Tier0Rules::default(), 60, true, false);
         for i in 1..=5 {
             record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay");
         }
@@ -1005,7 +1006,7 @@ mod tests {
             "the default max_per_hour is 3, and all five scored above the threshold"
         );
         assert_eq!(summary.digested, 2);
-        assert_eq!(f.log.recent(daytime()).unwrap().len(), 3);
+        assert_eq!(f.log.recent(daytime()).await.unwrap().len(), 3);
 
         // And the history is durable: a second pass an instant later sends
         // nothing at all.
@@ -1026,30 +1027,30 @@ mod tests {
             actions: f.deps.actions.clone(),
             sessions: Some(FakeTier1::new(scores, f.runs.clone()) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&f.pusher) as Arc<dyn Pusher>),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
+            log: NotificationLog::new(KvStore::new(f.pool.clone())),
             notify: NotificationPolicy::new(NotifyConfig::default()),
             rules: Tier0Rules::default(),
             budget: Budget::new(f.runs.clone(), 60, chrono_tz::Europe::Stockholm),
         }
     }
 
-    #[tokio::test]
-    async fn a_failed_send_is_not_charged_against_the_rate_limit_and_is_not_lost() {
-        let f = build_triage(vec![score(1, 90)], Tier0Rules::default(), 60, true, true);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_send_is_not_charged_against_the_rate_limit_and_is_not_lost(pool: sqlx::PgPool) {
+        let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 60, true, true);
         record(&f.events, "a1", "canvas", "assignment", "Essay due");
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary.sent, 0);
         assert_eq!(summary.digested, 1, "the line must still reach the digest");
         assert!(
-            f.log.recent(daytime()).unwrap().is_empty(),
+            f.log.recent(daytime()).await.unwrap().is_empty(),
             "a send that failed is not an interruption the human received"
         );
     }
 
-    #[tokio::test]
-    async fn triage_skips_tier1_once_the_daily_budget_is_spent() {
-        let f = build_triage(vec![score(1, 90)], Tier0Rules::default(), 1, true, false);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn triage_skips_tier1_once_the_daily_budget_is_spent(pool: sqlx::PgPool) {
+        let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 1, true, false);
         record(&f.events, "a1", "canvas", "assignment", "Essay");
 
         // First pass spends the day's single session.
@@ -1063,13 +1064,13 @@ mod tests {
         assert_eq!(f.tier1.as_ref().unwrap().sessions(), 1);
     }
 
-    #[tokio::test]
-    async fn triage_without_a_session_runner_still_does_tier0() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn triage_without_a_session_runner_still_does_tier0(pool: sqlx::PgPool) {
         let rules = Tier0Rules {
             muted_kinds: vec!["ping".to_string()],
             ..Tier0Rules::default()
         };
-        let f = build_triage(Vec::new(), rules, 60, false, false);
+        let f = build_triage(pool, Vec::new(), rules, 60, false, false);
         record(&f.events, "p1", "canvas", "ping", "noise");
         record(&f.events, "a1", "canvas", "assignment", "Essay");
 
@@ -1079,9 +1080,9 @@ mod tests {
         assert!(f.pusher.sent().is_empty());
     }
 
-    #[tokio::test]
-    async fn an_empty_database_is_a_cheap_no_op() {
-        let f = build_triage(Vec::new(), Tier0Rules::default(), 60, true, false);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_empty_database_is_a_cheap_no_op(pool: sqlx::PgPool) {
+        let f = build_triage(pool, Vec::new(), Tier0Rules::default(), 60, true, false);
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary, TriageSummary::default());
         assert_eq!(f.tier1.as_ref().unwrap().sessions(), 0);
@@ -1144,8 +1145,8 @@ mod tests {
     /// worth of events must run exactly two sessions — and the third must say
     /// why it ran none, because a pass that quietly stops scoring reads
     /// exactly like a pass with nothing to score.
-    #[tokio::test]
-    async fn triage_stops_running_tier_1_once_the_budget_is_spent() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn triage_stops_running_tier_1_once_the_budget_is_spent(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
         let events = EventStore::new(Arc::clone(&conn));
@@ -1160,7 +1161,7 @@ mod tests {
             actions: ActionStore::new(Arc::clone(&conn)),
             sessions: Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            log: NotificationLog::new(KvStore::new(pool)),
             notify: NotificationPolicy::new(NotifyConfig::default()),
             rules: Tier0Rules::default(),
             budget: Budget::new(runs, 2, chrono_tz::Europe::Stockholm),
@@ -1195,9 +1196,9 @@ mod tests {
 
     /// A ceiling of zero turns every unattended session off, and triage says
     /// why rather than merely going quiet.
-    #[tokio::test]
-    async fn a_zero_budget_stops_tier_1_and_says_so() {
-        let f = build_triage(vec![score(1, 90)], Tier0Rules::default(), 0, true, false);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_zero_budget_stops_tier_1_and_says_so(pool: sqlx::PgPool) {
+        let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 0, true, false);
         record(&f.events, "a1", "canvas", "assignment", "Essay");
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
@@ -1277,8 +1278,11 @@ mod tests {
     }
 
     /// Build a triage fixture whose tier 1 is a [`PartialTier1`].
-    fn build_partial_triage(scores_ids: Option<Vec<i64>>) -> (TriageFixture, Arc<PartialTier1>) {
-        let mut f = build_triage(Vec::new(), Tier0Rules::default(), 1000, true, false);
+    fn build_partial_triage(
+        pool: sqlx::PgPool,
+        scores_ids: Option<Vec<i64>>,
+    ) -> (TriageFixture, Arc<PartialTier1>) {
+        let mut f = build_triage(pool, Vec::new(), Tier0Rules::default(), 1000, true, false);
         let model = PartialTier1::new(scores_ids, f.runs.clone());
         f.deps.sessions = Some(Arc::clone(&model) as Arc<dyn SessionBoundary>);
         (f, model)
@@ -1292,9 +1296,9 @@ mod tests {
 
     /// The finding, stated directly: a model that returns no scores at all
     /// must not prevent later events from ever being triaged.
-    #[tokio::test]
-    async fn a_model_that_scores_nothing_does_not_wedge_triage_forever() {
-        let (f, model) = build_partial_triage(None);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_model_that_scores_nothing_does_not_wedge_triage_forever(pool: sqlx::PgPool) {
+        let (f, model) = build_partial_triage(pool, None);
         // More than one batch holds, so there is a "behind the head of the
         // queue" to be starved in the first place.
         let ids = record_n(&f.events, 45);
@@ -1324,7 +1328,7 @@ mod tests {
         assert_eq!(event.triage_error.as_deref(), Some(UNSCORABLE_REASON));
 
         // And it is in the digest, where a human reading the backlog sees it.
-        let digest = f.log.digest().unwrap();
+        let digest = f.log.digest().await.unwrap();
         assert!(
             digest.iter().any(|line| line.contains("gave up on event")),
             "{digest:?}"
@@ -1345,9 +1349,9 @@ mod tests {
 
     /// The other half: events behind the doomed ones must get scored *while*
     /// the doomed ones are still being retried, not only once they are gone.
-    #[tokio::test]
-    async fn events_behind_an_unscorable_batch_are_still_triaged() {
-        let (f, model) = build_partial_triage(Some((41..=45).collect()));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn events_behind_an_unscorable_batch_are_still_triaged(pool: sqlx::PgPool) {
+        let (f, model) = build_partial_triage(pool, Some((41..=45).collect()));
         let ids = record_n(&f.events, 45);
         let later: Vec<i64> = ids[40..].to_vec();
 
@@ -1377,9 +1381,9 @@ mod tests {
 
     /// One miss is not a verdict: a model that skips an event in one batch and
     /// scores it in the next must leave no trace of having given up.
-    #[tokio::test]
-    async fn one_missed_batch_does_not_give_up_on_an_event() {
-        let (f, _model) = build_partial_triage(None);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn one_missed_batch_does_not_give_up_on_an_event(pool: sqlx::PgPool) {
+        let (f, _model) = build_partial_triage(pool, None);
         let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
@@ -1404,8 +1408,8 @@ mod tests {
     /// A session that fails outright is not the event's fault. If failures
     /// were counted here, a week of `claude` being unreachable would abandon
     /// every event in the database.
-    #[tokio::test]
-    async fn a_failing_session_does_not_burn_an_event_s_attempts() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failing_session_does_not_burn_an_event_s_attempts(pool: sqlx::PgPool) {
         struct Broken;
         impl SessionBoundary for Broken {
             fn run_session(&self, _req: SessionRequest) -> BoxedSession<'_> {
@@ -1413,7 +1417,7 @@ mod tests {
             }
         }
 
-        let mut f = build_triage(Vec::new(), Tier0Rules::default(), 1000, true, false);
+        let mut f = build_triage(pool, Vec::new(), Tier0Rules::default(), 1000, true, false);
         f.deps.sessions = Some(Arc::new(Broken) as Arc<dyn SessionBoundary>);
         let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
 
