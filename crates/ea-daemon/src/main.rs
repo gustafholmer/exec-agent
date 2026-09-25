@@ -249,8 +249,8 @@ async fn main() -> anyhow::Result<()> {
     // than on an interval. Registered in the `schedules` table first, which
     // anchors a fresh install to *now* so that installing at 15:00 does not
     // immediately fire all three; see `ea_core::store::schedules`.
-    let schedule_store = ScheduleStore::new(Arc::clone(&conn));
-    schedules::register_built_ins(&schedule_store, chrono::Utc::now())?;
+    let schedule_store = ScheduleStore::new(pool.clone());
+    schedules::register_built_ins(&schedule_store, chrono::Utc::now()).await?;
     let briefings = Arc::new(BriefingDeps {
         events: EventStore::new(Arc::clone(&conn)),
         log: NotificationLog::new(KvStore::new(pool.clone())),

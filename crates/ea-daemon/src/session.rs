@@ -1572,7 +1572,7 @@ mod tests {
             events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
             runs: RunStore::new(Arc::clone(&conn)),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
-            schedules: ea_core::store::schedules::ScheduleStore::new(Arc::clone(&conn)),
+            schedules: ea_core::store::schedules::ScheduleStore::new(pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::new(crate::chat::ChatService::new(
                 ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),

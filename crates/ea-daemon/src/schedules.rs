@@ -308,7 +308,7 @@ where
         let body = Arc::clone(&body);
         async move {
             let now = Utc::now();
-            let Some(fired) = claim(&name, time_zone, &store, now)? else {
+            let Some(fired) = claim(&name, time_zone, &store, now).await? else {
                 return Ok(());
             };
             tracing::info!(
@@ -340,13 +340,13 @@ pub struct Fired {
 /// Separated from [`cron_job`] so the decision is testable without spawning a
 /// job, and returns `Ok(None)` rather than an error for the ordinary "not yet"
 /// case, which must not look like a failure to the breaker.
-fn claim(
+async fn claim(
     name: &str,
     time_zone: Tz,
     store: &ScheduleStore,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<Fired>> {
-    let Some(row) = store.get(name)? else {
+    let Some(row) = store.get(name).await? else {
         bail!("schedule {name} is not registered in the schedules table");
     };
     if !row.enabled {
@@ -357,7 +357,7 @@ fn claim(
     if !schedule.due(now) {
         return Ok(None);
     }
-    store.mark_run(name, now)?;
+    store.mark_run(name, now).await?;
     Ok(Some(Fired {
         now,
         previous: row.last_run_at,
@@ -369,13 +369,13 @@ fn claim(
 ///
 /// Called once at start-up, before the jobs are registered. Idempotent; see
 /// [`ScheduleStore::ensure`].
-pub fn register_built_ins(store: &ScheduleStore, now: DateTime<Utc>) -> anyhow::Result<()> {
+pub async fn register_built_ins(store: &ScheduleStore, now: DateTime<Utc>) -> anyhow::Result<()> {
     for (name, expression) in BUILT_IN {
         // Parsed here as well as stored, so a typo in a built-in expression is
         // a start-up error naming the schedule rather than a job that trips its
         // breaker once a minute for the life of the process.
         Schedule::parse(name, expression, chrono_tz::UTC, None)?;
-        store.ensure(name, expression, now)?;
+        store.ensure(name, expression, now).await?;
     }
     Ok(())
 }
@@ -443,17 +443,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     use chrono_tz::Europe::Stockholm;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
-
-    fn temp_store() -> (TempDir, Arc<Mutex<Connection>>) {
-        let dir = TempDir::new().unwrap();
-        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(Mutex::new(conn)))
-    }
 
     fn utc(text: &str) -> DateTime<Utc> {
         text.parse().unwrap()
@@ -885,25 +876,27 @@ mod tests {
     // `claim`: the store half
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn claim_takes_an_occurrence_once_and_stamps_the_anchor() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claim_takes_an_occurrence_once_and_stamps_the_anchor(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         store
             .ensure(
                 MORNING_BRIEFING,
                 MORNING_BRIEFING_CRON,
                 utc("2026-09-24T12:00:00Z"),
             )
+            .await
             .unwrap();
 
         let before = utc("2026-09-25T04:59:00Z");
         assert!(claim(MORNING_BRIEFING, Stockholm, &store, before)
+            .await
             .unwrap()
             .is_none());
 
         let at = utc("2026-09-25T05:00:00Z");
         let fired = claim(MORNING_BRIEFING, Stockholm, &store, at)
+            .await
             .unwrap()
             .expect("due");
         assert_eq!(fired.now, at);
@@ -913,7 +906,7 @@ mod tests {
             "the body is handed the anchor this firing replaced"
         );
         assert_eq!(
-            store.get(MORNING_BRIEFING).unwrap().unwrap().last_run_at,
+            store.get(MORNING_BRIEFING).await.unwrap().unwrap().last_run_at,
             Some(at)
         );
 
@@ -924,19 +917,20 @@ mod tests {
             &store,
             utc("2026-09-25T05:01:00Z")
         )
+        .await
         .unwrap()
         .is_none());
     }
 
-    #[test]
-    fn claim_skips_a_disabled_schedule_without_stamping_it() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claim_skips_a_disabled_schedule_without_stamping_it(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         let installed = utc("2026-09-24T12:00:00Z");
         store
             .ensure(MORNING_BRIEFING, MORNING_BRIEFING_CRON, installed)
+            .await
             .unwrap();
-        store.set_enabled(MORNING_BRIEFING, false).unwrap();
+        store.set_enabled(MORNING_BRIEFING, false).await.unwrap();
 
         assert!(claim(
             MORNING_BRIEFING,
@@ -944,52 +938,57 @@ mod tests {
             &store,
             utc("2026-09-25T05:00:00Z")
         )
+        .await
         .unwrap()
         .is_none());
         assert_eq!(
-            store.get(MORNING_BRIEFING).unwrap().unwrap().last_run_at,
+            store.get(MORNING_BRIEFING).await.unwrap().unwrap().last_run_at,
             Some(installed),
             "a disabled schedule is skipped, not silently advanced"
         );
     }
 
-    #[test]
-    fn claim_of_an_unregistered_schedule_is_an_error_not_a_silent_no() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claim_of_an_unregistered_schedule_is_an_error_not_a_silent_no(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         let err = claim("never_registered", Stockholm, &store, Utc::now())
+            .await
             .expect_err("an unregistered schedule must be visible");
         assert!(format!("{err:#}").contains("never_registered"));
     }
 
     /// A row whose expression has been hand-edited into nonsense fails that
     /// job, visibly, rather than the daemon.
-    #[test]
-    fn claim_reports_an_unparseable_stored_expression() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(Arc::clone(&conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claim_reports_an_unparseable_stored_expression(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         store
             .ensure(VAT_PREP, "not a cron at all", utc("2026-09-24T12:00:00Z"))
+            .await
             .unwrap();
-        let err = claim(VAT_PREP, Stockholm, &store, Utc::now()).expect_err("must not parse");
+        let err = claim(VAT_PREP, Stockholm, &store, Utc::now())
+            .await
+            .expect_err("must not parse");
         assert!(format!("{err:#}").contains("not a cron at all"));
     }
 
     /// The anchor `ensure` writes is what keeps a fresh install quiet: it is
     /// installed at 12:00 local and the first briefing is the next 07:00, not
     /// the tick after start-up.
-    #[test]
-    fn a_fresh_install_does_not_fire_all_three_briefings_at_once() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_fresh_install_does_not_fire_all_three_briefings_at_once(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         let installed = utc("2026-09-24T10:00:00Z"); // 12:00 Stockholm
         for (name, expression) in BUILT_IN {
-            store.ensure(name, expression, installed).unwrap();
+            store.ensure(name, expression, installed).await.unwrap();
         }
 
         for (name, _) in BUILT_IN {
             assert!(
-                claim(name, Stockholm, &store, installed).unwrap().is_none(),
+                claim(name, Stockholm, &store, installed)
+                    .await
+                    .unwrap()
+                    .is_none(),
                 "{name} must not fire on the tick it was installed"
             );
         }
@@ -1000,10 +999,12 @@ mod tests {
             &store,
             utc("2026-09-25T05:00:00Z")
         )
+        .await
         .unwrap()
         .is_some());
         assert!(
             claim(VAT_PREP, Stockholm, &store, utc("2026-09-25T05:00:00Z"))
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -1013,16 +1014,17 @@ mod tests {
     // Registration, and the job as the real scheduler drives it
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn register_built_ins_writes_all_three_and_is_idempotent() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn register_built_ins_writes_all_three_and_is_idempotent(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         let installed = utc("2026-09-24T10:00:00Z");
 
-        register_built_ins(&store, installed).unwrap();
-        register_built_ins(&store, utc("2026-09-25T10:00:00Z")).unwrap();
+        register_built_ins(&store, installed).await.unwrap();
+        register_built_ins(&store, utc("2026-09-25T10:00:00Z"))
+            .await
+            .unwrap();
 
-        let rows = store.all().unwrap();
+        let rows = store.all().await.unwrap();
         assert_eq!(rows.len(), 3);
         for row in &rows {
             assert!(row.enabled);
@@ -1044,12 +1046,11 @@ mod tests {
     /// Driven by the real [`crate::scheduler::Scheduler`], not by calling
     /// `claim` directly: the whole point of the one-job-per-schedule shape is
     /// that Phase 1's machinery drives it unchanged.
-    #[tokio::test]
-    async fn a_cron_job_fires_once_through_the_real_scheduler() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_cron_job_fires_once_through_the_real_scheduler(pool: sqlx::PgPool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+        let store = ScheduleStore::new(pool);
         // Anchored two days ago, so the schedule is overdue the moment the
         // scheduler looks at it.
         store
@@ -1058,6 +1059,7 @@ mod tests {
                 MORNING_BRIEFING_CRON,
                 Utc::now() - Duration::days(2),
             )
+            .await
             .unwrap();
 
         let ran = Arc::new(AtomicUsize::new(0));
@@ -1098,16 +1100,16 @@ mod tests {
     /// A briefing whose body fails must not be retried every minute: the
     /// anchor is stamped before the body runs, so the failure costs that
     /// occurrence and reaches `ea status` through the breaker instead.
-    #[tokio::test]
-    async fn a_failing_body_still_consumes_its_occurrence() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failing_body_still_consumes_its_occurrence(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         store
             .ensure(
                 MORNING_BRIEFING,
                 MORNING_BRIEFING_CRON,
                 Utc::now() - Duration::days(2),
             )
+            .await
             .unwrap();
 
         let job = cron_job(MORNING_BRIEFING, Stockholm, store.clone(), |_fired| async {
@@ -1127,6 +1129,7 @@ mod tests {
             .contains("telegram is down"));
         let anchor = store
             .get(MORNING_BRIEFING)
+            .await
             .unwrap()
             .unwrap()
             .last_run_at
@@ -1139,12 +1142,12 @@ mod tests {
 
     /// A schedule that is merely waiting is not a failure, so a breaker never
     /// trips on a job that has simply not come round yet.
-    #[tokio::test]
-    async fn ticks_before_the_cron_time_are_successes_not_failures() {
-        let (_dir, conn) = temp_store();
-        let store = ScheduleStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn ticks_before_the_cron_time_are_successes_not_failures(pool: sqlx::PgPool) {
+        let store = ScheduleStore::new(pool);
         store
             .ensure(MORNING_BRIEFING, MORNING_BRIEFING_CRON, Utc::now())
+            .await
             .unwrap();
         let job = cron_job(MORNING_BRIEFING, Stockholm, store, |_fired| async {
             panic!("must not run")

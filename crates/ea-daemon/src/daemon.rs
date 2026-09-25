@@ -397,7 +397,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             "digest_pending": self.notify_log.digest_len().await.unwrap_or_default(),
             "digest_dropped": self.notify_log.digest_dropped().await.unwrap_or_default(),
             "jobs": jobs,
-            "schedules": self.schedule_status(),
+            "schedules": self.schedule_status().await,
             "connectors": self.connectors,
             "sessions_available": self.chat.sessions_available(),
             "notifier_configured": self.pusher.is_some(),
@@ -428,8 +428,8 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// Read errors degrade to an empty list rather than failing `status`: this
     /// endpoint is what someone reaches for when things are already wrong, and
     /// it must answer.
-    fn schedule_status(&self) -> Vec<Value> {
-        let rows = match self.schedules.all() {
+    async fn schedule_status(&self) -> Vec<Value> {
+        let rows = match self.schedules.all().await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %format!("{err:#}"), "could not read the schedules table");
@@ -857,8 +857,6 @@ record_voucher = "approve"
 
     struct Fixture {
         _dir: TempDir,
-        /// Kept so a test can build a second `Daemon` over the same database.
-        conn: Arc<Mutex<rusqlite::Connection>>,
         pool: sqlx::PgPool,
         daemon: Arc<Daemon<SpyCaller>>,
         log: CallLog,
@@ -925,7 +923,7 @@ record_voucher = "approve"
                 events: EventStore::new(Arc::clone(&conn)),
                 runs: RunStore::new(Arc::clone(&conn)),
                 scheduler: Arc::clone(&scheduler),
-                schedules: ScheduleStore::new(Arc::clone(&conn)),
+                schedules: ScheduleStore::new(pool.clone()),
                 time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
                 chat: Arc::clone(&chat),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
@@ -936,7 +934,6 @@ record_voucher = "approve"
 
             Self {
                 _dir: dir,
-                conn,
                 pool,
                 daemon,
                 log,
@@ -1098,7 +1095,7 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f.daemon.chat),
             pusher: None,
@@ -1304,7 +1301,7 @@ record_voucher = "approve"
             events: f2.daemon.events.clone(),
             runs: f2.daemon.runs.clone(),
             scheduler: Arc::clone(&failing),
-            schedules: ScheduleStore::new(Arc::clone(&f2.conn)),
+            schedules: ScheduleStore::new(f2.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f2.daemon.chat),
             pusher: None,
@@ -1409,7 +1406,7 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f.daemon.chat),
             pusher: None,
@@ -1450,8 +1447,9 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn status_reports_every_schedule_and_when_it_next_runs(pool: sqlx::PgPool) {
         let f = Fixture::new(pool);
-        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        let store = ScheduleStore::new(f.pool.clone());
         crate::schedules::register_built_ins(&store, "2026-09-24T10:00:00Z".parse().unwrap())
+            .await
             .unwrap();
 
         let status = f.call("status", Value::Null).await.unwrap();
@@ -1476,13 +1474,14 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_broken_schedule_row_does_not_break_status(pool: sqlx::PgPool) {
         let f = Fixture::new(pool);
-        let store = ScheduleStore::new(Arc::clone(&f.conn));
+        let store = ScheduleStore::new(f.pool.clone());
         store
             .ensure(
                 "wrong",
                 "not a cron",
                 "2026-09-24T10:00:00Z".parse().unwrap(),
             )
+            .await
             .unwrap();
 
         let status = f.call("status", Value::Null).await.unwrap();
@@ -2014,7 +2013,7 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&f.scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat,
             pusher: None,
