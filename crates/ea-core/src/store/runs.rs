@@ -15,8 +15,8 @@ pub struct Run {
     pub duration_ms: Option<i64>,
     // Serialized explicitly as RFC 3339 (rather than left to chrono's default
     // `Serialize`, which renders a UTC offset as `Z`) so that `ea log` and the
-    // daemon's `log` IPC response keep the exact timestamp format the old
-    // SQLite-backed store produced with `Utc::now().to_rfc3339()`.
+    // daemon's `log` IPC response keep the exact timestamp format
+    // `to_rfc3339()` produces.
     #[serde(serialize_with = "serialize_rfc3339")]
     pub started_at: DateTime<Utc>,
     #[serde(serialize_with = "serialize_rfc3339_opt")]

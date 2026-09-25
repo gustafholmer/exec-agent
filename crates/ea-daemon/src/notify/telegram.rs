@@ -265,7 +265,7 @@ enum Callback {
 /// Everything here is total. `split_once` returns an `Option` rather than
 /// indexing; the id goes through `i64::from_str`, whose overflow and
 /// non-numeric cases are `Err` and not a panic; and an id is required to be
-/// positive because SQLite rowids are, so `0` and negatives are refused before
+/// positive because action ids are, so `0` and negatives are refused before
 /// they reach a query. Anything else — an unknown verb, no colon, an empty
 /// payload, a second colon — is `None`, which the caller answers politely.
 fn parse_callback(data: &str) -> Option<Callback> {

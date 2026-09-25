@@ -962,10 +962,9 @@ mod tests {
         assert_eq!(event.salience, Some(80), "nothing changed, so nothing is reset");
     }
 
-    /// Deliberate behaviour change from the SQLite version, which compared
-    /// serialized JSON text: JSONB compares semantically, so a connector
-    /// re-emitting the same object with its keys in a different order no
-    /// longer looks like a changed payload and no longer resets triage.
+    /// JSONB compares semantically, not as serialized text, so a connector
+    /// re-emitting the same object with its keys in a different order does
+    /// not look like a changed payload and does not reset triage.
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn reordered_payload_keys_are_not_a_change(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);
@@ -982,9 +981,9 @@ mod tests {
         assert_eq!(event.salience, Some(80), "same object, different key order");
     }
 
-    /// Review Focus #2: Postgres TEXT rejects the NUL byte and SQLite does
-    /// not. Connector data is untrusted — a mail subject can contain one —
-    /// so it must be turned into a clear error and never a panic.
+    /// Review Focus #2: Postgres TEXT rejects the NUL byte. Connector data is
+    /// untrusted — a mail subject can contain one — so it must be turned into
+    /// a clear error and never a panic.
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn a_nul_byte_in_a_text_field_is_an_error_not_a_panic(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);

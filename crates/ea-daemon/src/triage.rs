@@ -310,9 +310,8 @@ pub fn tier1_prompt(events: &[Event]) -> String {
             event.id,
             event.source,
             event.kind,
-            // `created_at` is a `DateTime<Utc>` now, not the stored RFC 3339
-            // string SQLite held; `.to_rfc3339()` keeps the prompt text byte
-            // for byte what it was, rather than chrono's `Display` format
+            // `.to_rfc3339()` keeps the prompt's timestamp format stable and
+            // predictable, rather than chrono's `Display` format
             // ("2026-09-24 09:00:00 UTC" — space-separated, no `T`).
             event.created_at.to_rfc3339(),
             clip(&payload, PAYLOAD_BUDGET),

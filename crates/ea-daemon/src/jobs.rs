@@ -159,20 +159,17 @@ pub async fn run_watch_poll<C: ToolCaller>(
     };
     for item in items {
         // A single malformed item must not take down the rest of the batch —
-        // but only when the fault really is the item's content. Under SQLite
-        // this loop could not fail on content at all (a NUL byte, say, is
-        // ordinary SQLite TEXT), so every failure here was a real problem and
-        // propagating it was correct. Postgres TEXT and JSONB both reject an
-        // embedded NUL, which a connector can now hand back from untrusted
-        // data (a mail subject, say) — but a blanket catch-and-skip here
-        // would also swallow a database outage: every item in the poll would
-        // fail, each would be logged and skipped, and the poll would still
-        // return `Ok`, which is exactly the "connector looks healthy
-        // forever" failure this function's doc comment forbids. So only a
-        // Postgres data-exception (`is_rejected_content` — a NUL byte is the
-        // case in practice) is skipped per item; anything else (the pool is
-        // closed, a connection timed out, ...) propagates and fails the poll,
-        // same as before this loop existed.
+        // but only when the fault really is the item's content. Postgres
+        // TEXT and JSONB both reject an embedded NUL, which a connector can
+        // hand back from untrusted data (a mail subject, say) — but a
+        // blanket catch-and-skip here would also swallow a database outage:
+        // every item in the poll would fail, each would be logged and
+        // skipped, and the poll would still return `Ok`, which is exactly
+        // the "connector looks healthy forever" failure this function's doc
+        // comment forbids. So only a Postgres data-exception
+        // (`is_rejected_content` — a NUL byte is the case in practice) is
+        // skipped per item; anything else (the pool is closed, a connection
+        // timed out, ...) propagates and fails the poll.
         let external_id = item.external_id.clone();
         match events
             .record(RecordInput {

@@ -936,10 +936,10 @@ record_voucher = "approve"
     /// it connects to `DATABASE_URL` directly instead (same pattern as
     /// `database.rs`'s dead-server test). That connection is the real,
     /// shared `exec_agent_test` database rather than an isolated per-test
-    /// one, and the sqlite-backed action id this test submits is always `1`,
-    /// so the final assertion also bounds `started_at` to this test's own
-    /// run rather than trusting the action id alone to tell it apart from
-    /// rows an earlier run of this same test left behind.
+    /// one, and action ids accumulate across runs against it, so the final
+    /// assertion also bounds `started_at` to this test's own run rather than
+    /// trusting the action id alone to tell it apart from rows an earlier
+    /// run of this same test left behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_concurrent_executions_make_exactly_one_connector_call() {
         let Ok(url) = std::env::var("DATABASE_URL") else {

@@ -1,7 +1,7 @@
 //! One daemon per state directory.
 //!
 //! Nothing else in this process tree is safe to run twice. Two daemons sharing
-//! a state directory share the SQLite file, the session budget and the
+//! a state directory share the Postgres database, the session budget and the
 //! connectors' credentials, and — because [`ipc::Server::spawn`] unlinks a
 //! stale socket unconditionally — the second one silently takes the control
 //! socket away from the first. The first keeps polling, keeps triaging, keeps

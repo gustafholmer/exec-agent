@@ -4,8 +4,8 @@
 //! years is a slow leak rather than a durable audit trail: `events` grows with
 //! every poll, `runs` with every session, `messages` with every line of chat.
 //! Nothing here is large per row, but nothing ever leaves either, and an
-//! unbounded SQLite file on a laptop eventually becomes somebody's problem at
-//! the worst moment.
+//! unbounded database eventually becomes somebody's problem at the worst
+//! moment.
 //!
 //! # What must never be pruned
 //!

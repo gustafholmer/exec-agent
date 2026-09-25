@@ -204,7 +204,7 @@ fn decode_entities(input: &str) -> String {
             Some(decoded) => {
                 // `&#0;` is a real numeric reference and decodes to a real
                 // NUL, which would then travel into an event payload, a JSON
-                // prompt and a SQLite TEXT column. The entity is consumed
+                // prompt and a Postgres TEXT column. The entity is consumed
                 // either way — leaving `&#0;` in the text would be no better —
                 // but nothing is emitted for it. See `is_droppable_control`.
                 if !is_droppable_control(decoded) {
@@ -248,7 +248,7 @@ fn decode_entity(body: &str) -> Option<char> {
 /// horizontal whitespace in prose. Everything else — a NUL from `&#0;`, a bare
 /// `\r` from a CRLF mail body, an escape sequence someone embedded — is
 /// invisible to a reader and costs characters against the triage prompt's cap
-/// at best, and at worst travels as a NUL into a JSON payload and a SQLite
+/// at best, and at worst travels as a NUL into a JSON payload and a Postgres
 /// TEXT column.
 fn is_droppable_control(c: char) -> bool {
     c.is_control() && c != '\n' && c != '\t'
@@ -424,8 +424,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `&#0;` is a valid numeric reference to a NUL. Decoding it faithfully
-    /// put a NUL into an event payload, a JSON prompt and a SQLite TEXT
-    /// column; the surrounding text is kept and the control character is not.
+    /// would put a NUL into an event payload, a JSON prompt and a Postgres
+    /// TEXT column; the surrounding text is kept and the control character is
+    /// not.
     #[test]
     fn a_control_character_never_reaches_the_output() {
         assert_eq!(strip_html("<p>a&#0;b</p>"), "ab");

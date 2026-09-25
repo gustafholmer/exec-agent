@@ -11,7 +11,7 @@
 //! Every method here is exactly one of two things:
 //!
 //! * **a read of local state** — `status`, `queue`, `log` — which touches the
-//!   SQLite database and the scheduler's flags and nothing else; or
+//!   Postgres database and the scheduler's flags and nothing else; or
 //! * **a path through [`Executor`]** — `propose`, `approve` — where
 //!   `Policy::decide` has already run and, for `approve`, a human has said yes
 //!   to a specific stored action.

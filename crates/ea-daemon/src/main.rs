@@ -22,7 +22,7 @@
 //! through writing events, an approved action mid-call. Only then does it
 //! close the socket and take the connector children down.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -100,15 +100,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(connectors = ?connector_names, "loaded connectors and their policies");
 
     // --- state -------------------------------------------------------------
-    let db_path = ea_core::paths::database_path();
-    // No production code reaches for this handle any more — every store has
-    // moved to `pool` as of Task 11 — but Task 12 is what removes the SQLite
-    // opener itself, so the open (and its error handling) stays here until
-    // then. Prefixed `_` because nothing else in this function reads it.
-    let _conn = Arc::new(Mutex::new(ea_core::db::sqlite::open(&db_path).with_context(
-        || format!("opening the state database at {}", db_path.display()),
-    )?));
-
     let database_url = config.database.resolve()?;
     let pool = ea_core::db::connect_with_retry(&database_url, std::time::Duration::from_secs(60))
         .await

@@ -1,17 +1,13 @@
 //! The state database.
 //!
-//! The pool below is the Postgres store every converted module targets.
-//! `sqlite` is the transitional pre-migration store: rusqlite against
-//! `schema.sql`, kept in place for the store modules that have not converted
-//! yet, and deleted in Task 12 once every store is on Postgres.
+//! `connect` opens the Postgres pool every store module targets, and applies
+//! the migrations in `crates/ea-core/migrations/` before handing it back.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-
-pub mod sqlite;
 
 /// The schema, embedded at compile time so the daemon carries its own
 /// migrations and nothing extra installs on the target machine.

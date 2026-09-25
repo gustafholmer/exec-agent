@@ -58,7 +58,7 @@ pub struct Action {
     // Serialized explicitly as RFC 3339 (rather than left to chrono's default
     // `Serialize`, which renders a UTC offset as `Z`) so that the daemon's IPC
     // responses, `ea pending`, and the `propose` tool keep the exact timestamp
-    // format the old SQLite-backed store produced with `to_rfc3339()`.
+    // format `to_rfc3339()` produces.
     #[serde(serialize_with = "serialize_rfc3339")]
     pub created_at: DateTime<Utc>,
     #[serde(serialize_with = "serialize_rfc3339")]
@@ -735,7 +735,7 @@ mod tests {
                 "action {} is approved, not proposed; cannot move to approved",
                 action.id
             ),
-            "the message text is unchanged from the SQLite store"
+            "the message text names the current and requested status"
         );
     }
 
@@ -763,9 +763,9 @@ mod tests {
         assert_eq!(reread.decided_at, rejected.decided_at);
     }
 
-    /// `Action` serializes its timestamps with `to_rfc3339()`, exactly the
-    /// text the SQLite store kept in its TEXT columns, so `ea pending` and the
-    /// IPC responses are unchanged.
+    /// `Action` serializes its timestamps with `to_rfc3339()`, so `ea pending`
+    /// and the IPC responses get a stable, predictable timestamp format
+    /// rather than chrono's default `Serialize`.
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn timestamps_serialize_as_rfc3339(pool: sqlx::PgPool) {
         let store = ActionStore::new(pool);
