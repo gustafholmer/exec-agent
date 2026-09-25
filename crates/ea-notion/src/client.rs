@@ -577,6 +577,8 @@ impl NotionClient {
         base.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // No redirects, ever: a same-host https->http downgrade would
             // carry the bearer token in clear text, and this API has no
@@ -1906,6 +1908,28 @@ mod tests {
             .search(None, None)
             .await
             .expect("the version and auth headers must both be present");
+    }
+
+    /// `reqwest` sends no `User-Agent` at all by default, which is what got
+    /// the Canvas connector a 403 from the live API. Notion tolerates an
+    /// anonymous client today; it need not keep doing so.
+    #[tokio::test]
+    async fn every_request_identifies_the_client_by_user_agent() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("POST"))
+            .and(path("/v1/search"))
+            .and(header("user-agent", ea_core::http::USER_AGENT))
+            .respond_with(json_body(serde_json::json!({
+                "object": "list", "results": [], "has_more": false,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .search(None, None)
+            .await
+            .expect("the User-Agent header must be present");
     }
 
     #[test]

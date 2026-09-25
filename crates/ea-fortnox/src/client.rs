@@ -210,6 +210,8 @@ impl FortnoxClient {
         base.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(timeout)
             // No redirects, ever: `reqwest` strips `Authorization` when the
             // host or port changes but not when the *scheme* does, so a
@@ -675,6 +677,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // get — translated from `fortnox/client.test.ts`
     // -----------------------------------------------------------------------
+
+    /// `reqwest` sends no `User-Agent` at all by default, which is what got
+    /// the Canvas connector a 403 from the live API. Fortnox tolerates an
+    /// anonymous client today; it need not keep doing so.
+    #[tokio::test]
+    async fn every_request_identifies_the_client_by_user_agent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/vouchers"))
+            .and(header("user-agent", ea_core::http::USER_AGENT))
+            .respond_with(json(serde_json::json!({ "Vouchers": [] }), 200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _refresh, _store) = client_for(&server);
+        client
+            .get("vouchers", &[])
+            .await
+            .expect("the User-Agent header must be present");
+    }
 
     #[tokio::test]
     async fn get_adds_bearer_auth_the_base_url_and_the_query_and_returns_parsed_json() {

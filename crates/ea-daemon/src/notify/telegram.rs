@@ -757,6 +757,8 @@ impl TelegramTransport {
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(timeout)
             .build()
             .context("building the HTTPS client for the Telegram Bot API")?;
@@ -1754,6 +1756,30 @@ record_voucher = "approve"
     // wrong: a message with `reply_markup` spelled anything else arrives with
     // no buttons at all, and nothing in the daemon would ever notice. These two
     // tests point it at a local stub. Nothing here reaches Telegram.
+
+    /// `reqwest` sends no `User-Agent` at all by default, which is what got
+    /// the Canvas connector a 403 from the live API. The Bot API tolerates an
+    /// anonymous client today; it need not keep doing so.
+    #[tokio::test]
+    async fn the_transport_identifies_the_client_by_user_agent() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:TOKEN/sendMessage"))
+            .and(header("user-agent", ea_core::http::USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        TelegramTransport::with_base_url(server.uri(), "123456:TOKEN", -42)
+            .unwrap()
+            .send("Approve this action?", &[])
+            .await
+            .expect("the User-Agent header must be present");
+    }
 
     #[tokio::test]
     async fn the_transport_posts_the_bot_api_shape_telegram_expects() {

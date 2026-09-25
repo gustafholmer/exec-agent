@@ -432,6 +432,8 @@ impl GmailClient {
         base.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // No redirects, ever: a same-host https->http downgrade would
             // otherwise carry the bearer access token onto the wire in clear

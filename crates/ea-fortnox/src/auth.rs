@@ -420,6 +420,8 @@ impl OAuthClient {
         token_url: &str,
     ) -> Result<Self, FortnoxError> {
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // See the module docs: the body carries the client secret and the
             // refresh token, and no redirect policy protects a body.

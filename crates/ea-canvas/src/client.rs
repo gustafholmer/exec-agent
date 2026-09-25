@@ -292,6 +292,8 @@ impl CanvasClient {
         base.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // Redirects are never followed. reqwest's default policy strips
             // `Authorization` when the host or port changes but not when the
@@ -650,6 +652,29 @@ mod tests {
             .expect("an empty course list is a success");
         // `expect(1)` above is checked on drop: without the header matchers
         // the request would not match and the call would 404 instead.
+    }
+
+    /// canvas.kth.se refuses a request that carries no `User-Agent`, with an
+    /// HTTP 403 whose HTML body says "You are not authorized to access this
+    /// site because you have not provided a valid user agent." `reqwest`
+    /// sends no `User-Agent` of its own, so the header has to be set.
+    #[tokio::test]
+    async fn every_request_identifies_the_client_by_user_agent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/courses"))
+            .and(header("user-agent", ea_core::http::USER_AGENT))
+            .respond_with(json_page(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .list_courses()
+            .await
+            .expect("an empty course list is a success");
+        // `expect(1)` is checked on drop: with no `User-Agent` on the wire
+        // the mock does not match and the call 404s instead.
     }
 
     #[tokio::test]

@@ -75,9 +75,16 @@ the connector silently green for the rest of term.
 
 ## Smoke test
 
-> **Unverified against the live Canvas API.** Every test in this crate runs
-> against `wiremock`; no test contacts Canvas. The first person with a real
-> token should run this and check the shapes.
+> **Verified against the live Canvas API on 2026-09-25** (`canvas.kth.se`).
+> `list_courses` returned ten courses and `watch_poll` five assignment events,
+> both with the shapes this crate expects. Every *test* here still runs against
+> `wiremock` and none contacts Canvas, so a shape change at the vendor would
+> not fail the suite — it would fail the next real poll.
+>
+> That run also found the only defect real traffic has exposed so far: Canvas
+> answers **403** to any request without a `User-Agent`, and `reqwest` sends
+> none by default. Every client in this workspace now sets one; see the failure
+> guide below.
 
 With credentials in place, talk to the connector directly over stdio — it is an
 ordinary MCP server, so two JSON-RPC lines are enough:
@@ -106,6 +113,15 @@ Failure reading guide:
   redirect or a maintenance page. Check `baseUrl` and the token.
 - `no Canvas credentials at …` — the file is missing; the message carries the
   commands to create it.
+- `HTTP 403 Forbidden` whose body is HTML saying *"You are not authorized to
+  access this site because you have not provided a valid user agent"* — the
+  request reached Canvas without a `User-Agent` header. `canvas.kth.se`
+  rejects those outright, and the message says nothing about your token, so
+  the 403 reads like a permissions problem when it is not. Every client in
+  this workspace now sends `exec-agent/<version>`
+  (`ea_core::http::USER_AGENT`), so this should not recur from the connector
+  — but a `curl` you write by hand will hit it, and `curl -A exec-agent/0.1`
+  is the fix.
 
 ## Notes on the Canvas API
 
