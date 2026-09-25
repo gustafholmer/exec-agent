@@ -346,7 +346,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// only symptom is that nothing ever happens again. Both are reported for
     /// every job, so a failing-but-not-yet-tripped connector is visible too.
     pub async fn status(&self, _params: Value) -> anyhow::Result<Value> {
-        let pending = self.actions.pending()?;
+        let pending = self.actions.pending().await?;
         let jobs: Vec<Value> = self
             .scheduler
             .names()
@@ -457,7 +457,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
 
     /// `queue` — the proposals waiting for a human.
     pub async fn queue(&self, _params: Value) -> anyhow::Result<Value> {
-        let pending = self.actions.pending()?;
+        let pending = self.actions.pending().await?;
         serde_json::to_value(pending).context("queue: serialising the pending actions")
     }
 
@@ -621,7 +621,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         let params: IdParams = parse_params("approve", params)?;
         // Propagates "action N does not exist" and "action N is executed, not
         // proposed" straight from the store, which is what the CLI shows.
-        self.actions.approve(params.id)?;
+        self.actions.approve(params.id).await?;
         let action = self.executor.execute_approved(params.id).await?;
         serde_json::to_value(action).context("approve: serialising the action")
     }
@@ -633,7 +633,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         let reason = params
             .reason
             .unwrap_or_else(|| "rejected by the user".into());
-        let action = self.actions.reject(params.id, &reason)?;
+        let action = self.actions.reject(params.id, &reason).await?;
         serde_json::to_value(action).context("reject: serialising the action")
     }
 
@@ -862,7 +862,6 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
         pool: sqlx::PgPool,
         daemon: Arc<Daemon<SpyCaller>>,
         log: CallLog,
@@ -885,17 +884,13 @@ record_voucher = "approve"
         }
 
         fn build(pool: sqlx::PgPool, with_sessions: bool, budget: u32) -> Self {
-            let dir = TempDir::new().unwrap();
-            let conn = Arc::new(Mutex::new(
-                ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-            ));
             let sessions = with_sessions.then(|| {
                 FakeSessions::new("here is your answer", RunStore::new(pool.clone()))
             });
             let caller = SpyCaller::default();
             let log = Arc::clone(&caller.calls);
             let executor = Arc::new(Executor::new(
-                ActionStore::new(Arc::clone(&conn)),
+                ActionStore::new(pool.clone()),
                 RunStore::new(pool.clone()),
                 policy(),
                 caller,
@@ -925,7 +920,7 @@ record_voucher = "approve"
 
             let daemon = Daemon::build(Deps {
                 executor,
-                actions: ActionStore::new(Arc::clone(&conn)),
+                actions: ActionStore::new(pool.clone()),
                 events: EventStore::new(pool.clone()),
                 runs: RunStore::new(pool.clone()),
                 scheduler: Arc::clone(&scheduler),
@@ -939,7 +934,6 @@ record_voucher = "approve"
             });
 
             Self {
-                _dir: dir,
                 pool,
                 daemon,
                 log,

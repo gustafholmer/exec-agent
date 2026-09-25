@@ -306,6 +306,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
         expired: deps
             .actions
             .expire_stale(now)
+            .await
             .context("expiring stale proposals")?,
         ..TriageSummary::default()
     };
@@ -536,8 +537,6 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use ea_core::store::actions::ProposeInput;
     use ea_core::store::kv::KvStore;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
 
     use ea_core::store::runs::RunStore;
 
@@ -691,12 +690,6 @@ mod tests {
     }
 
     // -- fixtures -----------------------------------------------------------
-
-    fn db(dir: &TempDir) -> Arc<Mutex<Connection>> {
-        Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ))
-    }
 
     fn canvas_policy() -> Policy {
         Policy::parse("[canvas]\nwatch_poll = \"auto\"\n").unwrap()
@@ -887,7 +880,6 @@ mod tests {
     // -- triage -------------------------------------------------------------
 
     struct TriageFixture {
-        _dir: TempDir,
         pool: sqlx::PgPool,
         deps: TriageDeps,
         runs: RunStore,
@@ -906,10 +898,8 @@ mod tests {
         with_sessions: bool,
         failing_pusher: bool,
     ) -> TriageFixture {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
         let events = EventStore::new(pool.clone());
-        let actions = ActionStore::new(Arc::clone(&conn));
+        let actions = ActionStore::new(pool.clone());
         let runs = RunStore::new(pool.clone());
         let log = NotificationLog::new(KvStore::new(pool.clone()));
         let pusher = Arc::new(SpyPusher {
@@ -930,7 +920,6 @@ mod tests {
         };
 
         TriageFixture {
-            _dir: dir,
             pool,
             deps,
             runs,
@@ -984,6 +973,7 @@ mod tests {
                 rationale: "y".into(),
                 ttl: ChronoDuration::seconds(1),
             })
+            .await
             .unwrap();
 
         let summary = run_triage(&f.deps, Utc::now() + ChronoDuration::hours(2))
@@ -991,7 +981,7 @@ mod tests {
             .unwrap();
         assert_eq!(summary.expired, 1);
         assert_eq!(
-            f.actions.get(action.id).unwrap().unwrap().status.as_str(),
+            f.actions.get(action.id).await.unwrap().unwrap().status.as_str(),
             "expired"
         );
     }
@@ -1229,8 +1219,6 @@ mod tests {
     /// exactly like a pass with nothing to score.
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn triage_stops_running_tier_1_once_the_budget_is_spent(pool: sqlx::PgPool) {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
         let events = EventStore::new(pool.clone());
         let runs = RunStore::new(pool.clone());
         let sessions = ScoringTier1::new(runs.clone());
@@ -1240,7 +1228,7 @@ mod tests {
         });
         let deps = TriageDeps {
             events: events.clone(),
-            actions: ActionStore::new(Arc::clone(&conn)),
+            actions: ActionStore::new(pool.clone()),
             sessions: Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
             log: NotificationLog::new(KvStore::new(pool)),

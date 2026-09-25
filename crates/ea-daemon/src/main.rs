@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = Arc::new(Registry::new(manifests.clone()));
     let executor = Arc::new(Executor::new(
-        ActionStore::new(Arc::clone(&conn)),
+        ActionStore::new(pool.clone()),
         RunStore::new(pool.clone()),
         policy.clone(),
         Arc::clone(&registry),
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         let notifier = Arc::new(
             Notifier::new(
                 TelegramTransport::from_config(&credentials)?,
-                ActionStore::new(Arc::clone(&conn)),
+                ActionStore::new(pool.clone()),
                 Arc::clone(&executor),
                 credentials.owner_id,
             )
@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     // resolved as failed-with-unknown-outcome and never retried. See
     // `recovery`.
     ea_daemon::recovery::sweep_stranded(
-        &ActionStore::new(Arc::clone(&conn)),
+        &ActionStore::new(pool.clone()),
         &NotificationLog::new(KvStore::new(pool.clone())),
         pusher.as_ref(),
     )
@@ -236,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         config.triage_interval,
         Arc::new(TriageDeps {
             events: EventStore::new(pool.clone()),
-            actions: ActionStore::new(Arc::clone(&conn)),
+            actions: ActionStore::new(pool.clone()),
             sessions: sessions.clone(),
             pusher: pusher.clone(),
             log: NotificationLog::new(KvStore::new(pool.clone())),
@@ -288,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
     // --- the socket --------------------------------------------------------
     let daemon = Daemon::build(Deps {
         executor,
-        actions: ActionStore::new(Arc::clone(&conn)),
+        actions: ActionStore::new(pool.clone()),
         events: EventStore::new(pool.clone()),
         runs: RunStore::new(pool.clone()),
         scheduler: Arc::clone(&scheduler),

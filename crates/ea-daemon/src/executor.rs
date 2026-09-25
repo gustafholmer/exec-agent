@@ -183,19 +183,19 @@ impl<C: ToolCaller> Executor<C> {
         // Decided before the action exists: nothing about the stored row can
         // influence whether the connector is reached.
         let decision = self.policy.decide(&input.connector, &input.tool);
-        let action = self.actions.propose(input)?;
+        let action = self.actions.propose(input).await?;
 
         match decision.mode {
             Mode::Deny => Ok((
                 self.actions.reject(
                     action.id,
                     &format!("policy denies this tool: {}", decision.reason),
-                )?,
+                ).await?,
                 false,
             )),
             Mode::Approve => Ok((action, false)),
             Mode::Auto => {
-                self.actions.approve(action.id)?;
+                self.actions.approve(action.id).await?;
                 Ok((self.run(action.id).await?, true))
             }
         }
@@ -245,7 +245,8 @@ impl<C: ToolCaller> Executor<C> {
 
         let action = self
             .actions
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| anyhow!("action {id} does not exist"))?;
         if action.status != ActionStatus::Approved {
             bail!(
@@ -265,7 +266,7 @@ impl<C: ToolCaller> Executor<C> {
 
         // The last thing before the side effect, and the only thing between
         // this line and the connector call.
-        if !self.actions.claim_for_execution(id)? {
+        if !self.actions.claim_for_execution(id).await? {
             let detail = format!(
                 "action {id} is already claimed for execution \
                  (approved with a non-null executed_at); refusing to call the connector again"
@@ -283,12 +284,12 @@ impl<C: ToolCaller> Executor<C> {
 
         let (updated, outcome, detail) = match called {
             Ok(result) => {
-                let updated = self.actions.mark_executed(id, &result);
+                let updated = self.actions.mark_executed(id, &result).await;
                 (updated, "ok", result)
             }
             Err(err) => {
                 let message = format!("{err:#}");
-                let updated = self.actions.mark_failed(id, &message);
+                let updated = self.actions.mark_failed(id, &message).await;
                 (updated, "error", message)
             }
         };
@@ -328,20 +329,40 @@ mod tests {
     use std::time::Duration;
 
     use ea_core::store::actions::ActionStatus;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
 
     use super::*;
 
-    /// `ea_core::store::test_support::temp_store` is `#[cfg(test)]
-    /// pub(crate)`, so it does not exist in the compiled `ea-core` this crate
-    /// links against. Rather than widen ea-core's public surface for a test
-    /// helper, this is the same three lines against the public
-    /// `db::sqlite::open`.
-    fn temp_store() -> (TempDir, Arc<Mutex<Connection>>) {
-        let dir = TempDir::new().unwrap();
-        let conn = ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(Mutex::new(conn)))
+    /// Make every write to `actions` fail, the way a real store fault would:
+    /// a statement-level trigger that raises on any INSERT, UPDATE or DELETE.
+    /// Each `#[sqlx::test]` has its own database, so this DDL is invisible to
+    /// every other test. `runs` is deliberately left writable.
+    async fn break_the_actions_store(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION actions_readonly() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+               RAISE EXCEPTION 'the actions store is readonly';
+             END $$",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER actions_readonly
+             BEFORE INSERT OR UPDATE OR DELETE ON actions
+             FOR EACH STATEMENT EXECUTE FUNCTION actions_readonly()",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The operator fixes the store: undo [`break_the_actions_store`].
+    async fn repair_the_actions_store(pool: &sqlx::PgPool) {
+        sqlx::query("DROP TRIGGER actions_readonly ON actions")
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     #[derive(Clone)]
@@ -360,18 +381,19 @@ mod tests {
         /// Held across the await so two concurrent executions genuinely
         /// overlap in the concurrency test.
         delay: Duration,
-        /// The sqlite actions store, for the test that needs to break it --
-        /// from *inside* the connector call. That instant is the one the
-        /// finding is about: the side effect has landed and nothing has been
-        /// recorded yet.
-        db: Option<Arc<Mutex<Connection>>>,
+        /// The Postgres pool backing the actions store, for the test that
+        /// needs to break it -- from *inside* the connector call. That instant
+        /// is the one the finding is about: the side effect has landed and
+        /// nothing has been recorded yet.
+        db: Option<sqlx::PgPool>,
         /// The Postgres pool backing `runs`, for the test that needs to see
         /// the `running` row mid-call.
         runs_pool: Option<sqlx::PgPool>,
         /// `runs` rows as they looked mid-call: (outcome, action_ids).
         runs_mid_call: Mutex<Vec<(String, Vec<i64>)>>,
-        /// Flip the connection read-only just before returning, so every store
-        /// write after the call fails the way a real store fault would.
+        /// Make the actions table refuse writes just before returning, so
+        /// every actions write after the call fails the way a real store
+        /// fault would.
         poison_db: bool,
     }
 
@@ -409,8 +431,8 @@ mod tests {
 
         /// Make the actions store read-only, so the store writes that follow
         /// a *successful* call all fail.
-        fn poisoning_db(mut self, conn: Arc<Mutex<Connection>>) -> Self {
-            self.db = Some(conn);
+        fn poisoning_db(mut self, pool: sqlx::PgPool) -> Self {
+            self.db = Some(pool);
             self.poison_db = true;
             self
         }
@@ -445,10 +467,7 @@ mod tests {
 
             if self.poison_db {
                 if let Some(db) = &self.db {
-                    db.lock()
-                        .unwrap()
-                        .pragma_update(None, "query_only", true)
-                        .unwrap();
+                    break_the_actions_store(db).await;
                 }
             }
 
@@ -494,21 +513,16 @@ record_voucher = "approve"
     }
 
     struct Harness {
-        _dir: TempDir,
         actions: ActionStore,
-        conn: Arc<Mutex<Connection>>,
         pool: sqlx::PgPool,
     }
 
     fn harness(pool: sqlx::PgPool) -> (Harness, ActionStore, RunStore) {
-        let (dir, conn) = temp_store();
         let h = Harness {
-            _dir: dir,
-            actions: ActionStore::new(conn.clone()),
-            conn: conn.clone(),
+            actions: ActionStore::new(pool.clone()),
             pool: pool.clone(),
         };
-        (h, ActionStore::new(conn), RunStore::new(pool))
+        (h, ActionStore::new(pool.clone()), RunStore::new(pool))
     }
 
     impl Harness {
@@ -536,7 +550,7 @@ record_voucher = "approve"
         assert_eq!(action.status, ActionStatus::Executed);
         assert_eq!(action.result.as_deref(), Some("done"));
         assert_eq!(
-            h.actions.get(action.id).unwrap().unwrap().status,
+            h.actions.get(action.id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
 
@@ -560,7 +574,7 @@ record_voucher = "approve"
             ex.caller().calls().is_empty(),
             "an action awaiting a human must not touch the connector"
         );
-        assert_eq!(h.actions.pending().unwrap().len(), 1);
+        assert_eq!(h.actions.pending().await.unwrap().len(), 1);
         assert!(
             h.runs_rows().await.is_empty(),
             "nothing ran, so nothing to record"
@@ -696,7 +710,7 @@ record_voucher = "approve"
         assert!(ex.caller().calls().is_empty());
 
         // The human taps approve; only then does the executor get to run it.
-        h.actions.approve(queued.id).unwrap();
+        h.actions.approve(queued.id).await.unwrap();
         let done = ex.execute_approved(queued.id).await.unwrap();
 
         assert_eq!(done.status, ActionStatus::Executed);
@@ -721,7 +735,7 @@ record_voucher = "approve"
             "an unapproved action must never reach the connector"
         );
         assert_eq!(
-            h.actions.get(queued.id).unwrap().unwrap().status,
+            h.actions.get(queued.id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "and the executor must not approve it on the way past"
         );
@@ -746,12 +760,12 @@ record_voucher = "approve"
         let ex = Executor::new(actions, runs, policy(), FakeCaller::ok());
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
-        h.actions.approve(queued.id).unwrap();
+        h.actions.approve(queued.id).await.unwrap();
 
         // Somebody already owns this execution: the previous process before it
         // died, a sibling daemon, a recovery job. The row is still `approved`,
         // which is exactly the state that used to look safe to re-run.
-        assert!(h.actions.claim_for_execution(queued.id).unwrap());
+        assert!(h.actions.claim_for_execution(queued.id).await.unwrap());
 
         let err = ex
             .execute_approved(queued.id)
@@ -763,7 +777,7 @@ record_voucher = "approve"
             "a claimed action must make zero connector calls"
         );
         assert_eq!(
-            h.actions.get(queued.id).unwrap().unwrap().status,
+            h.actions.get(queued.id).await.unwrap().unwrap().status,
             ActionStatus::Approved,
             "and the refusal must not rewrite the half-state"
         );
@@ -785,11 +799,11 @@ record_voucher = "approve"
             actions,
             runs,
             policy(),
-            FakeCaller::ok().poisoning_db(h.conn.clone()),
+            FakeCaller::ok().poisoning_db(h.pool.clone()),
         );
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
-        h.actions.approve(queued.id).unwrap();
+        h.actions.approve(queued.id).await.unwrap();
 
         let err = ex
             .execute_approved(queued.id)
@@ -803,13 +817,9 @@ record_voucher = "approve"
         );
 
         // The operator fixes the store / the daemon restarts.
-        h.conn
-            .lock()
-            .unwrap()
-            .pragma_update(None, "query_only", false)
-            .unwrap();
+        repair_the_actions_store(&h.pool).await;
 
-        let row = h.actions.get(queued.id).unwrap().unwrap();
+        let row = h.actions.get(queued.id).await.unwrap().unwrap();
         assert_eq!(
             row.status,
             ActionStatus::Approved,
@@ -820,7 +830,7 @@ record_voucher = "approve"
             "but the claim did, before the call — that is the whole fix"
         );
         assert!(
-            !h.actions.claim_for_execution(queued.id).unwrap(),
+            !h.actions.claim_for_execution(queued.id).await.unwrap(),
             "nobody may claim it again"
         );
 
@@ -853,7 +863,7 @@ record_voucher = "approve"
         );
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
-        h.actions.approve(queued.id).unwrap();
+        h.actions.approve(queued.id).await.unwrap();
 
         let outcome =
             tokio::time::timeout(Duration::from_millis(30), ex.execute_approved(queued.id)).await;
@@ -867,7 +877,7 @@ record_voucher = "approve"
             "the connector call had already started"
         );
 
-        let row = h.actions.get(queued.id).unwrap().unwrap();
+        let row = h.actions.get(queued.id).await.unwrap().unwrap();
         assert_eq!(row.status, ActionStatus::Approved);
         assert!(
             row.executed_at.is_some(),
@@ -946,7 +956,7 @@ record_voucher = "approve"
         ));
 
         let (queued, _) = ex.submit(input("fortnox", "record_voucher")).await.unwrap();
-        h.actions.approve(queued.id).unwrap();
+        h.actions.approve(queued.id).await.unwrap();
 
         let succeeded = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
@@ -970,7 +980,7 @@ record_voucher = "approve"
         );
         assert_eq!(succeeded.load(Ordering::SeqCst), 1);
         assert_eq!(
-            h.actions.get(queued.id).unwrap().unwrap().status,
+            h.actions.get(queued.id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
         let rows: i64 = sqlx::query_scalar(

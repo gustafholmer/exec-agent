@@ -347,7 +347,8 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     pub async fn push_action(&self, id: i64) -> anyhow::Result<()> {
         let action = self
             .actions
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| anyhow!("action {id} does not exist"))?;
         if action.status != ActionStatus::Proposed {
             bail!(
@@ -359,7 +360,11 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
         let text = truncate(
             &format!(
                 "Approve this action?\n\n#{id} · {}.{}\n\n{}\n\nWhy: {}\n\nExpires: {}",
-                action.connector, action.tool, action.preview, action.rationale, action.expires_at,
+                action.connector,
+                action.tool,
+                action.preview,
+                action.rationale,
+                action.expires_at.to_rfc3339(),
             ),
             MAX_MESSAGE_BYTES,
         );
@@ -422,7 +427,7 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 
         match parse_callback(data) {
             Some(Callback::Approve(id)) => self.approve(id).await,
-            Some(Callback::Reject(id)) => self.reject(id),
+            Some(Callback::Reject(id)) => self.reject(id).await,
             None => {
                 // Not an error: old buttons from a previous build, or someone
                 // poking the bot. Deliberately does not echo `data` back.
@@ -483,12 +488,12 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     /// UPDATE, so of two concurrent taps exactly one proceeds to the executor.
     /// No extra lock here — see the module docs.
     async fn approve(&self, id: i64) -> String {
-        if let Err(err) = self.actions.approve(id) {
+        if let Err(err) = self.actions.approve(id).await {
             // Almost always the losing half of a double tap, occasionally an
             // expired proposal. Either way the row itself is the authority on
             // what to say, so read it rather than surfacing this error.
             tracing::debug!(action = id, error = %err, "approve transition did not apply");
-            return self.already_handled(id);
+            return self.already_handled(id).await;
         }
 
         match self.executor.execute_approved(id).await {
@@ -508,12 +513,12 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 
     /// Reject. Nothing is executed and the connector is never reached — there
     /// is no call to the executor on this path at all.
-    fn reject(&self, id: i64) -> String {
-        match self.actions.reject(id, "rejected from Telegram") {
+    async fn reject(&self, id: i64) -> String {
+        match self.actions.reject(id, "rejected from Telegram").await {
             Ok(_) => format!("Rejected #{id}. Nothing was called."),
             Err(err) => {
                 tracing::debug!(action = id, error = %err, "reject transition did not apply");
-                self.already_handled(id)
+                self.already_handled(id).await
             }
         }
     }
@@ -537,8 +542,8 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     /// This is the double-tap loser's reply, and the reason it reads the row
     /// back instead of formatting the transition error: a person holding a
     /// phone needs "already handled", not a status-machine diagnostic.
-    fn already_handled(&self, id: i64) -> String {
-        match self.actions.get(id) {
+    async fn already_handled(&self, id: i64) -> String {
+        match self.actions.get(id).await {
             Ok(Some(action)) => match action.status {
                 // The transition failed but the row still looks decidable.
                 // Rare — a store fault rather than a race.
@@ -1100,7 +1105,6 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
         notifier: Notifier<FakeTransport, FakeCaller>,
         sent: Arc<Mutex<Vec<Sent>>>,
         calls: Arc<Mutex<Vec<(String, String, Value)>>>,
@@ -1108,11 +1112,6 @@ record_voucher = "approve"
     }
 
     fn fixture_with_delay(pool: sqlx::PgPool, delay: Duration) -> Fixture {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
-
         let transport = FakeTransport::default();
         let sent = transport.sent.clone();
         let caller = FakeCaller {
@@ -1122,18 +1121,17 @@ record_voucher = "approve"
         let calls = caller.calls.clone();
 
         let executor = Arc::new(Executor::new(
-            ActionStore::new(conn.clone()),
-            RunStore::new(pool),
+            ActionStore::new(pool.clone()),
+            RunStore::new(pool.clone()),
             policy(),
             caller,
         ));
 
         Fixture {
-            _dir: dir,
-            notifier: Notifier::new(transport, ActionStore::new(conn.clone()), executor, OWNER),
+            notifier: Notifier::new(transport, ActionStore::new(pool.clone()), executor, OWNER),
             sent,
             calls,
-            actions: ActionStore::new(conn),
+            actions: ActionStore::new(pool),
         }
     }
 
@@ -1224,7 +1222,7 @@ record_voucher = "approve"
         (f, chat)
     }
 
-    fn propose(actions: &ActionStore) -> i64 {
+    async fn propose(actions: &ActionStore) -> i64 {
         actions
             .propose(ProposeInput {
                 connector: "fortnox".into(),
@@ -1234,6 +1232,7 @@ record_voucher = "approve"
                 rationale: "the receipt arrived by mail".into(),
                 ttl: chrono::Duration::hours(24),
             })
+            .await
             .unwrap()
             .id
     }
@@ -1256,7 +1255,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn pushing_an_action_carries_the_preview_and_both_callback_ids(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         f.notifier.push_action(id).await.unwrap();
 
@@ -1283,7 +1282,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn an_approve_callback_approves_and_executes(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier
@@ -1292,7 +1291,7 @@ record_voucher = "approve"
 
         assert!(reply.contains("Executed"), "{reply}");
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
 
@@ -1306,7 +1305,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_reject_callback_rejects_and_never_reaches_the_connector(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier
@@ -1314,7 +1313,7 @@ record_voucher = "approve"
             .await;
 
         assert!(reply.contains("Rejected"), "{reply}");
-        let action = f.actions.get(id).unwrap().unwrap();
+        let action = f.actions.get(id).await.unwrap().unwrap();
         assert_eq!(action.status, ActionStatus::Rejected);
         assert!(action.reason.is_some(), "a rejection must record why");
         assert!(
@@ -1343,7 +1342,7 @@ record_voucher = "approve"
         let f = fixture(pool);
         // A real action exists, so a payload that *nearly* parses cannot be
         // dismissed just because the store is empty.
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let malformed = [
             "",
@@ -1380,7 +1379,7 @@ record_voucher = "approve"
             "malformed callback data must never reach a connector"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "and must never move a real action"
         );
@@ -1397,7 +1396,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_double_tapped_approve_executes_exactly_once(pool: sqlx::PgPool) {
         let f = fixture_with_delay(pool, Duration::from_millis(50));
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         // Bound to locals rather than inlined: `tokio::join!` holds both
         // futures past the end of the statement, so a `&format!(..)` temporary
@@ -1428,7 +1427,7 @@ record_voucher = "approve"
             "a raw store diagnostic reached the human: {replies}"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
     }
@@ -1448,7 +1447,7 @@ record_voucher = "approve"
         };
         let pool = ea_core::db::connect(&url).await.expect("a live database");
         let f = Arc::new(fixture_with_delay(pool, Duration::from_millis(50)));
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let one = {
             let f = f.clone();
@@ -1480,7 +1479,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn approving_an_already_rejected_action_changes_nothing(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         f.notifier
             .handle_callback(OWNER, &format!("reject:{id}"))
@@ -1493,7 +1492,7 @@ record_voucher = "approve"
         assert!(reply.contains("already handled: rejected"), "{reply}");
         assert!(f.calls.lock().unwrap().is_empty());
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Rejected
         );
     }
@@ -1501,8 +1500,8 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn pushing_an_already_decided_action_is_refused(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
-        f.actions.reject(id, "no").unwrap();
+        let id = propose(&f.actions).await;
+        f.actions.reject(id, "no").await.unwrap();
 
         assert!(f.notifier.push_action(id).await.is_err());
         assert!(
@@ -1544,7 +1543,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_callback_from_anyone_but_the_owner_does_nothing(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         for data in [format!("approve:{id}"), format!("reject:{id}")] {
             let reply = f.notifier.handle_callback(STRANGER, &data).await;
@@ -1578,7 +1577,7 @@ record_voucher = "approve"
             "a non-owner tap must make zero connector calls"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "a non-owner tap must not move the action"
         );
@@ -1591,7 +1590,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_wrong_sender_and_malformed_data_get_byte_identical_replies(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let malformed_from_owner = f.notifier.handle_callback(OWNER, "nonsense").await;
         let valid_from_stranger = f
@@ -1615,7 +1614,7 @@ record_voucher = "approve"
 
         assert!(f.calls.lock().unwrap().is_empty());
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed
         );
     }
@@ -1624,7 +1623,7 @@ record_voucher = "approve"
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn the_owner_still_approves_exactly_as_before(pool: sqlx::PgPool) {
         let f = fixture(pool);
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier

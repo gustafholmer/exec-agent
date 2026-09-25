@@ -761,12 +761,11 @@ impl SessionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     use ea_core::policy::Policy;
     use ea_core::store::actions::ActionStore;
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use crate::executor::{Executor, ToolCaller};
@@ -1518,7 +1517,7 @@ mod tests {
     ///
     /// The whole stack is real: a daemon on a temp socket, the real
     /// `ea-propose` binary spawned by the real CLI as an MCP server, the real
-    /// policy gate, and a real sqlite file. Only the connector is absent, and
+    /// policy gate, and a real Postgres database. Only the connector is absent, and
     /// deliberately: the policy queues the action for a human, so
     /// [`NeverCalls`] asserts nothing executed.
     ///
@@ -1550,20 +1549,26 @@ mod tests {
             ),
         );
 
-        let conn: Arc<Mutex<Connection>> = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&state.join("state.db")).unwrap(),
-        ));
-        // `kv` is on Postgres; the rest of this test's stores are still on the
-        // transitional sqlite database above. See `common-context.md`'s
-        // `DATABASE_URL` for how this is reached when the test is run.
+        // Every store this test touches is on Postgres. A multi-thread test
+        // cannot use `#[sqlx::test]`, so it connects to the shared
+        // `DATABASE_URL` database, and must not assume it is empty.
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set to run this ignored test");
         let pool = ea_core::db::connect(&database_url)
             .await
             .expect("connecting to the state database");
-        let actions = ActionStore::new(Arc::clone(&conn));
+        let actions = ActionStore::new(pool.clone());
+        // The shared database may already hold proposals from other runs, so
+        // only rows that appear during this session count.
+        let already_pending: Vec<i64> = actions
+            .pending()
+            .await
+            .expect("reading the actions table")
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
         let executor = Executor::new(
-            ActionStore::new(Arc::clone(&conn)),
+            ActionStore::new(pool.clone()),
             RunStore::new(pool.clone()),
             Policy::parse("[notes]\nadd_note = \"approve\"\n").unwrap(),
             NeverCalls,
@@ -1571,7 +1576,7 @@ mod tests {
         let mut server = crate::ipc::Server::new(&socket);
         crate::daemon::Daemon::build(crate::daemon::Deps {
             executor: Arc::new(executor),
-            actions: ActionStore::new(Arc::clone(&conn)),
+            actions: ActionStore::new(pool.clone()),
             events: ea_core::store::events::EventStore::new(pool.clone()),
             runs: RunStore::new(pool.clone()),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
@@ -1630,7 +1635,13 @@ mod tests {
             }
         };
 
-        let pending = actions.pending().expect("reading the actions table");
+        let pending: Vec<_> = actions
+            .pending()
+            .await
+            .expect("reading the actions table")
+            .into_iter()
+            .filter(|a| !already_pending.contains(&a.id))
+            .collect();
         daemon.shutdown().await;
 
         assert_eq!(

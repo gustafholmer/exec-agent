@@ -1452,7 +1452,6 @@ mod end_to_end {
     use ea_core::policy::Policy;
     use ea_core::store::actions::{ActionStore, ProposeInput};
     use ea_core::store::runs::RunStore;
-    use tempfile::TempDir;
 
     use super::tests_support::*;
     use super::*;
@@ -1468,7 +1467,6 @@ mod end_to_end {
     type RealLoop = UpdateLoop<Arc<ScriptedSource>, Arc<Notifier<RecordingTransport, SpyCaller>>>;
 
     struct Harness {
-        _dir: TempDir,
         actions: ActionStore,
         calls: Arc<Mutex<Vec<(String, String)>>>,
         notifier: Arc<Notifier<RecordingTransport, SpyCaller>>,
@@ -1497,14 +1495,10 @@ mod end_to_end {
     }
 
     fn harness(pool: sqlx::PgPool) -> Harness {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
         let caller = SpyCaller::default();
         let calls = Arc::clone(&caller.calls);
         let executor = Arc::new(Executor::new(
-            ActionStore::new(Arc::clone(&conn)),
+            ActionStore::new(pool.clone()),
             RunStore::new(pool.clone()),
             Policy::parse("[fortnox]\nrecord_voucher = \"approve\"\n").unwrap(),
             caller,
@@ -1526,15 +1520,14 @@ mod end_to_end {
         let notifier = Arc::new(
             Notifier::new(
                 RecordingTransport::default(),
-                ActionStore::new(Arc::clone(&conn)),
+                ActionStore::new(pool.clone()),
                 executor,
                 OWNER,
             )
             .with_chat(chat as Arc<dyn crate::chat::ChatResponder>),
         );
         Harness {
-            _dir: dir,
-            actions: ActionStore::new(Arc::clone(&conn)),
+            actions: ActionStore::new(pool.clone()),
             calls,
             notifier,
             pool,
@@ -1543,7 +1536,7 @@ mod end_to_end {
     }
 
     impl Harness {
-        fn propose(&self) -> i64 {
+        async fn propose(&self) -> i64 {
             self.actions
                 .propose(ProposeInput {
                     connector: "fortnox".into(),
@@ -1553,6 +1546,7 @@ mod end_to_end {
                     rationale: "the invoice arrived".into(),
                     ttl: ChronoDuration::hours(24),
                 })
+                .await
                 .unwrap()
                 .id
         }
@@ -1569,9 +1563,10 @@ mod end_to_end {
             (source, lp)
         }
 
-        fn status(&self, id: i64) -> String {
+        async fn status(&self, id: i64) -> String {
             self.actions
                 .get(id)
+                .await
                 .unwrap()
                 .unwrap()
                 .status
@@ -1671,12 +1666,12 @@ mod end_to_end {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn the_owners_tap_approves_and_executes(pool: sqlx::PgPool) {
         let h = harness(pool);
-        let id = h.propose();
+        let id = h.propose().await;
         let (source, lp) = h.drive(vec![press(1, OWNER, &format!("approve:{id}"))]);
 
         lp.poll_once().await.unwrap();
 
-        assert_eq!(h.status(id), "executed");
+        assert_eq!(h.status(id).await, "executed");
         assert_eq!(
             *h.calls.lock().unwrap(),
             vec![("fortnox".to_string(), "record_voucher".to_string())]
@@ -1693,13 +1688,13 @@ mod end_to_end {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_strangers_tap_changes_nothing_and_says_nothing(pool: sqlx::PgPool) {
         let h = harness(pool);
-        let id = h.propose();
+        let id = h.propose().await;
         let (source, lp) = h.drive(vec![press(1, STRANGER, &format!("approve:{id}"))]);
 
         lp.poll_once().await.unwrap();
 
         assert_eq!(
-            h.status(id),
+            h.status(id).await,
             "proposed",
             "a stranger must not decide anything"
         );
@@ -1717,12 +1712,12 @@ mod end_to_end {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn the_owners_reject_never_calls_the_connector(pool: sqlx::PgPool) {
         let h = harness(pool);
-        let id = h.propose();
+        let id = h.propose().await;
         let (_source, lp) = h.drive(vec![press(1, OWNER, &format!("reject:{id}"))]);
 
         lp.poll_once().await.unwrap();
 
-        assert_eq!(h.status(id), "rejected");
+        assert_eq!(h.status(id).await, "rejected");
         assert!(h.calls.lock().unwrap().is_empty());
     }
 
@@ -1735,7 +1730,7 @@ mod end_to_end {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_redelivered_tap_does_not_execute_twice(pool: sqlx::PgPool) {
         let h = harness(pool);
-        let id = h.propose();
+        let id = h.propose().await;
         let data = format!("approve:{id}");
         let (source, lp) = h.drive(vec![press(1, OWNER, &data), press(1, OWNER, &data)]);
 
@@ -1754,6 +1749,6 @@ mod end_to_end {
              to answer: {:?}",
             source.answers()
         );
-        assert_eq!(h.status(id), "executed");
+        assert_eq!(h.status(id).await, "executed");
     }
 }
