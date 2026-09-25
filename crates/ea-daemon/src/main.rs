@@ -228,14 +228,14 @@ async fn main() -> anyhow::Result<()> {
             manifest.name.clone(),
             manifest.watch_interval,
             Arc::clone(&registry),
-            EventStore::new(Arc::clone(&conn)),
+            EventStore::new(pool.clone()),
             policy.clone(),
         ));
     }
     scheduler.add(jobs::triage_job(
         config.triage_interval,
         Arc::new(TriageDeps {
-            events: EventStore::new(Arc::clone(&conn)),
+            events: EventStore::new(pool.clone()),
             actions: ActionStore::new(Arc::clone(&conn)),
             sessions: sessions.clone(),
             pusher: pusher.clone(),
@@ -252,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     let schedule_store = ScheduleStore::new(pool.clone());
     schedules::register_built_ins(&schedule_store, chrono::Utc::now()).await?;
     let briefings = Arc::new(BriefingDeps {
-        events: EventStore::new(Arc::clone(&conn)),
+        events: EventStore::new(pool.clone()),
         log: NotificationLog::new(KvStore::new(pool.clone())),
         sessions: sessions.clone(),
         pusher: pusher.clone(),
@@ -289,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Daemon::build(Deps {
         executor,
         actions: ActionStore::new(Arc::clone(&conn)),
-        events: EventStore::new(Arc::clone(&conn)),
+        events: EventStore::new(pool.clone()),
         runs: RunStore::new(pool.clone()),
         scheduler: Arc::clone(&scheduler),
         schedules: schedule_store,

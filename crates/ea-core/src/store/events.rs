@@ -1,9 +1,7 @@
-use std::sync::{Arc, Mutex};
-
-use anyhow::anyhow;
-use chrono::Utc;
-use rusqlite::{params, Connection, Row};
-use serde::Serialize;
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use serde::{Serialize, Serializer};
+use sqlx::PgPool;
 
 /// The `kind` strings that go into the `events` table, owned by the crate that
 /// owns the table.
@@ -47,6 +45,20 @@ pub mod kinds {
     pub const CONNECTOR_ERROR: &str = "connector_error";
 }
 
+fn serialize_rfc3339<S: Serializer>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&dt.to_rfc3339())
+}
+
+fn serialize_rfc3339_opt<S: Serializer>(
+    dt: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match dt {
+        Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -55,8 +67,10 @@ pub struct Event {
     pub kind: String,
     pub payload: serde_json::Value,
     pub salience: Option<i64>,
-    pub triaged_at: Option<String>,
-    pub created_at: String,
+    #[serde(serialize_with = "serialize_rfc3339_opt")]
+    pub triaged_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "serialize_rfc3339")]
+    pub created_at: DateTime<Utc>,
     /// How many tier-1 batches this event has been submitted to without a
     /// score coming back for it.
     pub triage_attempts: i64,
@@ -73,101 +87,93 @@ pub struct RecordInput {
     pub payload: serde_json::Value,
 }
 
-#[derive(Clone)]
-pub struct EventStore {
-    conn: Arc<Mutex<Connection>>,
-}
+/// The columns every query below selects, in the order [`hydrate`] reads
+/// them.
+const EVENT_COLUMNS: &str = "id, source, external_id, kind, payload, salience, \
+     triaged_at, created_at, triage_attempts, triage_error";
 
-fn hydrate(row: &Row<'_>) -> rusqlite::Result<Event> {
-    let payload: String = row.get("payload")?;
+fn hydrate(row: &sqlx::postgres::PgRow) -> anyhow::Result<Event> {
+    use sqlx::Row;
+    let payload: sqlx::types::Json<serde_json::Value> = row.try_get("payload")?;
+    // `salience` and `triage_attempts` are Postgres `INTEGER` (int4); the
+    // struct keeps them `i64` for parity with every other id/count in this
+    // crate, so the narrower wire type is decoded and widened here.
+    let salience: Option<i32> = row.try_get("salience")?;
+    let triage_attempts: i32 = row.try_get("triage_attempts")?;
     Ok(Event {
-        id: row.get("id")?,
-        source: row.get("source")?,
-        external_id: row.get("external_id")?,
-        kind: row.get("kind")?,
-        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-        salience: row.get("salience")?,
-        triaged_at: row.get("triaged_at")?,
-        created_at: row.get("created_at")?,
-        triage_attempts: row.get("triage_attempts")?,
-        triage_error: row.get("triage_error")?,
+        id: row.try_get("id")?,
+        source: row.try_get("source")?,
+        external_id: row.try_get("external_id")?,
+        kind: row.try_get("kind")?,
+        payload: payload.0,
+        salience: salience.map(i64::from),
+        triaged_at: row.try_get("triaged_at")?,
+        created_at: row.try_get("created_at")?,
+        triage_attempts: i64::from(triage_attempts),
+        triage_error: row.try_get("triage_error")?,
     })
 }
 
+#[derive(Clone)]
+pub struct EventStore {
+    pool: PgPool,
+}
+
 impl EventStore {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Idempotent per `(source, external_id)`. Returns `(event, is_new)`.
     /// A changed payload updates in place and clears triage, so a moved
     /// meeting or a part-paid invoice gets re-scored rather than going stale.
     ///
-    /// The whole read-decide-write sequence runs under a single lock
-    /// acquisition so two concurrent calls for a brand-new key can't both
-    /// observe "not found" and both attempt the insert.
-    pub fn record(&self, input: RecordInput) -> anyhow::Result<(Event, bool)> {
-        let payload = serde_json::to_string(&input.payload)?;
-        let conn = self.conn.lock().unwrap();
+    /// One statement, because it has to be atomic and there is no longer a
+    /// global mutex making it so. A changed payload is a new question, so the
+    /// attempt count and the give-up reason go with the old answer: an event
+    /// the model could not score as an empty stub deserves a fresh three tries
+    /// once it has actually got content. An unchanged payload keeps all of it.
+    ///
+    /// `xmax = 0` is how Postgres distinguishes an insert from an update in an
+    /// upsert's RETURNING. It is an MVCC implementation detail rather than
+    /// documented SQL, which is why both branches are covered by tests.
+    pub async fn record(&self, input: RecordInput) -> anyhow::Result<(Event, bool)> {
+        let row = sqlx::query(
+            "INSERT INTO events (source, external_id, kind, payload)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (source, external_id) DO UPDATE SET
+               payload         = EXCLUDED.payload,
+               salience        = CASE WHEN events.payload IS DISTINCT FROM EXCLUDED.payload
+                                      THEN NULL ELSE events.salience END,
+               triaged_at      = CASE WHEN events.payload IS DISTINCT FROM EXCLUDED.payload
+                                      THEN NULL ELSE events.triaged_at END,
+               triage_attempts = CASE WHEN events.payload IS DISTINCT FROM EXCLUDED.payload
+                                      THEN 0 ELSE events.triage_attempts END,
+               triage_error    = CASE WHEN events.payload IS DISTINCT FROM EXCLUDED.payload
+                                      THEN NULL ELSE events.triage_error END
+             RETURNING id, source, external_id, kind, payload, salience,
+                       triaged_at, created_at, triage_attempts, triage_error,
+                       (xmax = 0) AS inserted",
+        )
+        .bind(&input.source)
+        .bind(&input.external_id)
+        .bind(&input.kind)
+        .bind(sqlx::types::Json(&input.payload))
+        .fetch_one(&self.pool)
+        .await
+        .context("recording an event")?;
 
-        let existing: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT id, payload FROM events WHERE source = ?1 AND external_id = ?2",
-                params![input.source, input.external_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        if let Some((id, old_payload)) = existing {
-            if old_payload != payload {
-                // A changed payload is a new question, so the attempt count
-                // and the give-up reason go with the old answer: an event the
-                // model could not score as an empty stub deserves a fresh
-                // three tries once it has actually got content.
-                conn.execute(
-                    "UPDATE events SET payload = ?1, salience = NULL, triaged_at = NULL,
-                       triage_attempts = 0, triage_error = NULL
-                     WHERE id = ?2",
-                    params![payload, id],
-                )?;
-            }
-            let event =
-                Self::get_locked(&conn, id)?.ok_or_else(|| anyhow!("event {id} vanished"))?;
-            return Ok((event, false));
-        }
-
-        conn.execute(
-            "INSERT INTO events (source, external_id, kind, payload, created_at)
-             VALUES (?1,?2,?3,?4,?5)",
-            params![
-                input.source,
-                input.external_id,
-                input.kind,
-                payload,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        let event = Self::get_locked(&conn, id)?.ok_or_else(|| anyhow!("event {id} vanished"))?;
-        Ok((event, true))
+        let inserted: bool = sqlx::Row::try_get(&row, "inserted")?;
+        Ok((hydrate(&row)?, inserted))
     }
 
-    /// Reads by id using an already-locked connection. `record()` needs this
-    /// to read back the row it just wrote without releasing and re-acquiring
-    /// the (non-reentrant) mutex, which would reopen the very race this
-    /// store exists to close.
-    fn get_locked(conn: &Connection, id: i64) -> anyhow::Result<Option<Event>> {
-        let mut stmt = conn.prepare("SELECT * FROM events WHERE id = ?1")?;
-        let mut rows = stmt.query_map(params![id], hydrate)?;
-        Ok(match rows.next() {
-            Some(row) => Some(row?),
-            None => None,
-        })
-    }
-
-    pub fn get(&self, id: i64) -> anyhow::Result<Option<Event>> {
-        let conn = self.conn.lock().unwrap();
-        Self::get_locked(&conn, id)
+    pub async fn get(&self, id: i64) -> anyhow::Result<Option<Event>> {
+        let row = sqlx::query(&format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("reading an event")?;
+        row.as_ref().map(hydrate).transpose()
     }
 
     /// Events still waiting to be triaged, fewest failed attempts first and
@@ -182,14 +188,16 @@ impl EventStore {
     /// head of the queue can never be permanently occupied — and
     /// [`EventStore::abandon`] eventually takes the failures out of it
     /// altogether.
-    pub fn untriaged(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM events WHERE triaged_at IS NULL
-             ORDER BY triage_attempts, id LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    pub async fn untriaged(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE triaged_at IS NULL
+             ORDER BY triage_attempts, id LIMIT $1"
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("reading untriaged events")?;
+        rows.iter().map(hydrate).collect()
     }
 
     /// The most recent events of one `kind`, newest first — newest as
@@ -202,12 +210,16 @@ impl EventStore {
     /// today's meetings. Selecting on a payload timestamp is
     /// [`EventStore::in_payload_range`]'s job. This method is for "the last n
     /// of these, whatever they are".
-    pub fn by_kind(&self, kind: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT * FROM events WHERE kind = ?1 ORDER BY id DESC LIMIT ?2")?;
-        let rows = stmt.query_map(params![kind, limit], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    pub async fn by_kind(&self, kind: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE kind = $1 ORDER BY id DESC LIMIT $2"
+        ))
+        .bind(kind)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("reading events by kind")?;
+        rows.iter().map(hydrate).collect()
     }
 
     /// Events of any of `kinds` whose payload carries a timestamp — under the
@@ -240,7 +252,7 @@ impl EventStore {
     /// The payload keys are the *caller's*, passed in rather than hardcoded,
     /// so one connector's payload shape still does not end up written into the
     /// schema.
-    pub fn in_payload_range(
+    pub async fn in_payload_range(
         &self,
         kinds: &[&str],
         keys: &[&str],
@@ -250,43 +262,57 @@ impl EventStore {
         if kinds.is_empty() || keys.is_empty() {
             return Ok(Vec::new());
         }
-        // Both lists are `&str` slots bound as parameters — including the JSON
-        // paths, which `json_extract` takes as a bound value — so nothing a
-        // caller passes is interpolated into the SQL text.
+        // Both lists are bound as parameters — including the JSON keys, which
+        // `payload->>$n` takes as a bound value — so nothing a caller passes
+        // is interpolated into the SQL text. See the deliberate absence of an
+        // expression index in the commit message: the keys arrive at runtime,
+        // so no static btree expression index could serve this query, and a
+        // GIN index on `payload` supports containment, not `->>` extraction.
+        let mut bind_index = 1;
         let extracts = keys
             .iter()
-            .map(|_| "json_extract(payload, ?)")
+            .map(|_| {
+                let placeholder = format!("payload->>${bind_index}");
+                bind_index += 1;
+                placeholder
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        let kind_slots = vec!["?"; kinds.len()].join(", ");
-        // The trailing `NULL` is not decoration: SQLite's `COALESCE` requires
-        // at least two arguments, and a caller passing a single key is the
-        // ordinary case. It changes no result — coalescing to NULL is what a
-        // row with none of the keys does anyway.
+        let kind_slots = kinds
+            .iter()
+            .map(|_| {
+                let placeholder = format!("${bind_index}");
+                bind_index += 1;
+                placeholder
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let from_index = bind_index;
+        let to_index = bind_index + 1;
+
         let sql = format!(
             "SELECT * FROM (
-               SELECT *, COALESCE({extracts}, NULL) AS at_value
+               SELECT {EVENT_COLUMNS}, COALESCE({extracts}) AS at_value
                FROM events WHERE kind IN ({kind_slots})
-             )
-             WHERE at_value >= ? AND at_value < ?
+             ) AS ranged
+             WHERE at_value >= ${from_index} AND at_value < ${to_index}
              ORDER BY at_value, id"
         );
 
-        let paths: Vec<String> = keys.iter().map(|key| format!("$.{key}")).collect();
-        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
-        for path in &paths {
-            args.push(path);
+        let mut query = sqlx::query(&sql);
+        for key in keys {
+            query = query.bind(*key);
         }
         for kind in kinds {
-            args.push(kind);
+            query = query.bind(*kind);
         }
-        args.push(&from);
-        args.push(&to);
+        query = query.bind(from).bind(to);
 
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(args.as_slice(), hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("reading events in a payload range")?;
+        rows.iter().map(hydrate).collect()
     }
 
     /// Events triaged after `since` and scored at or above `min_salience`,
@@ -295,20 +321,28 @@ impl EventStore {
     /// What the morning briefing means by "what mattered since the last one".
     /// `triaged_at`, not `created_at`: an event recorded a fortnight ago and
     /// only scored this morning is news this morning.
-    pub fn scored_since(
+    pub async fn scored_since(
         &self,
         min_salience: i64,
-        since: chrono::DateTime<Utc>,
+        since: DateTime<Utc>,
         limit: i64,
     ) -> anyhow::Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM events
-             WHERE salience >= ?1 AND triaged_at IS NOT NULL AND triaged_at > ?2
-             ORDER BY id DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![min_salience, since.to_rfc3339(), limit], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        // `salience` is Postgres `INTEGER` (int4); see the note on
+        // `set_salience`.
+        let min_salience = i32::try_from(min_salience)
+            .with_context(|| format!("salience {min_salience} does not fit in a database column"))?;
+        let rows = sqlx::query(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE salience >= $1 AND triaged_at IS NOT NULL AND triaged_at > $2
+             ORDER BY id DESC LIMIT $3"
+        ))
+        .bind(min_salience)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("reading events scored since a time")?;
+        rows.iter().map(hydrate).collect()
     }
 
     /// Record that `id` was submitted to a tier-1 batch that came back without
@@ -317,18 +351,16 @@ impl EventStore {
     /// Counted on *submission that produced an answer*, not on every pass: a
     /// session that fails outright (the model is down, the budget is spent) is
     /// not this event's fault and must not burn its attempts.
-    pub fn record_triage_attempt(&self, id: i64) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE events SET triage_attempts = triage_attempts + 1 WHERE id = ?1",
-            params![id],
-        )?;
-        let count: i64 = conn.query_row(
-            "SELECT triage_attempts FROM events WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+    pub async fn record_triage_attempt(&self, id: i64) -> anyhow::Result<i64> {
+        let attempts: i32 = sqlx::query_scalar(
+            "UPDATE events SET triage_attempts = triage_attempts + 1
+             WHERE id = $1 RETURNING triage_attempts",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .context("recording a triage attempt")?;
+        Ok(i64::from(attempts))
     }
 
     /// Give up on an event: stamp `triaged_at` so it leaves the scan window,
@@ -338,45 +370,56 @@ impl EventStore {
     /// event nobody could score indistinguishable from an event that was
     /// scored and found unimportant, which is the difference a human looking
     /// into "why did I not hear about this" actually needs.
-    pub fn abandon(&self, id: i64, reason: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE events SET triaged_at = ?1, triage_error = ?2 WHERE id = ?3",
-            params![Utc::now().to_rfc3339(), reason, id],
-        )?;
+    pub async fn abandon(&self, id: i64, reason: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE events SET triaged_at = now(), triage_error = $2 WHERE id = $1")
+            .bind(id)
+            .bind(reason)
+            .execute(&self.pool)
+            .await
+            .context("abandoning an event")?;
         Ok(())
     }
 
     /// Events triage gave up on. `ea status` reports the count, which is what
     /// keeps this from being a silent failure.
-    pub fn abandoned(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM events WHERE triage_error IS NOT NULL ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    pub async fn abandoned(&self, limit: i64) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE triage_error IS NOT NULL ORDER BY id DESC LIMIT $1"
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("reading abandoned events")?;
+        rows.iter().map(hydrate).collect()
     }
 
-    pub fn abandoned_count(&self) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE triage_error IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?)
+    pub async fn abandoned_count(&self) -> anyhow::Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE triage_error IS NOT NULL")
+            .fetch_one(&self.pool)
+            .await
+            .context("counting abandoned events")
     }
 
     /// Record a score. Clears any `triage_error`: an event that was given up
     /// on and then scored anyway (because its payload changed and it came back
     /// round) is no longer a failure.
-    pub fn set_salience(&self, id: i64, salience: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE events SET salience = ?1, triaged_at = ?2, triage_error = NULL
-             WHERE id = ?3",
-            params![salience, Utc::now().to_rfc3339(), id],
-        )?;
+    pub async fn set_salience(&self, id: i64, salience: i64) -> anyhow::Result<()> {
+        // `salience` is Postgres `INTEGER` (int4); every caller passes a
+        // 0-100 score or DROPPED_SALIENCE, so this narrows cleanly, but a
+        // checked conversion means a caller error becomes an `Err` rather
+        // than a silently truncated value.
+        let salience = i32::try_from(salience)
+            .with_context(|| format!("salience {salience} does not fit in a database column"))?;
+        sqlx::query(
+            "UPDATE events SET salience = $2, triaged_at = now(), triage_error = NULL
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(salience)
+        .execute(&self.pool)
+        .await
+        .context("setting an event's salience")?;
         Ok(())
     }
 }
@@ -384,13 +427,13 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::test_support::temp_store;
+    use serde_json::json;
 
     fn input(source: &str, external_id: &str, payload: serde_json::Value) -> RecordInput {
         RecordInput {
             source: source.into(),
             external_id: external_id.into(),
-            kind: kinds::ASSIGNMENT.into(),
+            kind: "assignment".into(),
             payload,
         }
     }
@@ -404,29 +447,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn by_kind_returns_only_that_kind_newest_first_and_respects_the_limit() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
-        store
-            .record(of_kind("google", "c1", kinds::CALENDAR_EVENT))
-            .unwrap();
-        store.record(of_kind("google", "m1", kinds::MAIL)).unwrap();
-        store
-            .record(of_kind("google", "c2", kinds::CALENDAR_EVENT))
-            .unwrap();
-
-        let found = store.by_kind(kinds::CALENDAR_EVENT, 10).unwrap();
-        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
-        assert_eq!(ids, vec!["c2", "c1"], "newest first, and no mail");
-
-        assert_eq!(store.by_kind(kinds::CALENDAR_EVENT, 1).unwrap().len(), 1);
-        assert!(store
-            .by_kind("nothing_records_this", 10)
-            .unwrap()
-            .is_empty());
-    }
-
     fn at(source: &str, external_id: &str, kind: &str, payload: serde_json::Value) -> RecordInput {
         RecordInput {
             source: source.into(),
@@ -436,14 +456,48 @@ mod tests {
         }
     }
 
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn by_kind_returns_only_that_kind_newest_first_and_respects_the_limit(
+        pool: sqlx::PgPool,
+    ) {
+        let store = EventStore::new(pool);
+        store
+            .record(of_kind("google", "c1", kinds::CALENDAR_EVENT))
+            .await
+            .unwrap();
+        store
+            .record(of_kind("google", "m1", kinds::MAIL))
+            .await
+            .unwrap();
+        store
+            .record(of_kind("google", "c2", kinds::CALENDAR_EVENT))
+            .await
+            .unwrap();
+
+        let found = store.by_kind(kinds::CALENDAR_EVENT, 10).await.unwrap();
+        let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["c2", "c1"], "newest first, and no mail");
+
+        assert_eq!(
+            store.by_kind(kinds::CALENDAR_EVENT, 1).await.unwrap().len(),
+            1
+        );
+        assert!(store
+            .by_kind("nothing_records_this", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// The regression `in_payload_range` exists for. With `by_kind`'s
     /// `ORDER BY id DESC LIMIT n`, a row recorded before `n` others is gone
     /// before any date filter sees it — and a calendar row is recorded up to a
     /// week before it happens, so that is the ordinary case, not a corner one.
-    #[test]
-    fn a_row_in_the_window_is_found_however_many_rows_were_recorded_after_it() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_row_in_the_window_is_found_however_many_rows_were_recorded_after_it(
+        pool: sqlx::PgPool,
+    ) {
+        let store = EventStore::new(pool);
         store
             .record(at(
                 "google",
@@ -451,6 +505,7 @@ mod tests {
                 kinds::CALENDAR_EVENT,
                 serde_json::json!({ "start": "2026-09-25T08:00:00Z" }),
             ))
+            .await
             .unwrap();
         for i in 0..200 {
             store
@@ -460,6 +515,7 @@ mod tests {
                     kinds::CALENDAR_EVENT,
                     serde_json::json!({ "start": "2026-10-02T08:00:00Z" }),
                 ))
+                .await
                 .unwrap();
         }
 
@@ -470,6 +526,7 @@ mod tests {
                 "2026-09-25",
                 "2026-09-26",
             )
+            .await
             .unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(ids, vec!["wanted"]);
@@ -478,6 +535,7 @@ mod tests {
         assert!(
             !store
                 .by_kind(kinds::CALENDAR_EVENT, 60)
+                .await
                 .unwrap()
                 .iter()
                 .any(|e| e.external_id == "wanted"),
@@ -488,10 +546,9 @@ mod tests {
     /// The window is half-open, several kinds can be asked for at once, the
     /// keys are tried in order, and a row with none of them is simply absent
     /// rather than an error.
-    #[test]
-    fn in_payload_range_is_half_open_over_several_kinds_and_keys() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn in_payload_range_is_half_open_over_several_kinds_and_keys(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         for (id, kind, payload) in [
             (
                 "before",
@@ -524,7 +581,7 @@ mod tests {
                 serde_json::json!({ "start": "2026-09-25T10:00:00Z" }),
             ),
         ] {
-            store.record(at("google", id, kind, payload)).unwrap();
+            store.record(at("google", id, kind, payload)).await.unwrap();
         }
 
         let found = store
@@ -534,6 +591,7 @@ mod tests {
                 "2026-09-25",
                 "2026-09-26",
             )
+            .await
             .unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(
@@ -544,10 +602,12 @@ mod tests {
 
         assert!(store
             .in_payload_range(&[], &["start"], "2026-09-25", "2026-09-26")
+            .await
             .unwrap()
             .is_empty());
         assert!(store
             .in_payload_range(&[kinds::CALENDAR_EVENT], &[], "2026-09-25", "2026-09-26")
+            .await
             .unwrap()
             .is_empty());
     }
@@ -555,48 +615,60 @@ mod tests {
     /// The morning briefing asks "what was scored above the threshold since
     /// the last briefing" — so the cut is on `triaged_at`, not `created_at`,
     /// and an unscored event is never in the answer however old it is.
-    #[test]
-    fn scored_since_cuts_on_triaged_at_and_ignores_the_unscored() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn scored_since_cuts_on_triaged_at_and_ignores_the_unscored(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (low, _) = store
             .record(of_kind("canvas", "low", "assignment"))
+            .await
             .unwrap();
         let (high, _) = store
             .record(of_kind("canvas", "high", "assignment"))
+            .await
             .unwrap();
         let (untouched, _) = store
             .record(of_kind("canvas", "raw", "assignment"))
+            .await
             .unwrap();
 
         let before = Utc::now();
-        store.set_salience(low.id, 20).unwrap();
-        store.set_salience(high.id, 80).unwrap();
+        store.set_salience(low.id, 20).await.unwrap();
+        store.set_salience(high.id, 80).await.unwrap();
 
-        let found = store.scored_since(60, before, 10).unwrap();
+        let found = store.scored_since(60, before, 10).await.unwrap();
         let ids: Vec<i64> = found.iter().map(|e| e.id).collect();
         assert_eq!(
             ids,
             vec![high.id],
             "below the threshold and unscored are both out"
         );
-        assert!(store.get(untouched.id).unwrap().unwrap().salience.is_none());
+        assert!(store
+            .get(untouched.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .salience
+            .is_none());
 
         // A cut *after* the scoring returns nothing: yesterday's news is not
         // today's.
-        assert!(store.scored_since(60, Utc::now(), 10).unwrap().is_empty());
+        assert!(store
+            .scored_since(60, Utc::now(), 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
-    #[test]
-    fn records_a_new_event() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn records_a_new_event(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (event, is_new) = store
             .record(input(
                 "canvas",
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-01" }),
             ))
+            .await
             .unwrap();
         assert!(is_new);
         assert_eq!(event.source, "canvas");
@@ -604,10 +676,9 @@ mod tests {
         assert_eq!(event.payload["due"], "2026-10-01");
     }
 
-    #[test]
-    fn ten_identical_polls_produce_one_row() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn ten_identical_polls_produce_one_row(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         for _ in 0..10 {
             store
                 .record(input(
@@ -615,22 +686,23 @@ mod tests {
                     "assign-1",
                     serde_json::json!({ "due": "2026-10-01" }),
                 ))
+                .await
                 .unwrap();
         }
-        let untriaged = store.untriaged(100).unwrap();
+        let untriaged = store.untriaged(100).await.unwrap();
         assert_eq!(untriaged.len(), 1);
     }
 
-    #[test]
-    fn is_new_is_false_on_a_repeat_and_the_id_matches() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn is_new_is_false_on_a_repeat_and_the_id_matches(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (first, first_is_new) = store
             .record(input(
                 "canvas",
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-01" }),
             ))
+            .await
             .unwrap();
         assert!(first_is_new);
         let (second, second_is_new) = store
@@ -639,35 +711,37 @@ mod tests {
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-01" }),
             ))
+            .await
             .unwrap();
         assert!(!second_is_new);
         assert_eq!(first.id, second.id);
     }
 
-    #[test]
-    fn same_external_id_from_a_different_source_is_distinct() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn same_external_id_from_a_different_source_is_distinct(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (a, _) = store
             .record(input("canvas", "1", serde_json::json!({ "a": 1 })))
+            .await
             .unwrap();
         let (b, is_new) = store
             .record(input("gmail", "1", serde_json::json!({ "a": 1 })))
+            .await
             .unwrap();
         assert!(is_new);
         assert_ne!(a.id, b.id);
     }
 
-    #[test]
-    fn a_changed_payload_updates_in_place() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_changed_payload_updates_in_place(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (first, _) = store
             .record(input(
                 "canvas",
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-01" }),
             ))
+            .await
             .unwrap();
         let (second, is_new) = store
             .record(input(
@@ -675,25 +749,26 @@ mod tests {
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-08" }),
             ))
+            .await
             .unwrap();
         assert!(!is_new);
         assert_eq!(first.id, second.id);
         assert_eq!(second.payload["due"], "2026-10-08");
     }
 
-    #[test]
-    fn a_changed_payload_clears_salience_and_triaged_at() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_changed_payload_clears_salience_and_triaged_at(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let (first, _) = store
             .record(input(
                 "canvas",
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-01" }),
             ))
+            .await
             .unwrap();
-        store.set_salience(first.id, 5).unwrap();
-        assert!(store.untriaged(100).unwrap().is_empty());
+        store.set_salience(first.id, 5).await.unwrap();
+        assert!(store.untriaged(100).await.unwrap().is_empty());
 
         let (second, _) = store
             .record(input(
@@ -701,83 +776,54 @@ mod tests {
                 "assign-1",
                 serde_json::json!({ "due": "2026-10-08" }),
             ))
+            .await
             .unwrap();
         assert_eq!(second.salience, None);
         assert!(second.triaged_at.is_none());
 
-        let untriaged = store.untriaged(100).unwrap();
+        let untriaged = store.untriaged(100).await.unwrap();
         assert_eq!(untriaged.len(), 1);
         assert_eq!(untriaged[0].id, first.id);
-    }
-
-    #[test]
-    fn concurrent_record_of_a_brand_new_key_is_idempotent() {
-        use std::sync::Barrier;
-        use std::thread;
-
-        let (_dir, conn) = temp_store();
-        let store_a = EventStore::new(conn.clone());
-        let store_b = EventStore::new(conn.clone());
-        // A barrier makes both threads arrive at `record()` at the same
-        // instant instead of serialising by luck of thread-spawn order,
-        // widening the window in which a check-then-act race could show up.
-        let barrier = Arc::new(Barrier::new(2));
-
-        let ba = barrier.clone();
-        let handle_a = thread::spawn(move || {
-            ba.wait();
-            store_a.record(input("canvas", "race-1", serde_json::json!({ "n": 1 })))
-        });
-        let bb = barrier.clone();
-        let handle_b = thread::spawn(move || {
-            bb.wait();
-            store_b.record(input("canvas", "race-1", serde_json::json!({ "n": 1 })))
-        });
-
-        let result_a = handle_a.join().unwrap();
-        let result_b = handle_b.join().unwrap();
-
-        let (event_a, is_new_a) = result_a.expect("first concurrent record() must not error");
-        let (event_b, is_new_b) = result_b.expect("second concurrent record() must not error");
-
-        assert_eq!(event_a.id, event_b.id);
-        assert_ne!(
-            is_new_a, is_new_b,
-            "exactly one of the two concurrent calls must report is_new == true"
-        );
-
-        let locked = conn.lock().unwrap();
-        let count: i64 = locked
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
     }
 
     /// The ordering the triage wedge turned on: an event that has already
     /// failed a tier-1 batch must not keep a brand-new event out of the next
     /// one. With `ORDER BY id` it did, forever.
-    #[test]
-    fn untriaged_puts_fresh_events_ahead_of_ones_that_have_failed() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn untriaged_puts_fresh_events_ahead_of_ones_that_have_failed(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let old_id = store
             .record(input("canvas", "old", serde_json::json!({ "n": 1 })))
+            .await
             .unwrap()
             .0
             .id;
         let new_id = store
             .record(input("canvas", "new", serde_json::json!({ "n": 2 })))
+            .await
             .unwrap()
             .0
             .id;
         assert!(old_id < new_id);
 
         // Before any attempt, id order holds.
-        let order: Vec<i64> = store.untriaged(10).unwrap().iter().map(|e| e.id).collect();
+        let order: Vec<i64> = store
+            .untriaged(10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
         assert_eq!(order, vec![old_id, new_id]);
 
-        assert_eq!(store.record_triage_attempt(old_id).unwrap(), 1);
-        let order: Vec<i64> = store.untriaged(10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(store.record_triage_attempt(old_id).await.unwrap(), 1);
+        let order: Vec<i64> = store
+            .untriaged(10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
         assert_eq!(
             order,
             vec![new_id, old_id],
@@ -785,20 +831,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn abandon_takes_an_event_out_of_the_scan_window_and_says_why() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn abandon_takes_an_event_out_of_the_scan_window_and_says_why(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let id = store
             .record(input("canvas", "a", serde_json::json!({ "n": 1 })))
+            .await
             .unwrap()
             .0
             .id;
 
-        store.abandon(id, "the model never scored it").unwrap();
+        store.abandon(id, "the model never scored it").await.unwrap();
 
-        assert!(store.untriaged(10).unwrap().is_empty());
-        let event = store.get(id).unwrap().unwrap();
+        assert!(store.untriaged(10).await.unwrap().is_empty());
+        let event = store.get(id).await.unwrap().unwrap();
         assert!(event.triaged_at.is_some());
         assert_eq!(
             event.salience, None,
@@ -808,39 +854,39 @@ mod tests {
             event.triage_error.as_deref(),
             Some("the model never scored it")
         );
-        assert_eq!(store.abandoned_count().unwrap(), 1);
-        assert_eq!(store.abandoned(10).unwrap()[0].id, id);
+        assert_eq!(store.abandoned_count().await.unwrap(), 1);
+        assert_eq!(store.abandoned(10).await.unwrap()[0].id, id);
     }
 
     /// A changed payload is a new question. An event abandoned as an empty
     /// stub deserves a fresh set of attempts once it has content.
-    #[test]
-    fn a_changed_payload_clears_the_attempt_count_and_the_give_up() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_changed_payload_clears_the_attempt_count_and_the_give_up(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         let id = store
             .record(input("canvas", "a", serde_json::json!({ "n": 1 })))
+            .await
             .unwrap()
             .0
             .id;
-        store.record_triage_attempt(id).unwrap();
-        store.record_triage_attempt(id).unwrap();
-        store.abandon(id, "gave up").unwrap();
+        store.record_triage_attempt(id).await.unwrap();
+        store.record_triage_attempt(id).await.unwrap();
+        store.abandon(id, "gave up").await.unwrap();
 
         let (event, is_new) = store
             .record(input("canvas", "a", serde_json::json!({ "n": 2 })))
+            .await
             .unwrap();
         assert!(!is_new);
         assert_eq!(event.triage_attempts, 0);
         assert_eq!(event.triage_error, None);
         assert!(event.triaged_at.is_none());
-        assert_eq!(store.abandoned_count().unwrap(), 0);
+        assert_eq!(store.abandoned_count().await.unwrap(), 0);
     }
 
-    #[test]
-    fn untriaged_honours_its_limit() {
-        let (_dir, conn) = temp_store();
-        let store = EventStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn untriaged_honours_its_limit(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
         for i in 0..5 {
             store
                 .record(input(
@@ -848,9 +894,117 @@ mod tests {
                     &format!("assign-{i}"),
                     serde_json::json!({ "n": i }),
                 ))
+                .await
                 .unwrap();
         }
-        let limited = store.untriaged(2).unwrap();
+        let limited = store.untriaged(2).await.unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    // -- the upsert, restated as the brief asks for it ----------------------
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn record_inserts_once_and_reports_it(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, inserted) = store.record(input("canvas", "e1", json!({"a": 1}))).await.unwrap();
+        assert!(inserted, "the first record of an id is an insert");
+        assert_eq!(event.source, "canvas");
+
+        let (_, inserted) = store.record(input("canvas", "e1", json!({"a": 1}))).await.unwrap();
+        assert!(!inserted, "the same payload again is not an insert");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_changed_payload_resets_the_triage_state(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, _) = store.record(input("canvas", "e1", json!({"a": 1}))).await.unwrap();
+        store.set_salience(event.id, 80).await.unwrap();
+        store.record_triage_attempt(event.id).await.unwrap();
+
+        let (event, _) = store.record(input("canvas", "e1", json!({"a": 2}))).await.unwrap();
+        assert_eq!(event.salience, None, "a new question deserves a fresh answer");
+        assert_eq!(event.triaged_at, None);
+        assert_eq!(event.triage_attempts, 0);
+        assert_eq!(event.triage_error, None);
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn an_unchanged_payload_keeps_the_triage_state(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, _) = store.record(input("canvas", "e1", json!({"a": 1}))).await.unwrap();
+        store.set_salience(event.id, 80).await.unwrap();
+
+        let (event, _) = store.record(input("canvas", "e1", json!({"a": 1}))).await.unwrap();
+        assert_eq!(event.salience, Some(80), "nothing changed, so nothing is reset");
+    }
+
+    /// Deliberate behaviour change from the SQLite version, which compared
+    /// serialized JSON text: JSONB compares semantically, so a connector
+    /// re-emitting the same object with its keys in a different order no
+    /// longer looks like a changed payload and no longer resets triage.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn reordered_payload_keys_are_not_a_change(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, _) = store
+            .record(input("canvas", "e1", json!({"a": 1, "b": 2})))
+            .await
+            .unwrap();
+        store.set_salience(event.id, 80).await.unwrap();
+
+        let (event, _) = store
+            .record(input("canvas", "e1", json!({"b": 2, "a": 1})))
+            .await
+            .unwrap();
+        assert_eq!(event.salience, Some(80), "same object, different key order");
+    }
+
+    /// Review Focus #2: Postgres TEXT rejects the NUL byte and SQLite does
+    /// not. Connector data is untrusted — a mail subject can contain one —
+    /// so it must be turned into a clear error and never a panic.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_nul_byte_in_a_text_field_is_an_error_not_a_panic(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let result = store
+            .record(input("canvas", "e\u{0}1", json!({"a": 1})))
+            .await;
+        assert!(result.is_err(), "a NUL byte must be refused, cleanly");
+    }
+
+    /// The same hazard inside a JSONB *value* rather than a plain text column:
+    /// Postgres's `jsonb` also rejects `\u0000` in a string, and a connector
+    /// payload is exactly the kind of untrusted text that can contain one (an
+    /// email body pasted with a stray control character, say).
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_nul_byte_inside_a_jsonb_string_value_is_an_error_not_a_panic(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let result = store
+            .record(input("canvas", "e1", json!({"body": "before\u{0}after"})))
+            .await;
+        assert!(
+            result.is_err(),
+            "a NUL byte inside a JSON string value must be refused, cleanly"
+        );
+    }
+
+    /// Review Focus #3: `JSONB NOT NULL` accepts JSON `null` — it is a JSON
+    /// value, not a SQL NULL — and it must round-trip as `Value::Null`.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_null_payload_round_trips(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, _) = store
+            .record(input("canvas", "e1", serde_json::Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(event.payload, serde_json::Value::Null);
+        let read = store.get(event.id).await.unwrap().unwrap();
+        assert_eq!(read.payload, serde_json::Value::Null);
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn record_triage_attempt_returns_the_new_count(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        let (event, _) = store.record(input("canvas", "e1", json!({}))).await.unwrap();
+        assert_eq!(store.record_triage_attempt(event.id).await.unwrap(), 1);
+        assert_eq!(store.record_triage_attempt(event.id).await.unwrap(), 2);
     }
 }

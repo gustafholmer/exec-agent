@@ -158,16 +158,37 @@ pub async fn run_watch_poll<C: ToolCaller>(
         new: 0,
     };
     for item in items {
-        let (_event, is_new) = events
+        // A single malformed item must not take down the rest of the batch.
+        // Under SQLite this loop could not fail on the *content* of an item —
+        // a NUL byte, say, is ordinary SQLite TEXT — so every failure here
+        // was a real I/O problem and propagating it was correct. Postgres
+        // TEXT and JSONB both reject an embedded NUL, which a connector can
+        // now hand back from untrusted data (a mail subject, say), and one
+        // event like that must not stop the other 39 in the same poll from
+        // being recorded, or trip the connector's breaker over one bad row.
+        let external_id = item.external_id.clone();
+        match events
             .record(RecordInput {
                 source: connector.to_string(),
                 external_id: item.external_id,
                 kind: item.kind,
                 payload: item.payload,
             })
-            .with_context(|| format!("recording an event from {connector}"))?;
-        if is_new {
-            outcome.new += 1;
+            .await
+        {
+            Ok((_event, is_new)) => {
+                if is_new {
+                    outcome.new += 1;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    connector,
+                    external_id,
+                    error = %format!("{err:#}"),
+                    "could not record an event; skipping it"
+                );
+            }
         }
     }
 
@@ -282,6 +303,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
     let events = deps
         .events
         .untriaged(TRIAGE_SCAN_LIMIT)
+        .await
         .context("reading untriaged events")?;
     summary.scanned = events.len();
 
@@ -290,7 +312,7 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
     for (event, reason) in dropped {
         tracing::debug!(event = event.id, reason, "tier 0 dropped an event");
         // Stamped as triaged so it leaves the scan window. See DROPPED_SALIENCE.
-        deps.events.set_salience(event.id, DROPPED_SALIENCE)?;
+        deps.events.set_salience(event.id, DROPPED_SALIENCE).await?;
     }
 
     if kept.is_empty() {
@@ -351,10 +373,12 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
         let attempts = deps
             .events
             .record_triage_attempt(id)
+            .await
             .with_context(|| format!("recording a failed triage attempt for event {id}"))?;
         if attempts >= TRIAGE_MAX_ATTEMPTS {
             deps.events
                 .abandon(id, UNSCORABLE_REASON)
+                .await
                 .with_context(|| format!("giving up on event {id}"))?;
             summary.abandoned += 1;
             // Warned, not debugged: this is the daemon deciding not to look at
@@ -384,7 +408,8 @@ pub async fn run_triage(deps: &TriageDeps, now: DateTime<Utc>) -> anyhow::Result
 
     for score in scores {
         deps.events
-            .set_salience(score.event_id, i64::from(score.salience))?;
+            .set_salience(score.event_id, i64::from(score.salience))
+            .await?;
 
         let verdict = deps.notify.evaluate(score.salience, now, &recent);
         let line = describe(&kept, &score);
@@ -679,11 +704,9 @@ mod tests {
 
     // -- watch_poll ---------------------------------------------------------
 
-    #[tokio::test]
-    async fn a_poll_records_what_the_connector_reports() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(Arc::clone(&conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_poll_records_what_the_connector_reports(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool);
         let caller = FakeConnector::with(vec![Ok(r#"[
             {"external_id":"a1","kind":"assignment","payload":{"title":"Essay"}},
             {"external_id":"a2","kind":"assignment","payload":{"title":"Lab"}}
@@ -696,7 +719,7 @@ mod tests {
         assert_eq!(outcome, PollOutcome { seen: 2, new: 2 });
         assert_eq!(caller.calls(), vec![("canvas".into(), WATCH_TOOL.into())]);
 
-        let stored = events.untriaged(10).unwrap();
+        let stored = events.untriaged(10).await.unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(
             stored[0].source, "canvas",
@@ -710,11 +733,9 @@ mod tests {
     /// seconds instead, which is not a budget a connector that walks two
     /// Google accounts can meet on a slow link. Thirty seconds of timeouts,
     /// five ticks apart, is a tripped breaker on a connector that works.
-    #[tokio::test]
-    async fn a_poll_gets_the_watch_deadline_and_not_the_executors_default() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_poll_gets_the_watch_deadline_and_not_the_executors_default(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool);
         let caller = FakeConnector::with(vec![Ok("[]".to_string())]);
 
         run_watch_poll("canvas", &caller, &events, &canvas_policy())
@@ -730,11 +751,9 @@ mod tests {
     }
 
     /// Polling is idempotent: the same assignment reported twice is one event.
-    #[tokio::test]
-    async fn a_repeated_poll_records_nothing_new() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_repeated_poll_records_nothing_new(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool);
         let body = r#"[{"external_id":"a1","kind":"assignment","payload":{"title":"Essay"}}]"#;
         let caller = FakeConnector::with(vec![Ok(body.to_string()), Ok(body.to_string())]);
 
@@ -750,11 +769,11 @@ mod tests {
 
     /// The gate, restated for the one connector call that has no `actions`
     /// row: a `watch_poll` the policy does not rate `auto` is not made.
-    #[tokio::test]
-    async fn a_poll_the_policy_does_not_allow_is_refused_without_calling_anything() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_poll_the_policy_does_not_allow_is_refused_without_calling_anything(
+        pool: sqlx::PgPool,
+    ) {
+        let events = EventStore::new(pool);
         let caller = FakeConnector::with(vec![Ok("[]".to_string())]);
 
         for policy in [
@@ -778,11 +797,9 @@ mod tests {
     /// A connector that is down must look down. Returning an empty poll would
     /// leave a lapsed token green for the rest of term and the breaker would
     /// never trip.
-    #[tokio::test]
-    async fn a_connector_error_propagates_so_the_breaker_can_see_it() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_connector_error_propagates_so_the_breaker_can_see_it(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool);
         let caller = FakeConnector::with(vec![Err(anyhow::anyhow!("canvas: 401 Unauthorized"))]);
 
         let err = run_watch_poll("canvas", &caller, &events, &canvas_policy())
@@ -793,11 +810,9 @@ mod tests {
         assert!(text.contains("canvas"), "{text}");
     }
 
-    #[tokio::test]
-    async fn a_reply_that_is_not_the_documented_array_is_an_error() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let events = EventStore::new(conn);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_reply_that_is_not_the_documented_array_is_an_error(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool);
         let caller = FakeConnector::with(vec![Ok("sorry, no".to_string())]);
         let err = run_watch_poll("canvas", &caller, &events, &canvas_policy())
             .await
@@ -829,7 +844,7 @@ mod tests {
     ) -> TriageFixture {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
-        let events = EventStore::new(Arc::clone(&conn));
+        let events = EventStore::new(pool.clone());
         let actions = ActionStore::new(Arc::clone(&conn));
         let runs = RunStore::new(pool.clone());
         let log = NotificationLog::new(KvStore::new(pool.clone()));
@@ -863,7 +878,7 @@ mod tests {
         }
     }
 
-    fn record(
+    async fn record(
         events: &EventStore,
         external_id: &str,
         source: &str,
@@ -877,6 +892,7 @@ mod tests {
                 kind: kind.to_string(),
                 payload: serde_json::json!({ "title": title }),
             })
+            .await
             .unwrap()
             .0
             .id
@@ -926,14 +942,14 @@ mod tests {
             ..Tier0Rules::default()
         };
         let f = build_triage(pool, Vec::new(), rules, 60, true, false);
-        record(&f.events, "n1", "newsletter", "email", "50% off");
-        let kept = record(&f.events, "a1", "canvas", "assignment", "Essay");
+        record(&f.events, "n1", "newsletter", "email", "50% off").await;
+        let kept = record(&f.events, "a1", "canvas", "assignment", "Essay").await;
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary.scanned, 2);
         assert_eq!(summary.dropped, 1);
 
-        let still_untriaged = f.events.untriaged(10).unwrap();
+        let still_untriaged = f.events.untriaged(10).await.unwrap();
         assert_eq!(
             still_untriaged.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![kept],
@@ -947,7 +963,7 @@ mod tests {
     async fn triage_runs_exactly_one_tier1_session_on_the_cheap_model(pool: sqlx::PgPool) {
         let f = build_triage(pool, Vec::new(), Tier0Rules::default(), 60, true, false);
         for i in 0..5 {
-            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay");
+            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay").await;
         }
 
         run_triage(&f.deps, daytime()).await.unwrap();
@@ -968,8 +984,8 @@ mod tests {
     async fn a_high_score_is_sent_and_a_low_one_is_held_for_the_digest(pool: sqlx::PgPool) {
         let dir_scores = |a: i64, b: i64| vec![score(a, 90), score(b, 10)];
         let f = build_triage(pool, dir_scores(1, 2), Tier0Rules::default(), 60, true, false);
-        let high = record(&f.events, "a1", "canvas", "assignment", "Essay due");
-        let low = record(&f.events, "a2", "canvas", "assignment", "Reading");
+        let high = record(&f.events, "a1", "canvas", "assignment", "Essay due").await;
+        let low = record(&f.events, "a2", "canvas", "assignment", "Reading").await;
         assert_eq!((high, low), (1, 2), "ids the fake scores were built with");
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
@@ -986,9 +1002,9 @@ mod tests {
         assert!(f.log.digest().await.unwrap()[0].contains("Reading"));
 
         // And the scores were written back.
-        assert_eq!(f.events.get(high).unwrap().unwrap().salience, Some(90));
-        assert_eq!(f.events.get(low).unwrap().unwrap().salience, Some(10));
-        assert!(f.events.untriaged(10).unwrap().is_empty());
+        assert_eq!(f.events.get(high).await.unwrap().unwrap().salience, Some(90));
+        assert_eq!(f.events.get(low).await.unwrap().unwrap().salience, Some(10));
+        assert!(f.events.untriaged(10).await.unwrap().is_empty());
     }
 
     /// Addition 3, in the loop rather than in the store: the rate limit has to
@@ -998,7 +1014,7 @@ mod tests {
         let scores = (1..=5).map(|id| score(id, 95)).collect();
         let f = build_triage(pool, scores, Tier0Rules::default(), 60, true, false);
         for i in 1..=5 {
-            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay");
+            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay").await;
         }
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
@@ -1012,7 +1028,7 @@ mod tests {
         // And the history is durable: a second pass an instant later sends
         // nothing at all.
         for i in 6..=7 {
-            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay");
+            record(&f.events, &format!("a{i}"), "canvas", "assignment", "Essay").await;
         }
         let again = build_triage_over(&f, vec![score(6, 95), score(7, 95)]);
         let summary = run_triage(&again, daytime()).await.unwrap();
@@ -1038,7 +1054,7 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_failed_send_is_not_charged_against_the_rate_limit_and_is_not_lost(pool: sqlx::PgPool) {
         let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 60, true, true);
-        record(&f.events, "a1", "canvas", "assignment", "Essay due");
+        record(&f.events, "a1", "canvas", "assignment", "Essay due").await;
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary.sent, 0);
@@ -1052,13 +1068,13 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn triage_skips_tier1_once_the_daily_budget_is_spent(pool: sqlx::PgPool) {
         let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 1, true, false);
-        record(&f.events, "a1", "canvas", "assignment", "Essay");
+        record(&f.events, "a1", "canvas", "assignment", "Essay").await;
 
         // First pass spends the day's single session.
         let first = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(first.scored, 1);
 
-        record(&f.events, "a2", "canvas", "assignment", "Lab");
+        record(&f.events, "a2", "canvas", "assignment", "Lab").await;
         let second = run_triage(&f.deps, daytime()).await.unwrap();
         assert!(second.budget_exhausted);
         assert_eq!(second.scored, 0);
@@ -1072,8 +1088,8 @@ mod tests {
             ..Tier0Rules::default()
         };
         let f = build_triage(pool, Vec::new(), rules, 60, false, false);
-        record(&f.events, "p1", "canvas", "ping", "noise");
-        record(&f.events, "a1", "canvas", "assignment", "Essay");
+        record(&f.events, "p1", "canvas", "ping", "noise").await;
+        record(&f.events, "a1", "canvas", "assignment", "Essay").await;
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary.dropped, 1);
@@ -1151,7 +1167,7 @@ mod tests {
     async fn triage_stops_running_tier_1_once_the_budget_is_spent(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
         let conn = db(&dir);
-        let events = EventStore::new(Arc::clone(&conn));
+        let events = EventStore::new(pool.clone());
         let runs = RunStore::new(pool.clone());
         let sessions = ScoringTier1::new(runs.clone());
         let pusher = Arc::new(SpyPusher {
@@ -1171,7 +1187,7 @@ mod tests {
 
         // Three batches' worth: `tier1_batch` takes forty per pass.
         for i in 0..120 {
-            record(&events, &format!("e{i}"), "canvas", "assignment", "Essay");
+            record(&events, &format!("e{i}"), "canvas", "assignment", "Essay").await;
         }
 
         let first = run_triage(&deps, daytime()).await.unwrap();
@@ -1193,7 +1209,7 @@ mod tests {
 
         // And forty events are still waiting, rather than having been
         // silently marked as looked at.
-        assert_eq!(events.untriaged(TRIAGE_SCAN_LIMIT).unwrap().len(), 40);
+        assert_eq!(events.untriaged(TRIAGE_SCAN_LIMIT).await.unwrap().len(), 40);
     }
 
     /// A ceiling of zero turns every unattended session off, and triage says
@@ -1201,7 +1217,7 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn a_zero_budget_stops_tier_1_and_says_so(pool: sqlx::PgPool) {
         let f = build_triage(pool, vec![score(1, 90)], Tier0Rules::default(), 0, true, false);
-        record(&f.events, "a1", "canvas", "assignment", "Essay");
+        record(&f.events, "a1", "canvas", "assignment", "Essay").await;
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert!(summary.budget_exhausted);
@@ -1290,10 +1306,12 @@ mod tests {
         (f, model)
     }
 
-    fn record_n(events: &EventStore, n: usize) -> Vec<i64> {
-        (0..n)
-            .map(|i| record(events, &format!("e{i}"), "canvas", "assignment", "Essay"))
-            .collect()
+    async fn record_n(events: &EventStore, n: usize) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(record(events, &format!("e{i}"), "canvas", "assignment", "Essay").await);
+        }
+        ids
     }
 
     /// The finding, stated directly: a model that returns no scores at all
@@ -1303,7 +1321,7 @@ mod tests {
         let (f, model) = build_partial_triage(pool, None);
         // More than one batch holds, so there is a "behind the head of the
         // queue" to be starved in the first place.
-        let ids = record_n(&f.events, 45);
+        let ids = record_n(&f.events, 45).await;
 
         // Four passes is enough to spend three attempts on all 45 (40 slots a
         // pass, 135 attempts needed).
@@ -1316,14 +1334,14 @@ mod tests {
         assert_eq!(abandoned, 45, "every unscorable event must be given up on");
 
         assert!(
-            f.events.untriaged(500).unwrap().is_empty(),
+            f.events.untriaged(500).await.unwrap().is_empty(),
             "triage must not still be scanning the same doomed rows"
         );
-        assert_eq!(f.events.abandoned_count().unwrap(), 45);
+        assert_eq!(f.events.abandoned_count().await.unwrap(), 45);
 
         // Given up on, but not vanished: the reason is on the row, and the
         // salience is left NULL so it cannot be mistaken for "scored, boring".
-        let event = f.events.get(ids[0]).unwrap().unwrap();
+        let event = f.events.get(ids[0]).await.unwrap().unwrap();
         assert_eq!(event.triage_attempts, TRIAGE_MAX_ATTEMPTS);
         assert!(event.triaged_at.is_some());
         assert_eq!(event.salience, None);
@@ -1354,7 +1372,7 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn events_behind_an_unscorable_batch_are_still_triaged(pool: sqlx::PgPool) {
         let (f, model) = build_partial_triage(pool, Some((41..=45).collect()));
-        let ids = record_n(&f.events, 45);
+        let ids = record_n(&f.events, 45).await;
         let later: Vec<i64> = ids[40..].to_vec();
 
         // Pass one submits the first forty by id and gets nothing back.
@@ -1372,7 +1390,7 @@ mod tests {
         let second = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(second.scored, 5);
         for id in &later {
-            let event = f.events.get(*id).unwrap().unwrap();
+            let event = f.events.get(*id).await.unwrap().unwrap();
             assert_eq!(
                 event.salience,
                 Some(50),
@@ -1386,13 +1404,13 @@ mod tests {
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
     async fn one_missed_batch_does_not_give_up_on_an_event(pool: sqlx::PgPool) {
         let (f, _model) = build_partial_triage(pool, None);
-        let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
+        let id = record(&f.events, "e0", "canvas", "assignment", "Essay").await;
 
         let summary = run_triage(&f.deps, daytime()).await.unwrap();
         assert_eq!(summary.unscored, 1);
         assert_eq!(summary.abandoned, 0);
 
-        let event = f.events.get(id).unwrap().unwrap();
+        let event = f.events.get(id).await.unwrap().unwrap();
         assert_eq!(event.triage_attempts, 1);
         assert!(
             event.triaged_at.is_none(),
@@ -1400,11 +1418,11 @@ mod tests {
         );
 
         // The next pass scores it, and the attempt count stops mattering.
-        f.events.set_salience(id, 80).unwrap();
-        let event = f.events.get(id).unwrap().unwrap();
+        f.events.set_salience(id, 80).await.unwrap();
+        let event = f.events.get(id).await.unwrap().unwrap();
         assert_eq!(event.salience, Some(80));
         assert_eq!(event.triage_error, None);
-        assert_eq!(f.events.abandoned_count().unwrap(), 0);
+        assert_eq!(f.events.abandoned_count().await.unwrap(), 0);
     }
 
     /// A session that fails outright is not the event's fault. If failures
@@ -1421,7 +1439,7 @@ mod tests {
 
         let mut f = build_triage(pool, Vec::new(), Tier0Rules::default(), 1000, true, false);
         f.deps.sessions = Some(Arc::new(Broken) as Arc<dyn SessionBoundary>);
-        let id = record(&f.events, "e0", "canvas", "assignment", "Essay");
+        let id = record(&f.events, "e0", "canvas", "assignment", "Essay").await;
 
         for _ in 0..5 {
             run_triage(&f.deps, daytime())
@@ -1429,9 +1447,9 @@ mod tests {
                 .expect_err("a broken session must surface to the breaker");
         }
 
-        let event = f.events.get(id).unwrap().unwrap();
+        let event = f.events.get(id).await.unwrap().unwrap();
         assert_eq!(event.triage_attempts, 0);
         assert!(event.triaged_at.is_none());
-        assert_eq!(f.events.abandoned_count().unwrap(), 0);
+        assert_eq!(f.events.abandoned_count().await.unwrap(), 0);
     }
 }

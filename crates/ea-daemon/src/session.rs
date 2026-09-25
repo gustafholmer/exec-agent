@@ -1572,7 +1572,7 @@ mod tests {
         crate::daemon::Daemon::build(crate::daemon::Deps {
             executor: Arc::new(executor),
             actions: ActionStore::new(Arc::clone(&conn)),
-            events: ea_core::store::events::EventStore::new(Arc::clone(&conn)),
+            events: ea_core::store::events::EventStore::new(pool.clone()),
             runs: RunStore::new(pool.clone()),
             scheduler: Arc::new(crate::scheduler::Scheduler::new(3)),
             schedules: ea_core::store::schedules::ScheduleStore::new(pool.clone()),

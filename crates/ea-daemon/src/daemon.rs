@@ -386,7 +386,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // daemon has decided not to look at something; that must be
             // visible here rather than only in the log, or it is exactly the
             // silent failure the rest of this endpoint exists to prevent.
-            "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
+            "unscorable_events": self.events.abandoned_count().await.unwrap_or_default(),
             // Scores held back by the threshold, by quiet hours or by the
             // hourly rate limit. The morning briefing now delivers them, so
             // `digest_pending` is normally the hours since the last briefing
@@ -926,7 +926,7 @@ record_voucher = "approve"
             let daemon = Daemon::build(Deps {
                 executor,
                 actions: ActionStore::new(Arc::clone(&conn)),
-                events: EventStore::new(Arc::clone(&conn)),
+                events: EventStore::new(pool.clone()),
                 runs: RunStore::new(pool.clone()),
                 scheduler: Arc::clone(&scheduler),
                 schedules: ScheduleStore::new(pool.clone()),
@@ -1378,12 +1378,14 @@ record_voucher = "approve"
                 kind: "assignment".into(),
                 payload: json!({ "title": "essay" }),
             })
+            .await
             .unwrap()
             .0
             .id;
         f.daemon
             .events
             .abandon(id, "tier 1 never scored it")
+            .await
             .unwrap();
 
         let after = f.call("status", Value::Null).await.unwrap();

@@ -310,7 +310,11 @@ pub fn tier1_prompt(events: &[Event]) -> String {
             event.id,
             event.source,
             event.kind,
-            event.created_at,
+            // `created_at` is a `DateTime<Utc>` now, not the stored RFC 3339
+            // string SQLite held; `.to_rfc3339()` keeps the prompt text byte
+            // for byte what it was, rather than chrono's `Display` format
+            // ("2026-09-24 09:00:00 UTC" — space-separated, no `T`).
+            event.created_at.to_rfc3339(),
             clip(&payload, PAYLOAD_BUDGET),
         ));
     }
@@ -421,7 +425,7 @@ mod tests {
             payload,
             salience: None,
             triaged_at: None,
-            created_at: "2026-09-24T09:00:00Z".to_string(),
+            created_at: "2026-09-24T09:00:00Z".parse().unwrap(),
             triage_attempts: 0,
             triage_error: None,
         }
@@ -601,7 +605,7 @@ mod tests {
     #[test]
     fn an_already_triaged_event_is_dropped() {
         let mut triaged = plain(1);
-        triaged.triaged_at = Some("2026-09-24T08:00:00Z".to_string());
+        triaged.triaged_at = Some("2026-09-24T08:00:00Z".parse().unwrap());
         triaged.salience = Some(70);
         let (kept, dropped) = tier0(vec![triaged], &Tier0Rules::default());
         assert!(kept.is_empty());
@@ -617,7 +621,7 @@ mod tests {
             "announcement",
             serde_json::json!({ "b": "exam" }),
         );
-        triaged.triaged_at = Some("2026-09-24T08:00:00Z".to_string());
+        triaged.triaged_at = Some("2026-09-24T08:00:00Z".parse().unwrap());
         let rules = Tier0Rules {
             keywords: vec!["exam".into()],
             ..Tier0Rules::default()

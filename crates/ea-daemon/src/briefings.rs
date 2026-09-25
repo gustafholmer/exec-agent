@@ -355,7 +355,7 @@ const START_KEYS: [&str; 2] = ["start", "overlap_start"];
 /// absorbs any offset (the largest in use anywhere is 14 hours) without
 /// trusting that. `MATERIAL_LIMIT` still caps the result, but now it caps
 /// *today's* events, after the date is known.
-pub fn todays_calendar(
+pub async fn todays_calendar(
     events: &EventStore,
     time_zone: Tz,
     now: DateTime<Utc>,
@@ -370,7 +370,8 @@ pub fn todays_calendar(
             &START_KEYS,
             &from,
             &to,
-        )?
+        )
+        .await?
         .into_iter()
         .filter(|event| starts_on(event, today, time_zone))
         .collect();
@@ -414,7 +415,7 @@ fn lines(events: &[Event]) -> String {
 }
 
 /// Everything the morning briefing is made of.
-pub fn morning_material<C: ToolCaller>(
+pub async fn morning_material<C: ToolCaller>(
     deps: &BriefingDeps<C>,
     now: DateTime<Utc>,
     since: DateTime<Utc>,
@@ -424,7 +425,7 @@ pub fn morning_material<C: ToolCaller>(
     let today = now.with_timezone(&deps.time_zone).date_naive();
     material.push(
         format!("Today's calendar ({today})"),
-        lines(&todays_calendar(&deps.events, deps.time_zone, now)?),
+        lines(&todays_calendar(&deps.events, deps.time_zone, now).await?),
     );
     // Two readings of the brief's "anything untriaged above the digest
     // threshold", and both are material a morning briefing wants. The literal
@@ -434,7 +435,7 @@ pub fn morning_material<C: ToolCaller>(
     // interruption line since the last briefing.
     material.push(
         "Not yet triaged",
-        lines(&deps.events.untriaged(MATERIAL_LIMIT)?),
+        lines(&deps.events.untriaged(MATERIAL_LIMIT).await?),
     );
     material.push(
         format!(
@@ -444,7 +445,8 @@ pub fn morning_material<C: ToolCaller>(
         lines(
             &deps
                 .events
-                .scored_since(i64::from(deps.threshold), since, MATERIAL_LIMIT)?,
+                .scored_since(i64::from(deps.threshold), since, MATERIAL_LIMIT)
+                .await?,
         ),
     );
     material.push("Digest since the last briefing", digest.join("\n"));
@@ -523,7 +525,7 @@ pub async fn vat_material<C: ToolCaller>(
     // does, this wants the same treatment `todays_calendar` got.
     material.push(
         "Upcoming declaration deadlines",
-        lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT)?),
+        lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT).await?),
     );
     Ok(material)
 }
@@ -684,7 +686,7 @@ pub async fn run_morning_briefing<C: ToolCaller>(
     // a second briefing on the same day report nothing twice: the first one
     // dropped exactly the lines it sent.
     let digest = deps.log.digest().await?;
-    let material = morning_material(deps, now, since, &digest)?;
+    let material = morning_material(deps, now, since, &digest).await?;
 
     if material.is_empty() {
         tracing::info!("nothing to brief on; sending the short line instead of a session");
@@ -785,7 +787,6 @@ mod tests {
     use ea_core::store::events::RecordInput;
     use ea_core::store::kv::KvStore;
     use ea_core::store::runs::RunStore;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::session::SessionOutcome;
@@ -920,7 +921,6 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
         pool: sqlx::PgPool,
         events: EventStore,
         log: NotificationLog,
@@ -935,11 +935,7 @@ record_voucher = "approve"
     }
 
     fn build(pool: sqlx::PgPool, pusher: Arc<SpyPusher>, caller: Arc<SpyCaller>) -> Fixture {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::sqlite::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        let events = EventStore::new(Arc::clone(&conn));
+        let events = EventStore::new(pool.clone());
         let log = NotificationLog::new(KvStore::new(pool.clone()));
         let sessions = SpySessions::new("the briefing");
         let deps = BriefingDeps {
@@ -954,7 +950,6 @@ record_voucher = "approve"
             budget: Budget::new(RunStore::new(pool.clone()), 60, Stockholm),
         };
         Fixture {
-            _dir: dir,
             pool,
             events,
             log,
@@ -969,7 +964,7 @@ record_voucher = "approve"
         text.parse().unwrap()
     }
 
-    fn record(events: &EventStore, source: &str, id: &str, kind: &str, payload: Value) -> Event {
+    async fn record(events: &EventStore, source: &str, id: &str, kind: &str, payload: Value) -> Event {
         events
             .record(RecordInput {
                 source: source.into(),
@@ -977,6 +972,7 @@ record_voucher = "approve"
                 kind: kind.into(),
                 payload,
             })
+            .await
             .unwrap()
             .0
     }
@@ -995,24 +991,24 @@ record_voucher = "approve"
             "late",
             kinds::CALENDAR_EVENT,
             json!({ "title": "midnight standup", "start": "2026-09-24T22:30:00Z" }),
-        );
+        ).await;
         record(
             &f.events,
             "google",
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch", "start": "2026-09-25T10:00:00Z" }),
-        );
+        ).await;
         record(
             &f.events,
             "google",
             "tomorrow",
             kinds::CALENDAR_EVENT,
             json!({ "title": "next week", "start": "2026-09-30T10:00:00Z" }),
-        );
+        ).await;
 
         // Noon Stockholm on 25 September.
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1041,7 +1037,7 @@ record_voucher = "approve"
             "the-one-that-matters",
             kinds::CALENDAR_EVENT,
             json!({ "title": "board meeting", "start": "2026-09-25T08:00:00Z" }),
-        );
+        ).await;
         // A hundred rows recorded since, none of them today's.
         for i in 0..100 {
             record(
@@ -1050,10 +1046,10 @@ record_voucher = "approve"
                 &format!("later-{i}"),
                 kinds::CALENDAR_EVENT,
                 json!({ "title": format!("standup {i}"), "start": "2026-10-02T08:00:00Z" }),
-            );
+            ).await;
         }
 
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1073,7 +1069,7 @@ record_voucher = "approve"
             "the-clash",
             kinds::CALENDAR_CONFLICT,
             json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
-        );
+        ).await;
         for i in 0..100 {
             record(
                 &f.events,
@@ -1081,9 +1077,9 @@ record_voucher = "approve"
                 &format!("later-{i}"),
                 kinds::CALENDAR_CONFLICT,
                 json!({ "overlap_start": "2026-10-02T09:00:00Z" }),
-            );
+            ).await;
         }
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(ids, vec!["the-clash"]);
     }
@@ -1097,8 +1093,8 @@ record_voucher = "approve"
             "clash",
             kinds::CALENDAR_CONFLICT,
             json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
-        );
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        ).await;
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         assert_eq!(found.len(), 1);
     }
 
@@ -1158,22 +1154,22 @@ record_voucher = "approve"
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
-        );
+        ).await;
         let scored = record(
             &f.events,
             "canvas",
             "hand-in",
             "assignment",
             json!({ "title": "XX1002 hand-in" }),
-        );
+        ).await;
         record(
             &f.events,
             "kth",
             "unread",
             "mail",
             json!({ "subject": "examiner mail" }),
-        );
-        f.events.set_salience(scored.id, 90).unwrap();
+        ).await;
+        f.events.set_salience(scored.id, 90).await.unwrap();
         f.log.push_digest("[notion] a page moved (30)").await.unwrap();
 
         let outcome = run_morning_briefing(
@@ -1252,7 +1248,7 @@ record_voucher = "approve"
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
-        );
+        ).await;
         f.log.push_digest("[notion] a page moved (30)").await.unwrap();
 
         let first = run_morning_briefing(
@@ -1501,7 +1497,7 @@ record_voucher = "approve"
             "tax-deadline:moms:2026-09",
             kinds::TAX_DEADLINE,
             json!({ "label": "Momsdeklaration", "due_on": "2026-10-12" }),
-        );
+        ).await;
 
         run_vat_prep(&f.deps, utc("2026-10-01T07:00:00Z"))
             .await
