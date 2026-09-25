@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 380" width="880" height="380" role="img" aria-labelledby="t d">
+  <title id="t">exec-agent</title>
+  <desc id="d">Mail, calendars, coursework, Notion and the company books flow into the assistant, which filters out the noise and sends only what matters to your phone, with Approve and Reject buttons for anything it wants to change.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrHot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a5b4fc"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .src { fill: #1e293b; stroke: #334155; stroke-width: 1.5; }
+      .srcLabel { fill: #e2e8f0; font-size: 15px; font-weight: 600; }
+      .srcSub { fill: #94a3b8; font-size: 11px; }
+      .flow { stroke: #64748b; stroke-width: 1.6; fill: none; stroke-dasharray: 4 5; }
+      .noise { fill: #475569; font-size: 11px; font-style: italic; }
+    </style>
+  </defs>
+
+  <rect width="880" height="380" rx="18" fill="url(#bg)"/>
+
+  <!-- Sources -->
+  <g>
+    <rect class="src" x="28" y="34" width="200" height="50" rx="12"/>
+    <text x="48" y="59" class="srcLabel">✉  Mail</text>
+    <text x="48" y="75" class="srcSub">work, private, university</text>
+
+    <rect class="src" x="28" y="96" width="200" height="50" rx="12"/>
+    <text x="48" y="121" class="srcLabel">📅  Calendars</text>
+    <text x="48" y="137" class="srcSub">meetings and events</text>
+
+    <rect class="src" x="28" y="158" width="200" height="50" rx="12"/>
+    <text x="48" y="183" class="srcLabel">🎓  Coursework</text>
+    <text x="48" y="199" class="srcSub">assignment deadlines</text>
+
+    <rect class="src" x="28" y="220" width="200" height="50" rx="12"/>
+    <text x="48" y="245" class="srcLabel">🗂  Notion</text>
+    <text x="48" y="261" class="srcSub">shared plans and notes</text>
+
+    <rect class="src" x="28" y="282" width="200" height="50" rx="12"/>
+    <text x="48" y="307" class="srcLabel">📒  Company books</text>
+    <text x="48" y="323" class="srcSub">invoices, VAT, tax dates</text>
+  </g>
+
+  <!-- Flows into the core -->
+  <path class="flow" d="M228,59 C290,59 290,190 322,190"/>
+  <path class="flow" d="M228,121 C285,121 290,190 322,190"/>
+  <path class="flow" d="M228,183 C280,183 290,190 322,190"/>
+  <path class="flow" d="M228,245 C285,245 290,190 322,190"/>
+  <path class="flow" d="M228,307 C290,307 290,190 322,190"/>
+  <circle cx="324" cy="190" r="4" fill="#64748b"/>
+  <path d="M324,190 L344,190" stroke="#64748b" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Core -->
+  <rect x="348" y="104" width="220" height="172" rx="20" fill="url(#core)"/>
+  <rect x="348" y="104" width="220" height="172" rx="20" fill="none" stroke="#a5b4fc" stroke-opacity="0.5" stroke-width="1.5"/>
+  <text x="458" y="140" text-anchor="middle" fill="#ffffff" font-size="20" font-weight="700">exec-agent</text>
+  <text x="458" y="160" text-anchor="middle" fill="#c7d2fe" font-size="12">your assistant, running quietly</text>
+  <g fill="#e0e7ff" font-size="13">
+    <text x="374" y="194">①  reads everything</text>
+    <text x="374" y="219">②  decides what matters</text>
+    <text x="374" y="244">③  asks before it acts</text>
+  </g>
+
+  <!-- Filtered-out noise -->
+  <path d="M458,276 L458,322" stroke="#475569" stroke-width="1.6" stroke-dasharray="4 5" marker-end="url(#arr)"/>
+  <text x="458" y="344" text-anchor="middle" class="noise">the rest waits for a daily digest</text>
+
+  <!-- Flow to phone -->
+  <path d="M568,190 L646,190" stroke="#a5b4fc" stroke-width="2.4" fill="none" marker-end="url(#arrHot)"/>
+
+  <!-- Phone -->
+  <rect x="652" y="30" width="196" height="320" rx="30" fill="#020617" stroke="#475569" stroke-width="2"/>
+  <rect x="664" y="42" width="172" height="296" rx="22" fill="#111827"/>
+  <rect x="722" y="50" width="56" height="8" rx="4" fill="#020617"/>
+
+  <text x="678" y="86" fill="#94a3b8" font-size="11" font-weight="600">ASSISTANT · now</text>
+
+  <rect x="676" y="96" width="148" height="112" rx="14" fill="#1f2937"/>
+  <g fill="#f1f5f9" font-size="12">
+    <text x="688" y="120">Invoice #1042 to Acme</text>
+    <text x="688" y="137">is 14 days overdue.</text>
+    <text x="688" y="162">I drafted a polite</text>
+    <text x="688" y="179">reminder. Send it?</text>
+  </g>
+
+  <rect x="676" y="220" width="148" height="36" rx="10" fill="#16a34a"/>
+  <text x="750" y="243" text-anchor="middle" fill="#ffffff" font-size="13" font-weight="700">✓  Approve</text>
+  <rect x="676" y="264" width="148" height="36" rx="10" fill="#1f2937" stroke="#475569"/>
+  <text x="750" y="287" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="600">✕  Reject</text>
+
+  <text x="750" y="324" text-anchor="middle" fill="#64748b" font-size="10">nothing happens until you tap</text>
+</svg>

@@ -1,5 +1,32 @@
 # exec-agent
 
+<p align="center">
+  <img src="assets/hero.svg" alt="Mail, calendars, coursework, Notion and the company books flow into exec-agent, which sends only what matters to your phone and waits for you to tap Approve or Reject before changing anything." width="100%">
+</p>
+
+## In plain terms
+
+exec-agent is a personal assistant that lives quietly on your Mac and keeps
+an eye on the places where things pile up: your email, your calendars, your
+university coursework, your shared Notion pages and your company's books.
+
+Most of what arrives there can wait, so it doesn't interrupt you with it. It
+reads everything, works out what actually needs you (a meeting that moved, an
+assignment due tomorrow, an invoice that's gone unpaid) and sends you a short
+message on your phone. The rest goes into a daily summary you can read over
+coffee.
+
+It can also do small jobs for you, like drafting a reply or preparing a
+reminder, but **it asks first**. Almost anything it wants to send or change shows up
+on your phone with an **Approve** and a **Reject** button, and nothing happens
+until you tap one. If it's unsure whether it's allowed to do something, it
+asks you instead of guessing.
+
+The rest of this README is for anyone who wants to run it or understand how
+it works under the hood.
+
+## Technical overview
+
 A personal executive assistant that runs as a background daemon on macOS. It
 watches five services — mail, two calendars, coursework, Notion, and the
 company's books — decides what is worth your attention, interrupts you on
