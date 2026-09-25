@@ -341,6 +341,8 @@ impl CalendarClient {
         base.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // No redirects, ever: a same-host https->http downgrade would
             // otherwise carry the bearer access token onto the wire in clear
@@ -1048,6 +1050,35 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].account, "work");
         assert_eq!(events[0].title, "Advisor meeting");
+    }
+
+    /// `reqwest` sends no `User-Agent` at all by default, which is what got
+    /// the Canvas connector a 403 from the live API. Google tolerates an
+    /// anonymous client today; its API guidelines ask for one regardless.
+    #[tokio::test]
+    async fn every_request_identifies_the_client_by_user_agent() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = auth_with_healthy_token(tmp.path(), "work");
+
+        Mock::given(method("GET"))
+            .and(path("/calendars/primary/events"))
+            .and(header("user-agent", ea_core::http::USER_AGENT))
+            .respond_with(json_page(serde_json::json!({ "items": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        CalendarClient::new(&server.uri())
+            .unwrap()
+            .list_events(
+                &auth,
+                "work",
+                at("2026-09-01T00:00:00Z"),
+                at("2026-11-01T00:00:00Z"),
+            )
+            .await
+            .expect("the User-Agent header must be present");
     }
 
     #[tokio::test]

@@ -733,6 +733,8 @@ impl fmt::Debug for HttpTokenBackend {
 impl HttpTokenBackend {
     pub fn new(config: &AppConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // This client carries a refresh token (and, at consent time, a
             // PKCE verifier) in every request body. `reqwest`'s default

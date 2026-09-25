@@ -660,6 +660,8 @@ impl fmt::Debug for HttpRefreshBackend {
 impl HttpRefreshBackend {
     pub fn new(config: &AppConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
+            // Not optional; see `ea_core::http` for the 403 that proved it.
+            .user_agent(ea_core::http::USER_AGENT)
             .timeout(HTTP_TIMEOUT)
             // This client carries a refresh token and a client secret in every
             // request body. `reqwest`'s default redirect policy strips the

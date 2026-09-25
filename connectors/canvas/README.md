@@ -106,6 +106,15 @@ Failure reading guide:
   redirect or a maintenance page. Check `baseUrl` and the token.
 - `no Canvas credentials at …` — the file is missing; the message carries the
   commands to create it.
+- `HTTP 403 Forbidden` whose body is HTML saying *"You are not authorized to
+  access this site because you have not provided a valid user agent"* — the
+  request reached Canvas without a `User-Agent` header. `canvas.kth.se`
+  rejects those outright, and the message says nothing about your token, so
+  the 403 reads like a permissions problem when it is not. Every client in
+  this workspace now sends `exec-agent/<version>`
+  (`ea_core::http::USER_AGENT`), so this should not recur from the connector
+  — but a `curl` you write by hand will hit it, and `curl -A exec-agent/0.1`
+  is the fix.
 
 ## Notes on the Canvas API
 
