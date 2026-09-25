@@ -114,6 +114,30 @@ fn hydrate(row: &sqlx::postgres::PgRow) -> anyhow::Result<Event> {
     })
 }
 
+/// True when `err`'s chain bottoms out at a Postgres error in SQLSTATE class
+/// `22` — a data exception, where the fault is the *content* of the row a
+/// caller tried to write, not the connection, the pool, or the query. The
+/// two class-`22` codes [`EventStore::record`] can actually produce today are
+/// `22021` (`character_not_in_repertoire`: a NUL byte in a plain `TEXT`
+/// column) and `22P05` (`untranslatable_character`: a NUL byte inside a
+/// `JSONB` string value) — see the NUL-byte tests below.
+///
+/// This is the line a caller like `run_watch_poll` needs: a connector handing
+/// back one malformed item is not a reason to abandon the rest of the poll,
+/// but a database that is down or a pool that has timed out is exactly the
+/// "connector looks healthy forever" failure the poll's breaker exists to
+/// catch, and must never be treated the same way. Everything that is not a
+/// class-`22` database error — `PoolTimedOut`, `PoolClosed`, `Io`, a
+/// constraint violation from a different class, or no `sqlx::Error` in the
+/// chain at all — is *not* rejected content, and the caller must propagate it.
+pub fn is_rejected_content(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(|db_err| db_err.code())
+        .is_some_and(|code| code.starts_with("22"))
+}
+
 #[derive(Clone)]
 pub struct EventStore {
     pool: PgPool,
@@ -964,10 +988,16 @@ mod tests {
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn a_nul_byte_in_a_text_field_is_an_error_not_a_panic(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);
-        let result = store
+        let err = store
             .record(input("canvas", "e\u{0}1", json!({"a": 1})))
-            .await;
-        assert!(result.is_err(), "a NUL byte must be refused, cleanly");
+            .await
+            .expect_err("a NUL byte must be refused, cleanly");
+        assert!(
+            is_rejected_content(&err),
+            "a NUL byte is a data exception (SQLSTATE class 22), which a \
+             caller like run_watch_poll must be able to tell apart from a \
+             connection failure: {err:#}"
+        );
     }
 
     /// The same hazard inside a JSONB *value* rather than a plain text column:
@@ -977,13 +1007,25 @@ mod tests {
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn a_nul_byte_inside_a_jsonb_string_value_is_an_error_not_a_panic(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);
-        let result = store
+        let err = store
             .record(input("canvas", "e1", json!({"body": "before\u{0}after"})))
-            .await;
+            .await
+            .expect_err("a NUL byte inside a JSON string value must be refused, cleanly");
         assert!(
-            result.is_err(),
-            "a NUL byte inside a JSON string value must be refused, cleanly"
+            is_rejected_content(&err),
+            "expected a class-22 data exception: {err:#}"
         );
+    }
+
+    /// The negative case `is_rejected_content` exists to draw: an error with
+    /// no Postgres database error in its chain at all — the shape a pool
+    /// timeout or a closed pool takes — must never be mistaken for rejected
+    /// content, or a database outage would look like "one bad row" and the
+    /// poll it came from would report success.
+    #[test]
+    fn is_rejected_content_is_false_for_an_error_with_no_database_error_in_it() {
+        let err = anyhow::anyhow!("the pool is closed").context("recording an event");
+        assert!(!is_rejected_content(&err));
     }
 
     /// Review Focus #3: `JSONB NOT NULL` accepts JSON `null` — it is a JSON

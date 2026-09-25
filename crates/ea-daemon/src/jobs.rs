@@ -158,14 +158,21 @@ pub async fn run_watch_poll<C: ToolCaller>(
         new: 0,
     };
     for item in items {
-        // A single malformed item must not take down the rest of the batch.
-        // Under SQLite this loop could not fail on the *content* of an item —
-        // a NUL byte, say, is ordinary SQLite TEXT — so every failure here
-        // was a real I/O problem and propagating it was correct. Postgres
-        // TEXT and JSONB both reject an embedded NUL, which a connector can
-        // now hand back from untrusted data (a mail subject, say), and one
-        // event like that must not stop the other 39 in the same poll from
-        // being recorded, or trip the connector's breaker over one bad row.
+        // A single malformed item must not take down the rest of the batch —
+        // but only when the fault really is the item's content. Under SQLite
+        // this loop could not fail on content at all (a NUL byte, say, is
+        // ordinary SQLite TEXT), so every failure here was a real problem and
+        // propagating it was correct. Postgres TEXT and JSONB both reject an
+        // embedded NUL, which a connector can now hand back from untrusted
+        // data (a mail subject, say) — but a blanket catch-and-skip here
+        // would also swallow a database outage: every item in the poll would
+        // fail, each would be logged and skipped, and the poll would still
+        // return `Ok`, which is exactly the "connector looks healthy
+        // forever" failure this function's doc comment forbids. So only a
+        // Postgres data-exception (`is_rejected_content` — a NUL byte is the
+        // case in practice) is skipped per item; anything else (the pool is
+        // closed, a connection timed out, ...) propagates and fails the poll,
+        // same as before this loop existed.
         let external_id = item.external_id.clone();
         match events
             .record(RecordInput {
@@ -181,13 +188,16 @@ pub async fn run_watch_poll<C: ToolCaller>(
                     outcome.new += 1;
                 }
             }
-            Err(err) => {
+            Err(err) if ea_core::store::events::is_rejected_content(&err) => {
                 tracing::warn!(
                     connector,
                     external_id,
                     error = %format!("{err:#}"),
                     "could not record an event; skipping it"
                 );
+            }
+            Err(err) => {
+                return Err(err.context(format!("recording an event from {connector}")));
             }
         }
     }
@@ -818,6 +828,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("JSON array"), "{err:#}");
+    }
+
+    /// Controller fix round 1: a NUL byte is rejected content (SQLSTATE class
+    /// `22`), which the loop must skip and keep going on — the other items in
+    /// the same poll are not at fault and must still be recorded.
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_nul_byte_in_one_item_is_skipped_and_the_others_are_still_recorded(
+        pool: sqlx::PgPool,
+    ) {
+        let events = EventStore::new(pool);
+        let caller = FakeConnector::with(vec![Ok(r#"[
+            {"external_id":"a1","kind":"assignment","payload":{"title":"Essay"}},
+            {"external_id":"bad\u0000id","kind":"assignment","payload":{"title":"Bad"}},
+            {"external_id":"a2","kind":"assignment","payload":{"title":"Lab"}}
+        ]"#
+        .to_string())]);
+
+        let outcome = run_watch_poll("canvas", &caller, &events, &canvas_policy())
+            .await
+            .expect("a rejected-content item must not fail the whole poll");
+        assert_eq!(
+            outcome,
+            PollOutcome { seen: 3, new: 2 },
+            "the NUL-byte item is seen but not counted as new; the other two are"
+        );
+
+        let stored = events.untriaged(10).await.unwrap();
+        let ids: Vec<&str> = stored.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(stored.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"a1"), "{ids:?}");
+        assert!(ids.contains(&"a2"), "{ids:?}");
+    }
+
+    /// Controller fix round 1, the case the blanket log-and-skip got wrong: a
+    /// database outage is not rejected content, and must propagate and fail
+    /// the poll rather than being silently skipped item by item — which,
+    /// with every item in the poll failing the same way, would otherwise
+    /// leave `run_watch_poll` returning `Ok` while Postgres is unreachable.
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_closed_pool_propagates_rather_than_being_skipped_per_item(pool: sqlx::PgPool) {
+        let events = EventStore::new(pool.clone());
+        pool.close().await;
+        let caller = FakeConnector::with(vec![Ok(
+            r#"[{"external_id":"a1","kind":"assignment","payload":{"title":"Essay"}}]"#
+                .to_string(),
+        )]);
+
+        let err = run_watch_poll("canvas", &caller, &events, &canvas_policy())
+            .await
+            .expect_err("a closed pool must fail the poll, not be skipped as one bad item");
+        assert!(
+            format!("{err:#}").contains("recording an event"),
+            "{err:#}"
+        );
     }
 
     // -- triage -------------------------------------------------------------
