@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         config.notify.time_zone,
     );
     let chat = Arc::new(ChatService::new(
-        ConversationStore::new(Arc::clone(&conn)),
+        ConversationStore::new(pool.clone()),
         FactStore::new(Arc::clone(&conn)),
         sessions.clone(),
         budget.clone(),

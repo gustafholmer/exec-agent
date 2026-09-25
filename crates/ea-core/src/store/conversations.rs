@@ -1,120 +1,113 @@
-use std::sync::{Arc, Mutex};
-
-use anyhow::anyhow;
-use chrono::Utc;
-use rusqlite::{params, Connection, Row};
+use anyhow::Context;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sqlx::PgPool;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct Message {
     pub id: i64,
     pub conversation_id: i64,
     pub role: String,
     pub surface: String,
     pub body: String,
-    pub created_at: String,
-}
-
-fn hydrate_message(row: &Row<'_>) -> rusqlite::Result<Message> {
-    Ok(Message {
-        id: row.get("id")?,
-        conversation_id: row.get("conversation_id")?,
-        role: row.get("role")?,
-        surface: row.get("surface")?,
-        body: row.get("body")?,
-        created_at: row.get("created_at")?,
-    })
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
 pub struct ConversationStore {
-    conn: Arc<Mutex<Connection>>,
+    pool: PgPool,
 }
 
 impl ConversationStore {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
-    /// The newest conversation's id, creating one if the table is empty.
-    pub fn current(&self) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-        conn.execute(
-            "INSERT INTO conversations (created_at) VALUES (?1)",
-            params![Utc::now().to_rfc3339()],
-        )?;
-        Ok(conn.last_insert_rowid())
+    /// The id of the conversation in progress, creating one if there is none.
+    ///
+    /// The check and the insert have to be one atomic unit or two callers
+    /// arriving at an empty table each create a conversation. There is no row
+    /// to lock when the table is empty, so row-level locking cannot help; a
+    /// transaction-scoped advisory lock on a fixed key is the mechanism that
+    /// works on the empty case. It is released by the commit, and it is taken
+    /// on this one path only.
+    pub async fn current(&self) -> anyhow::Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ea.conversations.current'))")
+            .execute(&mut *tx)
+            .await
+            .context("taking the conversation lock")?;
+
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM conversations ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .context("reading the current conversation")?;
+
+        let id = match existing {
+            Some(id) => id,
+            None => sqlx::query_scalar("INSERT INTO conversations DEFAULT VALUES RETURNING id")
+                .fetch_one(&mut *tx)
+                .await
+                .context("opening a conversation")?,
+        };
+        tx.commit().await?;
+        Ok(id)
     }
 
-    pub fn append(
+    pub async fn append(
         &self,
         conversation_id: i64,
         role: &str,
         surface: &str,
         body: &str,
     ) -> anyhow::Result<Message> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO messages (conversation_id, role, surface, body, created_at)
-             VALUES (?1,?2,?3,?4,?5)",
-            params![
-                conversation_id,
-                role,
-                surface,
-                body,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        let mut stmt = conn.prepare("SELECT * FROM messages WHERE id = ?1")?;
-        let mut rows = stmt.query_map(params![id], hydrate_message)?;
-        match rows.next() {
-            Some(row) => Ok(row?),
-            None => Err(anyhow!("message {id} vanished after insert")),
-        }
+        sqlx::query_as::<_, Message>(
+            "INSERT INTO messages (conversation_id, role, surface, body)
+             VALUES ($1,$2,$3,$4)
+             RETURNING id, conversation_id, role, surface, body, created_at",
+        )
+        .bind(conversation_id)
+        .bind(role)
+        .bind(surface)
+        .bind(body)
+        .fetch_one(&self.pool)
+        .await
+        .context("appending a message")
     }
 
     /// The last `limit` messages in this conversation, oldest first.
-    pub fn recent(&self, conversation_id: i64, limit: i64) -> anyhow::Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM messages WHERE conversation_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![conversation_id, limit], hydrate_message)?;
-        let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    pub async fn recent(&self, conversation_id: i64, limit: i64) -> anyhow::Result<Vec<Message>> {
+        let mut messages = sqlx::query_as::<_, Message>(
+            "SELECT id, conversation_id, role, surface, body, created_at
+             FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT $2",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("reading recent messages")?;
         messages.reverse();
         Ok(messages)
     }
 
-    pub fn claude_session(&self, id: i64) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let session: Option<String> = conn
-            .query_row(
-                "SELECT claude_session FROM conversations WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-        Ok(session)
+    pub async fn claude_session(&self, id: i64) -> anyhow::Result<Option<String>> {
+        let session: Option<Option<String>> =
+            sqlx::query_scalar("SELECT claude_session FROM conversations WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("reading the claude session id")?;
+        Ok(session.flatten())
     }
 
-    pub fn set_claude_session(&self, id: i64, session: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations SET claude_session = ?1 WHERE id = ?2",
-            params![session, id],
-        )?;
+    pub async fn set_claude_session(&self, id: i64, session: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE conversations SET claude_session = $2 WHERE id = $1")
+            .bind(id)
+            .bind(session)
+            .execute(&self.pool)
+            .await
+            .context("setting the claude session id")?;
         Ok(())
     }
 }
@@ -122,31 +115,33 @@ impl ConversationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::test_support::temp_store;
 
-    #[test]
-    fn current_creates_a_conversation_then_reuses_it() {
-        let (_dir, conn) = temp_store();
-        let store = ConversationStore::new(conn);
-        let first = store.current().unwrap();
-        let second = store.current().unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn current_creates_a_conversation_then_reuses_it(pool: sqlx::PgPool) {
+        let store = ConversationStore::new(pool);
+        let first = store.current().await.unwrap();
+        let second = store.current().await.unwrap();
         assert_eq!(first, second);
     }
 
-    #[test]
-    fn both_surfaces_interleave_in_order() {
-        let (_dir, conn) = temp_store();
-        let store = ConversationStore::new(conn);
-        let convo = store.current().unwrap();
-        store.append(convo, "user", "telegram", "hi").unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn both_surfaces_interleave_in_order(pool: sqlx::PgPool) {
+        let store = ConversationStore::new(pool);
+        let convo = store.current().await.unwrap();
+        store
+            .append(convo, "user", "telegram", "hi")
+            .await
+            .unwrap();
         store
             .append(convo, "assistant", "cli", "hello there")
+            .await
             .unwrap();
         store
             .append(convo, "user", "telegram", "what's due today?")
+            .await
             .unwrap();
 
-        let recent = store.recent(convo, 10).unwrap();
+        let recent = store.recent(convo, 10).await.unwrap();
         assert_eq!(recent.len(), 3);
         assert_eq!(recent[0].body, "hi");
         assert_eq!(recent[0].surface, "telegram");
@@ -155,32 +150,61 @@ mod tests {
         assert_eq!(recent[2].body, "what's due today?");
     }
 
-    #[test]
-    fn recent_returns_the_last_n_chronologically() {
-        let (_dir, conn) = temp_store();
-        let store = ConversationStore::new(conn);
-        let convo = store.current().unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn recent_returns_the_last_n_chronologically(pool: sqlx::PgPool) {
+        let store = ConversationStore::new(pool);
+        let convo = store.current().await.unwrap();
         for i in 0..5 {
             store
                 .append(convo, "user", "cli", &format!("message {i}"))
+                .await
                 .unwrap();
         }
-        let recent = store.recent(convo, 2).unwrap();
+        let recent = store.recent(convo, 2).await.unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].body, "message 3");
         assert_eq!(recent[1].body, "message 4");
     }
 
-    #[test]
-    fn a_stored_session_id_round_trips() {
-        let (_dir, conn) = temp_store();
-        let store = ConversationStore::new(conn);
-        let convo = store.current().unwrap();
-        assert_eq!(store.claude_session(convo).unwrap(), None);
-        store.set_claude_session(convo, "sess-abc123").unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_stored_session_id_round_trips(pool: sqlx::PgPool) {
+        let store = ConversationStore::new(pool);
+        let convo = store.current().await.unwrap();
+        assert_eq!(store.claude_session(convo).await.unwrap(), None);
+        store
+            .set_claude_session(convo, "sess-abc123")
+            .await
+            .unwrap();
         assert_eq!(
-            store.claude_session(convo).unwrap().as_deref(),
+            store.claude_session(convo).await.unwrap().as_deref(),
             Some("sess-abc123")
         );
+    }
+
+    /// `current` was a SELECT-then-INSERT, atomic only because one global
+    /// mutex serialized the whole daemon. Without it, two callers arriving at
+    /// an empty table would each insert, and `ea chat` would silently fork
+    /// into two conversations.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn concurrent_callers_agree_on_one_conversation(pool: sqlx::PgPool) {
+        let store = ConversationStore::new(pool.clone());
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            set.spawn(async move { store.current().await.unwrap() });
+        }
+        let mut ids = Vec::new();
+        while let Some(id) = set.join_next().await {
+            ids.push(id.unwrap());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "every caller must get the same id, got {ids:?}");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "exactly one conversation row may exist");
     }
 }

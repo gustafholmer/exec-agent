@@ -1510,7 +1510,7 @@ mod end_to_end {
             caller,
         ));
         let conversations =
-            ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn));
+            ea_core::store::conversations::ConversationStore::new(pool.clone());
         let chat = Arc::new(crate::chat::ChatService::new(
             conversations.clone(),
             ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
@@ -1631,8 +1631,8 @@ mod end_to_end {
             source.sent(),
             vec![(CHAT, "the tenta is on the 14th".to_string())]
         );
-        let id = h.conversations.current().unwrap();
-        let messages = h.conversations.recent(id, 10).unwrap();
+        let id = h.conversations.current().await.unwrap();
+        let messages = h.conversations.recent(id, 10).await.unwrap();
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].surface, "telegram");
@@ -1661,9 +1661,9 @@ mod end_to_end {
                 crate::notify::telegram::UNRECOGNISED_REPLY.to_string()
             )]
         );
-        let id = h.conversations.current().unwrap();
+        let id = h.conversations.current().await.unwrap();
         assert!(
-            h.conversations.recent(id, 10).unwrap().is_empty(),
+            h.conversations.recent(id, 10).await.unwrap().is_empty(),
             "a stranger must not write to the owner's conversation"
         );
     }

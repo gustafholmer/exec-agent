@@ -902,7 +902,7 @@ record_voucher = "approve"
                 Ok(())
             }));
             let pusher = Arc::new(FakePusher::default());
-            let conversations = ConversationStore::new(Arc::clone(&conn));
+            let conversations = ConversationStore::new(pool.clone());
             let facts = FactStore::new(Arc::clone(&conn));
             let chat = Arc::new(ChatService::new(
                 conversations.clone(),
@@ -2157,8 +2157,8 @@ record_voucher = "approve"
             .await
             .unwrap();
 
-        let id = f.conversations.current().unwrap();
-        let messages = f.conversations.recent(id, 10).unwrap();
+        let id = f.conversations.current().await.unwrap();
+        let messages = f.conversations.recent(id, 10).await.unwrap();
         assert_eq!(
             messages
                 .iter()

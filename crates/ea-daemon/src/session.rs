@@ -1575,7 +1575,7 @@ mod tests {
             schedules: ea_core::store::schedules::ScheduleStore::new(pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::new(crate::chat::ChatService::new(
-                ea_core::store::conversations::ConversationStore::new(Arc::clone(&conn)),
+                ea_core::store::conversations::ConversationStore::new(pool.clone()),
                 ea_core::store::facts::FactStore::new(Arc::clone(&conn)),
                 None,
                 crate::budget::Budget::new(
