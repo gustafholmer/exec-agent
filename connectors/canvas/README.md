@@ -75,9 +75,16 @@ the connector silently green for the rest of term.
 
 ## Smoke test
 
-> **Unverified against the live Canvas API.** Every test in this crate runs
-> against `wiremock`; no test contacts Canvas. The first person with a real
-> token should run this and check the shapes.
+> **Verified against the live Canvas API on 2026-09-25** (`canvas.kth.se`).
+> `list_courses` returned ten courses and `watch_poll` five assignment events,
+> both with the shapes this crate expects. Every *test* here still runs against
+> `wiremock` and none contacts Canvas, so a shape change at the vendor would
+> not fail the suite — it would fail the next real poll.
+>
+> That run also found the only defect real traffic has exposed so far: Canvas
+> answers **403** to any request without a `User-Agent`, and `reqwest` sends
+> none by default. Every client in this workspace now sets one; see the failure
+> guide below.
 
 With credentials in place, talk to the connector directly over stdio — it is an
 ordinary MCP server, so two JSON-RPC lines are enough:
