@@ -293,11 +293,11 @@ impl OffsetStore {
     /// Record the next offset. Monotonic: a lower value is ignored, so a
     /// reordered or duplicated batch cannot rewind the cursor and replay taps
     /// that were already acted on.
+    ///
+    /// One statement ([`KvStore::set_max`]), so the check and the write
+    /// cannot be split by another writer.
     pub async fn set(&self, offset: i64) -> anyhow::Result<()> {
-        if self.get().await?.is_some_and(|current| current >= offset) {
-            return Ok(());
-        }
-        self.kv.set(OFFSET_KEY, &offset.to_string()).await
+        self.kv.set_max(OFFSET_KEY, offset).await
     }
 }
 
@@ -348,10 +348,7 @@ impl HandledUpdates {
     /// redelivered or reordered batch must never lower the mark and make an
     /// update claimable again.
     pub async fn mark(&self, update_id: i64) -> anyhow::Result<()> {
-        if self.contains(update_id).await? {
-            return Ok(());
-        }
-        self.kv.set(HANDLED_KEY, &update_id.to_string()).await
+        self.kv.set_max(HANDLED_KEY, update_id).await
     }
 }
 

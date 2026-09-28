@@ -58,30 +58,24 @@ impl NotificationLog {
     /// its own hour-window filtering, so nothing narrower is needed here.
     pub async fn recent(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<DateTime<Utc>>> {
         let raw: Vec<String> = self.kv.get_json(SENT_KEY).await?;
-        let cutoff = now - RETENTION;
-        let mut parsed: Vec<DateTime<Utc>> = raw
-            .iter()
-            .filter_map(|text| {
-                text.parse::<DateTime<Utc>>()
-                    .map_err(|err| {
-                        tracing::warn!(value = %text, error = %err, "dropping unparseable notification timestamp");
-                    })
-                    .ok()
-            })
-            .filter(|sent| *sent > cutoff)
-            .collect();
-        parsed.sort_unstable();
-        Ok(parsed)
+        Ok(within_retention(&raw, now))
     }
 
     /// Record that an interruption was delivered at `at`, pruning anything
     /// older than [`RETENTION`].
+    ///
+    /// Atomic ([`KvStore::update_json`]): several `NotificationLog`s share
+    /// this key across concurrently running jobs, and a lost send would make
+    /// the hourly limit under-count.
     pub async fn record(&self, at: DateTime<Utc>) -> anyhow::Result<()> {
-        let mut history = self.recent(at).await?;
-        history.push(at);
-        history.sort_unstable();
-        let encoded: Vec<String> = history.iter().map(|t| t.to_rfc3339()).collect();
-        self.kv.set_json(SENT_KEY, &encoded).await
+        self.kv
+            .update_json(SENT_KEY, |raw: &mut Vec<String>| {
+                let mut history = within_retention(raw, at);
+                history.push(at);
+                history.sort_unstable();
+                *raw = history.iter().map(|t| t.to_rfc3339()).collect();
+            })
+            .await
     }
 
     /// Hold a line for the next digest.
@@ -92,21 +86,39 @@ impl NotificationLog {
     /// might have wanted to read is destroyed. A number they can see in `ea
     /// status` is the difference between "the daemon is quiet" and "the daemon
     /// has been throwing away your mail for a week".
+    ///
+    /// One transaction over both keys, locked digest first and then the drop
+    /// count (the only order anything here takes them in): a push that
+    /// interleaved with the briefing's [`NotificationLog::drop_digest_prefix`]
+    /// would otherwise be overwritten by it, and the owner never told.
     pub async fn push_digest(&self, line: impl Into<String>) -> anyhow::Result<()> {
-        let mut lines: Vec<String> = self.kv.get_json(DIGEST_KEY).await?;
+        let mut tx = self.kv.begin().await?;
+        let mut lines: Vec<String> = tx.lock_json(DIGEST_KEY).await?;
         lines.push(line.into());
+        let mut dropped_report = None;
         if lines.len() > MAX_DIGEST_LINES {
             let overflow = lines.len() - MAX_DIGEST_LINES;
             let dropped: Vec<String> = lines.drain(..overflow).collect();
-            let total = self.record_drops(overflow).await?;
+            let total = tx
+                .lock_json::<u64>(DIGEST_DROPPED_KEY)
+                .await?
+                .saturating_add(overflow.try_into().unwrap_or(u64::MAX));
+            tx.set_json(DIGEST_DROPPED_KEY, &total).await?;
+            dropped_report = Some((overflow, total, dropped.into_iter().next()));
+        }
+        tx.set_json(DIGEST_KEY, &lines).await?;
+        tx.commit().await?;
+        // Logged only once the drop is durable, so the log never claims a
+        // drop that a failed commit rolled back.
+        if let Some((overflow, total, oldest)) = dropped_report {
             tracing::warn!(
                 dropped = overflow,
                 dropped_total = total,
-                oldest = %dropped.first().map(String::as_str).unwrap_or(""),
+                oldest = %oldest.as_deref().unwrap_or(""),
                 "the digest backlog is full; discarding its oldest lines"
             );
         }
-        self.kv.set_json(DIGEST_KEY, &lines).await
+        Ok(())
     }
 
     /// Everything held for the digest, without clearing it.
@@ -125,15 +137,6 @@ impl NotificationLog {
     /// database's whole life.
     pub async fn digest_dropped(&self) -> anyhow::Result<u64> {
         self.kv.get_json(DIGEST_DROPPED_KEY).await
-    }
-
-    async fn record_drops(&self, count: usize) -> anyhow::Result<u64> {
-        let total = self
-            .digest_dropped()
-            .await?
-            .saturating_add(count.try_into().unwrap_or(u64::MAX));
-        self.kv.set_json(DIGEST_DROPPED_KEY, &total).await?;
-        Ok(total)
     }
 
     /// Drop the first `count` lines of the digest, leaving the rest.
@@ -157,17 +160,38 @@ impl NotificationLog {
         if count == 0 {
             return Ok(());
         }
-        let lines: Vec<String> = self.kv.get_json(DIGEST_KEY).await?;
-        let kept: Vec<String> = lines.into_iter().skip(count).collect();
-        self.kv.set_json(DIGEST_KEY, &kept).await
+        self.kv
+            .update_json(DIGEST_KEY, |lines: &mut Vec<String>| {
+                lines.drain(..count.min(lines.len()));
+            })
+            .await
     }
 
     /// Everything held for the digest, clearing it.
     pub async fn take_digest(&self) -> anyhow::Result<Vec<String>> {
-        let lines = self.digest().await?;
-        self.kv.set_json(DIGEST_KEY, &Vec::<String>::new()).await?;
-        Ok(lines)
+        self.kv
+            .update_json(DIGEST_KEY, |lines: &mut Vec<String>| std::mem::take(lines))
+            .await
     }
+}
+
+/// The parseable entries of a stored send history that fall within
+/// [`RETENTION`] of `now`, oldest first.
+fn within_retention(raw: &[String], now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let cutoff = now - RETENTION;
+    let mut parsed: Vec<DateTime<Utc>> = raw
+        .iter()
+        .filter_map(|text| {
+            text.parse::<DateTime<Utc>>()
+                .map_err(|err| {
+                    tracing::warn!(value = %text, error = %err, "dropping unparseable notification timestamp");
+                })
+                .ok()
+        })
+        .filter(|sent| *sent > cutoff)
+        .collect();
+    parsed.sort_unstable();
+    parsed
 }
 
 #[cfg(test)]
@@ -366,6 +390,59 @@ mod tests {
         log.drop_digest_prefix(read.len()).await.unwrap();
 
         assert_eq!(log.digest().await.unwrap(), vec!["three".to_string()]);
+    }
+
+    /// The kv-level race the Postgres port opened: several jobs hold their
+    /// own `NotificationLog` over the same keys, and each mutation used to be
+    /// a read and a write with a network round trip between them. Pushes,
+    /// sends and a briefing's drain run concurrently here; nothing may be
+    /// lost.
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn concurrent_mutations_lose_nothing(pool: sqlx::PgPool) {
+        // Two lines the "briefing" has read and will drop.
+        let log = store(pool.clone());
+        log.push_digest("read-0").await.unwrap();
+        log.push_digest("read-1").await.unwrap();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let log = store(pool.clone());
+            tasks.spawn(async move { log.push_digest(format!("new-{i}")).await.unwrap() });
+            let log = store(pool.clone());
+            tasks.spawn(async move {
+                log.record(daytime() - Duration::minutes(i)).await.unwrap()
+            });
+        }
+        let drainer = store(pool.clone());
+        tasks.spawn(async move { drainer.drop_digest_prefix(2).await.unwrap() });
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap();
+        }
+
+        let lines = log.digest().await.unwrap();
+        // The drain may run before some pushes, in which case it removes
+        // "new" lines instead of the two it read; what must hold is that
+        // every push landed and exactly two lines were dropped.
+        assert_eq!(lines.len(), 12, "{lines:?}");
+        assert!(lines.iter().all(|l| l.starts_with("new-") || l.starts_with("read-")));
+        assert_eq!(log.recent(daytime()).await.unwrap().len(), 12, "every send is recorded");
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn concurrent_pushes_are_all_kept(pool: sqlx::PgPool) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..20 {
+            let log = store(pool.clone());
+            tasks.spawn(async move { log.push_digest(format!("line {i}")).await.unwrap() });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap();
+        }
+        let mut lines = store(pool).digest().await.unwrap();
+        lines.sort();
+        let mut expected: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        expected.sort();
+        assert_eq!(lines, expected);
     }
 
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
