@@ -253,9 +253,17 @@ before `./scripts/install-launchd.sh`.
 
 ```bash
 brew install postgresql@17 && brew services start postgresql@17
-createuser --createdb ea && createdb -O ea exec_agent
-umask 077 && echo 'postgres:///exec_agent' > ~/.config/exec-agent/database.url
+# postgresql@17 is keg-only: its client tools are not on PATH, and an older
+# Postgres's `psql` may be. Use the keg's explicitly.
+PG="$(brew --prefix postgresql@17)/bin"
+"$PG/createuser" --createdb ea && "$PG/createdb" -O ea exec_agent
+mkdir -p ~/.config/exec-agent
+(umask 077 && echo 'postgres://ea@localhost/exec_agent' > ~/.config/exec-agent/database.url)
 ```
+
+The URL connects as the `ea` role the snippet creates, which owns the
+database; Homebrew's default `pg_hba.conf` trusts local connections, so it
+needs no password here.
 
 That leaves the connection URL in a `0600` file the daemon points `[database]
 url_file` at, in the sample `config.toml` below. `url_file` is read through
@@ -351,8 +359,8 @@ ceiling is two files per stream.
 ### Backups
 
 `cp state.db` is no longer a backup. A nightly
-`pg_dump exec_agent > ~/.local/state/exec-agent/backup.sql` keeps Time Machine
-covering it.
+`"$(brew --prefix postgresql@17)/bin/pg_dump" -U ea exec_agent > ~/.local/state/exec-agent/backup.sql`
+keeps Time Machine covering it.
 
 ### Telegram
 
