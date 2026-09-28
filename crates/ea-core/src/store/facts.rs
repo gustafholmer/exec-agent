@@ -246,6 +246,33 @@ mod tests {
         assert!(serde_json::to_value(&never).unwrap()["updated_at"].is_null());
     }
 
+    /// Concurrent `remember`s of one topic in different cases converge on one
+    /// row: the `ON CONFLICT (lower(topic))` upsert under a real race.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn concurrent_remember_of_one_topic_in_different_cases_makes_one_row(
+        pool: sqlx::PgPool,
+    ) {
+        let facts = FactStore::new(pool.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, topic) in ["Tenta", "tenta", "TENTA", "tEnTa", "tenta", "Tenta"]
+            .into_iter()
+            .enumerate()
+        {
+            let facts = facts.clone();
+            tasks.spawn(async move { facts.remember(topic, &format!("body {i}")).await.unwrap() });
+        }
+        let mut ids = Vec::new();
+        while let Some(done) = tasks.join_next().await {
+            ids.push(done.unwrap().id);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn a_remembered_fact_comes_back(pool: sqlx::PgPool) {
         let facts = FactStore::new(pool);

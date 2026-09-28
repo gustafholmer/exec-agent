@@ -167,7 +167,8 @@ pub async fn run_watch_poll<C: ToolCaller>(
         // skipped, and the poll would still return `Ok`, which is exactly
         // the "connector looks healthy forever" failure this function's doc
         // comment forbids. So only a Postgres data-exception
-        // (`is_rejected_content` — a NUL byte is the case in practice) is
+        // (`is_rejected_content` — NUL bytes used to be the case in practice;
+        // `EventStore::record` now replaces them, so this is a backstop) is
         // skipped per item; anything else (the pool is closed, a connection
         // timed out, ...) propagates and fails the poll.
         let external_id = item.external_id.clone();
@@ -820,11 +821,13 @@ mod tests {
         assert!(format!("{err:#}").contains("JSON array"), "{err:#}");
     }
 
-    /// Controller fix round 1: a NUL byte is rejected content (SQLSTATE class
-    /// `22`), which the loop must skip and keep going on — the other items in
-    /// the same poll are not at fault and must still be recorded.
+    /// A NUL byte used to be rejected content (SQLSTATE class `22`) that the
+    /// loop skipped — dropping the item on every poll, forever. The store now
+    /// replaces the byte, so the item is recorded along with the rest. (The
+    /// class-22 skip itself is still there as a backstop; its predicate is
+    /// tested in `ea_core::store::events`.)
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
-    async fn a_nul_byte_in_one_item_is_skipped_and_the_others_are_still_recorded(
+    async fn a_nul_byte_in_one_item_is_recorded_with_the_others(
         pool: sqlx::PgPool,
     ) {
         let events = EventStore::new(pool);
@@ -837,17 +840,18 @@ mod tests {
 
         let outcome = run_watch_poll("canvas", &caller, &events, &canvas_policy())
             .await
-            .expect("a rejected-content item must not fail the whole poll");
+            .expect("a NUL byte must not fail the whole poll");
         assert_eq!(
             outcome,
-            PollOutcome { seen: 3, new: 2 },
-            "the NUL-byte item is seen but not counted as new; the other two are"
+            PollOutcome { seen: 3, new: 3 },
+            "the NUL-byte item is recorded too"
         );
 
         let stored = events.untriaged(10).await.unwrap();
         let ids: Vec<&str> = stored.iter().map(|e| e.external_id.as_str()).collect();
-        assert_eq!(stored.len(), 2, "{ids:?}");
+        assert_eq!(stored.len(), 3, "{ids:?}");
         assert!(ids.contains(&"a1"), "{ids:?}");
+        assert!(ids.contains(&"bad\u{FFFD}id"), "{ids:?}");
         assert!(ids.contains(&"a2"), "{ids:?}");
     }
 

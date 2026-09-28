@@ -105,10 +105,10 @@ fn hydrate(row: &sqlx::postgres::PgRow) -> anyhow::Result<Event> {
 /// True when `err`'s chain bottoms out at a Postgres error in SQLSTATE class
 /// `22` — a data exception, where the fault is the *content* of the row a
 /// caller tried to write, not the connection, the pool, or the query. The
-/// two class-`22` codes [`EventStore::record`] can actually produce today are
-/// `22021` (`character_not_in_repertoire`: a NUL byte in a plain `TEXT`
-/// column) and `22P05` (`untranslatable_character`: a NUL byte inside a
-/// `JSONB` string value) — see the NUL-byte tests below.
+/// two class-`22` codes a NUL byte used to produce — `22021` in a plain
+/// `TEXT` column, `22P05` inside a `JSONB` string — can no longer reach the
+/// database, because [`EventStore::record`] replaces NULs first; this remains
+/// the backstop for any other data exception.
 ///
 /// This is the line a caller like `run_watch_poll` needs: a connector handing
 /// back one malformed item is not a reason to abandon the rest of the poll,
@@ -124,6 +124,38 @@ pub fn is_rejected_content(err: &anyhow::Error) -> bool {
         .and_then(sqlx::Error::as_database_error)
         .and_then(|db_err| db_err.code())
         .is_some_and(|code| code.starts_with("22"))
+}
+
+/// Replace every NUL byte with U+FFFD (the replacement character).
+///
+/// Postgres `TEXT` and `JSONB` both refuse U+0000, and connector data is
+/// untrusted: a mail subject with a NUL in it would otherwise be rejected on
+/// every poll and never reach triage — a third party able to keep an item out
+/// of the owner's sight. SQLite stored such text as-is. Replacing the byte
+/// keeps the event, visibly marked where the NUL was. `watch_poll`'s
+/// skip of class-`22` errors ([`is_rejected_content`]) stays as the backstop
+/// for any other data exception.
+fn sanitize_nul(text: String) -> String {
+    if text.contains('\0') {
+        text.replace('\0', "\u{FFFD}")
+    } else {
+        text
+    }
+}
+
+/// [`sanitize_nul`] over every string in a JSON value, object keys included.
+fn sanitize_nul_json(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(sanitize_nul(text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_nul_json).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (sanitize_nul(key), sanitize_nul_json(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 #[derive(Clone)]
@@ -149,7 +181,15 @@ impl EventStore {
     /// `xmax = 0` is how Postgres distinguishes an insert from an update in an
     /// upsert's RETURNING. It is an MVCC implementation detail rather than
     /// documented SQL, which is why both branches are covered by tests.
+    ///
+    /// NUL bytes are replaced with U+FFFD first (see [`sanitize_nul`]).
     pub async fn record(&self, input: RecordInput) -> anyhow::Result<(Event, bool)> {
+        let input = RecordInput {
+            source: sanitize_nul(input.source),
+            external_id: sanitize_nul(input.external_id),
+            kind: sanitize_nul(input.kind),
+            payload: sanitize_nul_json(input.payload),
+        };
         let row = sqlx::query(
             "INSERT INTO events (source, external_id, kind, payload)
              VALUES ($1, $2, $3, $4)
@@ -252,7 +292,9 @@ impl EventStore {
     /// month, not for "the most recent n". A limit here would reintroduce
     /// exactly the failure above, one window smaller.
     ///
-    /// **Comparison is lexicographic over the stored text**, which is what
+    /// **Comparison is bytewise over the stored text** (`COLLATE "C"`, as
+    /// SQLite's `BINARY` was; the database's own collation may order `+` and
+    /// `-` the other way round), which is what
     /// makes this safe without teaching the store a date format: RFC 3339
     /// timestamps in a fixed shape sort chronologically as strings, and a
     /// caller that cannot promise one shape (an offset instead of `Z`, say)
@@ -307,8 +349,9 @@ impl EventStore {
                SELECT {EVENT_COLUMNS}, COALESCE({extracts}) AS at_value
                FROM events WHERE kind IN ({kind_slots})
              ) AS ranged
-             WHERE at_value >= ${from_index} AND at_value < ${to_index}
-             ORDER BY at_value, id"
+             WHERE at_value COLLATE \"C\" >= ${from_index}
+               AND at_value COLLATE \"C\" < ${to_index}
+             ORDER BY at_value COLLATE \"C\", id"
         );
 
         let mut query = sqlx::query(&sql);
@@ -622,6 +665,43 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Minor 1 of the final review: ordering and bounds are bytewise, as they
+    /// were in SQLite. Under a locale collation `-05:00` can sort before
+    /// `+02:00`; bytewise `+` (0x2B) comes before `-` (0x2D).
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn in_payload_range_compares_bytewise(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool);
+        for (id, start) in [
+            ("minus", "2026-09-25T10:00:00-05:00"),
+            ("plus", "2026-09-25T10:00:00+02:00"),
+        ] {
+            store
+                .record(at("google", id, kinds::CALENDAR_EVENT, json!({ "start": start })))
+                .await
+                .unwrap();
+        }
+        let ids = |found: Vec<Event>| -> Vec<String> {
+            found.into_iter().map(|e| e.external_id).collect()
+        };
+
+        let all = store
+            .in_payload_range(&[kinds::CALENDAR_EVENT], &["start"], "2026-09-25", "2026-09-26")
+            .await
+            .unwrap();
+        assert_eq!(ids(all), vec!["plus", "minus"], "ordered bytewise");
+
+        let upper = store
+            .in_payload_range(
+                &[kinds::CALENDAR_EVENT],
+                &["start"],
+                "2026-09-25",
+                "2026-09-25T10:00:00-",
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(upper), vec!["plus"], "bounded bytewise");
     }
 
     /// The morning briefing asks "what was scored above the threshold since
@@ -970,38 +1050,92 @@ mod tests {
     }
 
     /// Review Focus #2: Postgres TEXT rejects the NUL byte. Connector data is
-    /// untrusted — a mail subject can contain one — so it must be turned into
-    /// a clear error and never a panic.
+    /// untrusted — a mail subject can contain one — and an event refused for
+    /// it would be refused on every poll, forever. So the byte is replaced
+    /// and the event kept.
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
-    async fn a_nul_byte_in_a_text_field_is_an_error_not_a_panic(pool: sqlx::PgPool) {
+    async fn a_nul_byte_in_a_text_field_is_replaced_and_the_event_kept(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);
-        let err = store
+        let mut with_nul = input("canvas", "e\u{0}1", json!({"a": 1}));
+        with_nul.kind = "assign\u{0}ment".into();
+        let (event, inserted) = store.record(with_nul).await.expect("a NUL byte must not drop the event");
+        assert!(inserted);
+        assert_eq!(event.external_id, "e\u{FFFD}1");
+        assert_eq!(event.kind, "assign\u{FFFD}ment");
+
+        // And a re-poll of the same item is the same event, not a new one.
+        let (again, inserted) = store
             .record(input("canvas", "e\u{0}1", json!({"a": 1})))
             .await
-            .expect_err("a NUL byte must be refused, cleanly");
-        assert!(
-            is_rejected_content(&err),
-            "a NUL byte is a data exception (SQLSTATE class 22), which a \
-             caller like run_watch_poll must be able to tell apart from a \
-             connection failure: {err:#}"
-        );
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(again.id, event.id);
     }
 
-    /// The same hazard inside a JSONB *value* rather than a plain text column:
+    /// The same hazard inside a JSONB value, and in a key, at any depth:
     /// Postgres's `jsonb` also rejects `\u0000` in a string, and a connector
     /// payload is exactly the kind of untrusted text that can contain one (an
     /// email body pasted with a stray control character, say).
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
-    async fn a_nul_byte_inside_a_jsonb_string_value_is_an_error_not_a_panic(pool: sqlx::PgPool) {
+    async fn a_nul_byte_anywhere_in_the_payload_is_replaced(pool: sqlx::PgPool) {
         let store = EventStore::new(pool);
-        let err = store
-            .record(input("canvas", "e1", json!({"body": "before\u{0}after"})))
+        let (event, _) = store
+            .record(input(
+                "canvas",
+                "e1",
+                json!({"body": "before\u{0}after", "k\u{0}ey": [1, {"deep": "x\u{0}"}]}),
+            ))
             .await
-            .expect_err("a NUL byte inside a JSON string value must be refused, cleanly");
-        assert!(
-            is_rejected_content(&err),
-            "expected a class-22 data exception: {err:#}"
+            .expect("a NUL byte inside the payload must not drop the event");
+        assert_eq!(
+            event.payload,
+            json!({"body": "before\u{FFFD}after", "k\u{FFFD}ey": [1, {"deep": "x\u{FFFD}"}]})
         );
+    }
+
+    /// The spec's Risks table: every audited read-then-write gets a test under
+    /// contention. Concurrent records of one brand-new key (each task on its
+    /// own pooled connection) make exactly one row, and exactly one caller is
+    /// told it inserted — the `xmax = 0` branch under a real race.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn concurrent_record_of_a_brand_new_key_is_idempotent(pool: sqlx::PgPool) {
+        let store = EventStore::new(pool.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                store
+                    .record(input("canvas", "same", json!({"title": "Essay"})))
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut ids = Vec::new();
+        let mut inserted = 0;
+        while let Some(done) = tasks.join_next().await {
+            let (event, is_new) = done.unwrap();
+            ids.push(event.id);
+            inserted += usize::from(is_new);
+        }
+        assert_eq!(inserted, 1, "exactly one caller inserted");
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// The backstop `watch_poll` still relies on: a genuine class-22 data
+    /// exception from Postgres is recognised as rejected content.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn is_rejected_content_is_true_for_a_genuine_class_22_error(pool: sqlx::PgPool) {
+        let err = sqlx::query("SELECT 'not a number'::int")
+            .execute(&pool)
+            .await
+            .expect_err("an invalid cast is a data exception");
+        let err = anyhow::Error::new(err).context("recording an event");
+        assert!(is_rejected_content(&err), "{err:#}");
     }
 
     /// The negative case `is_rejected_content` exists to draw: an error with
