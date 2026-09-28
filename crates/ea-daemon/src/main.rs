@@ -44,7 +44,7 @@ use ea_daemon::daemon::{self, Daemon, Deps, SHUTDOWN_DRAIN};
 use ea_daemon::executor::Executor;
 use ea_daemon::ipc;
 use ea_daemon::jobs::{self, Pusher, TriageDeps};
-use ea_daemon::lock::InstanceLock;
+use ea_daemon::lock::{DatabaseLock, InstanceLock};
 use ea_daemon::notify::log::NotificationLog;
 use ea_daemon::notify::policy::NotificationPolicy;
 use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, TOKEN_FILE};
@@ -104,6 +104,12 @@ async fn main() -> anyhow::Result<()> {
     let pool = ea_core::db::connect_with_retry(&database_url, std::time::Duration::from_secs(60))
         .await
         .context("the state database is not reachable")?;
+    // The file lock above guards the state directory; this guards the
+    // database, which another state directory (or another machine) can also
+    // point at. Taken before anything reads or writes state — above all
+    // before the stranded-action sweep, which would otherwise fail a live
+    // daemon's in-flight actions. Held for the whole of `main`. See `lock`.
+    let _database_lock = DatabaseLock::acquire(&pool).await?;
 
     let registry = Arc::new(Registry::new(manifests.clone()));
     let executor = Arc::new(Executor::new(

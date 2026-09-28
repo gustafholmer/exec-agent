@@ -1,4 +1,4 @@
-//! One daemon per state directory.
+//! One daemon per state directory, and one per database.
 //!
 //! Nothing else in this process tree is safe to run twice. Two daemons sharing
 //! a state directory share the Postgres database, the session budget and the
@@ -23,6 +23,16 @@
 //! error message can name the process to stop. A file whose contents are
 //! unreadable or nonsense still refuses the second start.
 //!
+//! The file lock covers the state directory, and the state directory used to
+//! *be* the database. It no longer is: the Postgres URL comes from
+//! `config.toml` and can name a server that another machine, or a daemon with a
+//! different `EA_STATE_DIR`, also points at. Two daemons on one database would
+//! each run the startup sweep over the other's in-flight actions, both poll
+//! Telegram and both spend the one session budget. So the database carries
+//! its own guard, [`DatabaseLock`]: a session-level Postgres advisory lock on
+//! a connection held for the life of the process. Both are taken; neither
+//! replaces the other.
+//!
 //! [`ipc::Server::spawn`]: crate::ipc::Server::spawn
 
 use std::fs::{File, OpenOptions};
@@ -32,6 +42,71 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+
+/// The advisory-lock key a daemon holds on its database. Advisory locks are
+/// per database, so this only ever collides with another ea-daemon on the
+/// same one — which is the point.
+const DATABASE_LOCK_KEY: &str = "ea.daemon";
+
+/// A held single-instance lock on the state database.
+///
+/// Holding the connection is what holds the lock: a session-level advisory
+/// lock lives until it is unlocked or its session ends, and Postgres ends the
+/// session when the process dies, however it dies. The connection is detached
+/// from the pool so it neither counts against `max_connections` nor gets
+/// recycled out from under the lock.
+pub struct DatabaseLock {
+    conn: sqlx::PgConnection,
+}
+
+impl std::fmt::Debug for DatabaseLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseLock").finish_non_exhaustive()
+    }
+}
+
+impl DatabaseLock {
+    /// Take the lock, or refuse because another daemon has it.
+    ///
+    /// A try-lock, like the file lock: a daemon that cannot have the database
+    /// must say so and exit, never wait for the other one to finish.
+    pub async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
+        let mut conn = pool
+            .acquire()
+            .await
+            .context("taking a connection for the database instance lock")?
+            .detach();
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+            .bind(DATABASE_LOCK_KEY)
+            .fetch_one(&mut conn)
+            .await
+            .context("taking the database instance lock")?;
+        if !locked {
+            bail!(
+                "another ea-daemon is already using this database; stop it before \
+                 starting a second one (a second daemon would sweep the first one's \
+                 in-flight actions as stranded)"
+            );
+        }
+        tracing::info!("database single-instance lock held");
+        Ok(Self { conn })
+    }
+
+    /// Release the lock now and close its connection.
+    ///
+    /// Dropping the lock also releases it, but only once the server notices
+    /// the socket has gone; this is the prompt, explicit version.
+    pub async fn release(mut self) -> anyhow::Result<()> {
+        use sqlx::Connection;
+        sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+            .bind(DATABASE_LOCK_KEY)
+            .execute(&mut self.conn)
+            .await
+            .context("releasing the database instance lock")?;
+        self.conn.close().await.context("closing the lock connection")?;
+        Ok(())
+    }
+}
 
 /// The lockfile's name inside the state directory.
 pub const LOCK_FILE: &str = "daemon.lock";
@@ -194,6 +269,28 @@ mod tests {
         let path = dir.path().join(LOCK_FILE);
         std::fs::write(&path, "999999").unwrap();
         InstanceLock::acquire(&path).expect("a stale lockfile must not block startup");
+    }
+
+    /// Two daemons with different state directories, one database: the file
+    /// lock cannot see that, so the database lock must.
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_second_daemon_on_the_same_database_is_refused(pool: sqlx::PgPool) {
+        let first = DatabaseLock::acquire(&pool)
+            .await
+            .expect("the first daemon must get the database lock");
+        let err = DatabaseLock::acquire(&pool)
+            .await
+            .expect_err("a second daemon on the same database must be refused")
+            .to_string();
+        assert!(
+            err.contains("another ea-daemon is already using this database"),
+            "{err}"
+        );
+
+        first.release().await.unwrap();
+        DatabaseLock::acquire(&pool)
+            .await
+            .expect("a released database lock must be re-acquirable");
     }
 
     #[test]

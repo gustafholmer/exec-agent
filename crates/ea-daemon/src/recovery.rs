@@ -64,7 +64,8 @@ pub async fn sweep_stranded(
         if !actions.fail_stranded(action.id, STRANDED_REASON).await? {
             // Only reachable if something else resolved it between the read
             // and the write, which at startup means a second daemon — and the
-            // instance lock rules that out. Logged rather than ignored anyway.
+            // database lock (`lock::DatabaseLock`, taken before this sweep)
+            // rules that out. Logged rather than ignored anyway.
             tracing::warn!(
                 action = action.id,
                 "a stranded action resolved itself mid-sweep"
