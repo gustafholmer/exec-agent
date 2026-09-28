@@ -30,6 +30,8 @@ use std::collections::BTreeSet;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use super::timestamp::{serialize_rfc3339, serialize_rfc3339_opt};
 use sqlx::PgPool;
 
 /// Longest topic accepted. A topic is a handful of words; anything longer is a
@@ -64,9 +66,13 @@ pub struct Fact {
     pub id: i64,
     pub topic: String,
     pub body: String,
+    /// `+00:00`, not `Z`, on the wire: the `facts`/`remember` IPC responses
+    /// and `ea facts` print what they always printed. See `store::timestamp`.
+    #[serde(serialize_with = "serialize_rfc3339")]
     pub created_at: DateTime<Utc>,
     /// When `remember` last overwrote the body. `None` on a fact that has
     /// never been corrected, and on any row predating the column.
+    #[serde(serialize_with = "serialize_rfc3339_opt")]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -219,6 +225,26 @@ impl FactStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Important 4 of the final review: chrono's default would print `Z`;
+    /// the IPC responses and `ea facts` have always printed `+00:00`.
+    #[test]
+    fn timestamps_serialize_as_rfc3339() {
+        let at: DateTime<Utc> = "2026-09-20T18:00:00.123456Z".parse().unwrap();
+        let fact = Fact {
+            id: 1,
+            topic: "tenta".into(),
+            body: "on the 14th".into(),
+            created_at: at,
+            updated_at: Some(at),
+        };
+        let json = serde_json::to_value(&fact).unwrap();
+        assert_eq!(json["created_at"], "2026-09-20T18:00:00.123456+00:00");
+        assert_eq!(json["updated_at"], "2026-09-20T18:00:00.123456+00:00");
+
+        let never = Fact { updated_at: None, ..fact };
+        assert!(serde_json::to_value(&never).unwrap()["updated_at"].is_null());
+    }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn a_remembered_fact_comes_back(pool: sqlx::PgPool) {

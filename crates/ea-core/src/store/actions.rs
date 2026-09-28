@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Duration, Utc};
-use serde::{Serialize, Serializer};
+use serde::Serialize;
+
+use super::timestamp::{serialize_rfc3339, serialize_rfc3339_opt};
 use sqlx::{postgres::PgRow, types::Json, PgPool, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -67,20 +69,6 @@ pub struct Action {
     pub decided_at: Option<DateTime<Utc>>,
     #[serde(serialize_with = "serialize_rfc3339_opt")]
     pub executed_at: Option<DateTime<Utc>>,
-}
-
-fn serialize_rfc3339<S: Serializer>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&dt.to_rfc3339())
-}
-
-fn serialize_rfc3339_opt<S: Serializer>(
-    dt: &Option<DateTime<Utc>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match dt {
-        Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
-        None => serializer.serialize_none(),
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,8 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer};
+use serde::Serialize;
+
+use super::timestamp::{serialize_rfc3339, serialize_rfc3339_opt};
 use sqlx::PgPool;
 
 /// The `kind` strings that go into the `events` table, owned by the crate that
@@ -43,20 +45,6 @@ pub mod kinds {
     /// The synthetic row a poll emits for an account it could not read.
     /// Emitted by `ea-google` and `ea-kth`.
     pub const CONNECTOR_ERROR: &str = "connector_error";
-}
-
-fn serialize_rfc3339<S: Serializer>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&dt.to_rfc3339())
-}
-
-fn serialize_rfc3339_opt<S: Serializer>(
-    dt: &Option<DateTime<Utc>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match dt {
-        Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
-        None => serializer.serialize_none(),
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

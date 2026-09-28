@@ -1,6 +1,8 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use super::timestamp::serialize_rfc3339;
 use sqlx::PgPool;
 
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
@@ -10,6 +12,8 @@ pub struct Message {
     pub role: String,
     pub surface: String,
     pub body: String,
+    /// Same wire format as every other store row. See `store::timestamp`.
+    #[serde(serialize_with = "serialize_rfc3339")]
     pub created_at: DateTime<Utc>,
 }
 

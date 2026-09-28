@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer};
+use serde::Serialize;
+
+use super::timestamp::{serialize_rfc3339, serialize_rfc3339_opt};
 use sqlx::{types::Json, FromRow, PgPool};
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,20 +23,6 @@ pub struct Run {
     pub started_at: DateTime<Utc>,
     #[serde(serialize_with = "serialize_rfc3339_opt")]
     pub finished_at: Option<DateTime<Utc>>,
-}
-
-fn serialize_rfc3339<S: Serializer>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&dt.to_rfc3339())
-}
-
-fn serialize_rfc3339_opt<S: Serializer>(
-    dt: &Option<DateTime<Utc>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match dt {
-        Some(dt) => serializer.serialize_str(&dt.to_rfc3339()),
-        None => serializer.serialize_none(),
-    }
 }
 
 /// The row shape as it comes back from Postgres. `action_ids` decodes as
