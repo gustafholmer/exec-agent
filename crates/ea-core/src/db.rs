@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
 /// The schema, embedded at compile time so the daemon carries its own
@@ -18,30 +18,65 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Eight connections is ample: the daemon's real concurrency is a handful of
 /// tasks, and a personal assistant polls rather than serves.
 pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(url)
-        .await
-        .context("connecting to the state database")?;
-    MIGRATOR
-        .run(&pool)
-        .await
-        .context("applying database migrations")?;
+    let pool = open_pool(parse_url(url)?).await?;
+    migrate(&pool).await?;
     Ok(pool)
 }
 
-/// [`connect`], retried with backoff for up to `budget`.
+/// The URL as connect options. The error deliberately does not repeat the
+/// URL, which can carry a password.
+fn parse_url(url: &str) -> anyhow::Result<PgConnectOptions> {
+    url.parse().context("parsing the state database URL")
+}
+
+/// Open the pool, without migrating: the step that can fail because the
+/// server is not up yet.
+async fn open_pool(options: PgConnectOptions) -> anyhow::Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await
+        .context("connecting to the state database")
+}
+
+async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .context("applying database migrations")
+}
+
+/// [`connect`], with the *connection* retried with backoff for up to `budget`.
 ///
 /// `launchd` starts the daemon at boot and will sometimes start it before
 /// Postgres is accepting connections. A daemon that cannot reach its store is
 /// dead rather than degraded, so this gives up cleanly and lets `launchd`'s
 /// existing restart policy handle it, instead of hanging forever.
+///
+/// Only connecting is retried. A migration that fails against a reachable
+/// server — a checksum mismatch, a failing statement — will fail the same way
+/// every time, so it is fatal at once rather than spending the whole budget
+/// under a log line that blames reachability.
 pub async fn connect_with_retry(url: &str, budget: Duration) -> anyhow::Result<PgPool> {
+    connect_options_with_retry(parse_url(url)?, budget).await
+}
+
+/// [`connect_with_retry`] for connect options already in hand.
+pub async fn connect_options_with_retry(
+    options: PgConnectOptions,
+    budget: Duration,
+) -> anyhow::Result<PgPool> {
+    let pool = open_pool_with_retry(options, budget).await?;
+    migrate(&pool).await?;
+    Ok(pool)
+}
+
+async fn open_pool_with_retry(options: PgConnectOptions, budget: Duration) -> anyhow::Result<PgPool> {
     let deadline = std::time::Instant::now() + budget;
     let mut wait = Duration::from_millis(250);
     loop {
-        match connect(url).await {
+        match open_pool(options.clone()).await {
             Ok(pool) => return Ok(pool),
             Err(err) if std::time::Instant::now() + wait < deadline => {
                 tracing::warn!(
@@ -84,6 +119,32 @@ mod tests {
         ] {
             assert!(names.contains(&table.to_string()), "missing {table}");
         }
+    }
+
+    /// A migration failure against a reachable server is fatal at once: it
+    /// would fail identically on every retry. Simulated with a checksum
+    /// mismatch on the applied migration.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_migration_failure_is_not_retried(pool: sqlx::PgPool) {
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00'::bytea")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let options = (*pool.connect_options()).clone();
+
+        let started = std::time::Instant::now();
+        let err = super::connect_options_with_retry(options, std::time::Duration::from_secs(30))
+            .await
+            .expect_err("a checksum mismatch must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a migration failure must not be retried for the whole budget (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("applying database migrations"),
+            "{err:#}"
+        );
     }
 
     /// Review Focus #4 belongs to Task 10, but the constraint itself is created

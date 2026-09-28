@@ -81,9 +81,10 @@ mod tests {
 
     /// Review Focus #5: Postgres going away under a running daemon.
     ///
-    /// The pool must surface a clear error within the acquire timeout rather than
-    /// hanging, and must not be permanently poisoned — a later call against a
-    /// reachable database succeeds on the same pool.
+    /// Two halves. An unreachable server must surface a clear error within
+    /// the retry budget rather than hanging. And a pool whose connection the
+    /// server killed must not be permanently poisoned: the *same* pool serves
+    /// the next query on a fresh connection.
     #[tokio::test]
     async fn a_pool_pointed_at_a_dead_server_fails_fast_and_recovers() {
         // Port 1 is reserved and never listening: a stand-in for "Postgres is down".
@@ -94,9 +95,36 @@ mod tests {
         .await;
         assert!(dead.is_err(), "an unreachable database must not hang");
 
-        let Ok(url) = std::env::var("DATABASE_URL") else { return };
+        // Like every other database test in the suite, this needs a live
+        // server; passing silently without one would claim coverage it
+        // does not have.
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set: this test needs a live Postgres");
         let pool = ea_core::db::connect(&url).await.expect("a live database");
-        let one: i64 = sqlx::query_scalar("SELECT 1::bigint").fetch_one(&pool).await.unwrap();
-        assert_eq!(one, 1, "a healthy pool still works after an unrelated failure");
+
+        let victim: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Kill that connection from outside the pool, the way a server
+        // restart or an idle-session timeout would.
+        {
+            use sqlx::Connection;
+            let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
+            let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+                .bind(victim)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+            assert!(killed, "the pool's connection should have been terminated");
+            admin.close().await.unwrap();
+        }
+
+        let (one, pid): (i64, i32) = sqlx::query_as("SELECT 1::bigint, pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .expect("the same pool must recover from a killed connection");
+        assert_eq!(one, 1);
+        assert_ne!(pid, victim, "the answer must come from a fresh connection");
     }
 }
