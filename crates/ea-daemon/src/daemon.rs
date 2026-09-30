@@ -2100,7 +2100,7 @@ record_voucher = "approve"
         assert!(seen[0].connectors.is_empty());
         assert_eq!(
             seen[0].tools.allowed_tools(),
-            "mcp__ea-propose__propose_action,mcp__ea-propose__remember"
+            "mcp__ea-propose__propose_action,mcp__ea-propose__remember,mcp__ea-propose__search_sessions"
         );
     }
 

@@ -46,11 +46,16 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
 
+use ea_core::store::claude_sessions::SessionHit;
+
 /// The IPC method the daemon exposes for proposals.
 pub const PROPOSE_METHOD: &str = "propose";
 
 /// The IPC method the daemon exposes for facts.
 pub const REMEMBER_METHOD: &str = "remember";
+
+/// The IPC method the daemon exposes for searching past Claude Code sessions.
+pub const SEARCH_SESSIONS_METHOD: &str = "claude_session.search";
 
 /// How long to wait for the daemon's answer before giving up.
 ///
@@ -196,7 +201,54 @@ pub fn render_remembered(fact: &Remembered) -> String {
     }
 }
 
-/// The stdio MCP server. Two tools, and no state beyond where the daemon lives.
+/// The arguments of the session search tool.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SearchSessionsArgs {
+    /// Words to look for in session summaries and transcripts. Leave out to
+    /// list the most recent sessions.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Only sessions that ran in this working directory, e.g.
+    /// "/Users/me/dev/exec-agent".
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Only sessions from the last this many days (1 to 365).
+    #[serde(default)]
+    pub days: Option<u32>,
+    /// The most sessions to return (1 to 20, default 5).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Turn search hits into the text the model reads.
+pub fn render_session_hits(hits: &[SessionHit]) -> String {
+    if hits.is_empty() {
+        return "No matching sessions.".to_string();
+    }
+    hits.iter()
+        .map(|hit| {
+            let mut out = format!(
+                "{} UTC  {}",
+                hit.created_at.format("%Y-%m-%d %H:%M"),
+                hit.cwd
+            );
+            if let Some(branch) = hit.git_branch.as_deref().filter(|b| !b.is_empty()) {
+                out.push_str(&format!("  ({branch})"));
+            }
+            out.push_str(&format!(
+                "\n{}",
+                hit.summary.as_deref().unwrap_or("(no summary yet)")
+            ));
+            if let Some(excerpt) = hit.excerpt.as_deref().filter(|e| !e.is_empty()) {
+                out.push_str(&format!("\nExcerpt: {excerpt}"));
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The stdio MCP server. Three tools, and no state beyond where the daemon lives.
 #[derive(Clone)]
 pub struct ProposeServer {
     socket_path: Arc<PathBuf>,
@@ -293,6 +345,67 @@ impl ProposeServer {
                 "remember: the exec-agent daemon refused this fact: {detail}. Nothing was \
                  stored. An empty body is refused on purpose — a fact that says nothing \
                  would erase the one it replaces."
+            )),
+        }
+    }
+
+    /// Read-only search over the user's past Claude Code sessions.
+    #[tool(
+        description = "Search summaries and transcripts of the user's past Claude Code \
+                       sessions, to recall what was worked on, decided or tried before. \
+                       This only reads and changes nothing. All arguments are optional: \
+                       with no query it lists the most recent sessions."
+    )]
+    pub async fn search_sessions(
+        &self,
+        Parameters(args): Parameters<SearchSessionsArgs>,
+    ) -> Result<String, String> {
+        let mut params = serde_json::Map::new();
+        if let Some(query) = args.query {
+            params.insert("query".into(), query.into());
+        }
+        if let Some(cwd) = args.cwd {
+            params.insert("cwd".into(), cwd.into());
+        }
+        if let Some(days) = args.days {
+            params.insert("days".into(), days.into());
+        }
+        if let Some(limit) = args.limit {
+            params.insert("limit".into(), limit.into());
+        }
+        let params = serde_json::Value::Object(params);
+        match call_daemon(
+            &self.socket_path,
+            self.timeout,
+            SEARCH_SESSIONS_METHOD,
+            params,
+        )
+        .await
+        {
+            Ok(value) => match serde_json::from_value::<Vec<SessionHit>>(value.clone()) {
+                Ok(hits) => Ok(render_session_hits(&hits)),
+                Err(err) => Err(format!(
+                    "search_sessions: the exec-agent daemon answered with something this \
+                     build does not understand ({err}). Nothing was changed; the search \
+                     is read-only. Raw reply: {}",
+                    truncate(&value.to_string(), 500)
+                )),
+            },
+            Err(CallFailure::Timeout) => Err(format!(
+                "search_sessions: the exec-agent daemon did not answer within {}s. \
+                 Nothing was changed. Carry on without past sessions and say the search \
+                 timed out.",
+                self.timeout.as_secs()
+            )),
+            Err(CallFailure::Unreachable(detail)) => Err(format!(
+                "search_sessions: the exec-agent daemon is not reachable, there is no \
+                 socket at {}. Nothing was changed. Say that you could not search past \
+                 sessions. Underlying error: {detail}",
+                self.socket_path.display()
+            )),
+            Err(CallFailure::Refused(detail)) => Err(format!(
+                "search_sessions: the exec-agent daemon refused this search: {detail}. \
+                 Nothing was changed. `days` must be 1 to 365 and `limit` 1 to 20."
             )),
         }
     }
@@ -550,13 +663,13 @@ mod tests {
     /// the CLI denies it silently and
     /// the tool looks like one the model simply never chooses.
     #[test]
-    fn the_server_exposes_exactly_the_two_tools() {
+    fn the_server_exposes_exactly_the_three_tools() {
         let tools = ProposeServer::tool_router().list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
             names,
-            vec!["propose_action", "remember"],
-            "ea-propose exposes exactly these two tools, in this order"
+            vec!["propose_action", "remember", "search_sessions"],
+            "ea-propose exposes exactly these three tools, in this order"
         );
     }
 
@@ -616,6 +729,63 @@ mod tests {
             "{description}"
         );
         assert!(description.contains("ea forget"), "{description}");
+    }
+
+    #[test]
+    fn the_search_sessions_schema_has_no_required_fields() {
+        let tool = tool_named("search_sessions");
+        let schema = serde_json::to_value(&*tool.input_schema).unwrap();
+        let required = schema.get("required").and_then(|r| r.as_array());
+        assert!(
+            required.is_none_or(|r| r.is_empty()),
+            "every field is optional: {schema}"
+        );
+        for field in ["query", "cwd", "days", "limit"] {
+            assert!(
+                schema["properties"].get(field).is_some(),
+                "{field}: {schema}"
+            );
+        }
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(description.contains("only reads"), "{description}");
+        assert!(description.contains("changes nothing"), "{description}");
+    }
+
+    fn hit(summary: Option<&str>, excerpt: Option<&str>, branch: Option<&str>) -> SessionHit {
+        let at = "2026-09-30T14:05:00Z".parse().unwrap();
+        SessionHit {
+            session_id: "s1".into(),
+            cwd: "/dev/x".into(),
+            git_branch: branch.map(Into::into),
+            status: "done".into(),
+            summary: summary.map(Into::into),
+            excerpt: excerpt.map(Into::into),
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    #[test]
+    fn no_hits_render_as_no_matching_sessions() {
+        assert_eq!(render_session_hits(&[]), "No matching sessions.");
+    }
+
+    #[test]
+    fn hits_render_date_cwd_branch_summary_and_excerpt() {
+        let full = render_session_hits(&[hit(
+            Some("Fixed it"),
+            Some("...the <b>bug</b>..."),
+            Some("main"),
+        )]);
+        assert!(full.contains("2026-09-30 14:05 UTC"), "{full}");
+        assert!(full.contains("/dev/x"), "{full}");
+        assert!(full.contains("(main)"), "{full}");
+        assert!(full.contains("Fixed it"), "{full}");
+        assert!(full.contains("Excerpt: ...the <b>bug</b>..."), "{full}");
+
+        let bare = render_session_hits(&[hit(None, None, None)]);
+        assert!(bare.contains("(no summary yet)"), "{bare}");
+        assert!(!bare.contains("Excerpt"), "{bare}");
     }
 
     #[test]

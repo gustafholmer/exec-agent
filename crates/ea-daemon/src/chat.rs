@@ -773,7 +773,10 @@ mod tests {
             .expect("the propose server is always present");
         let argv = build_argv(&request, &mcp);
         assert!(
-            argv.contains(&"mcp__ea-propose__propose_action,mcp__ea-propose__remember".to_string()),
+            argv.contains(
+                &"mcp__ea-propose__propose_action,mcp__ea-propose__remember,mcp__ea-propose__search_sessions"
+                    .to_string()
+            ),
             "chat lost its memory tool: {argv:?}"
         );
     }

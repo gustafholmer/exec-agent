@@ -1140,7 +1140,9 @@ record_voucher = "approve"
             "connector-authored text could write a durable fact: {argv:?}"
         );
         assert!(
-            argv.contains(&"mcp__ea-propose__propose_action".to_string()),
+            argv.contains(
+                &"mcp__ea-propose__propose_action,mcp__ea-propose__search_sessions".to_string()
+            ),
             "a briefing still proposes, and the gate is what makes that safe: {argv:?}"
         );
     }
