@@ -457,7 +457,7 @@ mod tests {
                 "cwd": "/work/app",
                 "git_branch": "main",
                 "summary": "Fixed the bug",
-                "excerpt": "the >>bug<<",
+                "excerpt": "the «bug»",
                 "created_at": "2026-09-01T09:05:00+00:00",
             },
             { "cwd": "/work/other", "git_branch": null, "summary": null,
@@ -465,7 +465,7 @@ mod tests {
         ]));
         assert!(
             rendered.starts_with(
-                "2026-09-01 09:05 UTC  /work/app  (main)\nFixed the bug\nExcerpt: the >>bug<<\n\n"
+                "2026-09-01 09:05 UTC  /work/app  (main)\nFixed the bug\nExcerpt: the «bug»\n\n"
             ),
             "{rendered}"
         );

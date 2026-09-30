@@ -126,13 +126,38 @@ class DaemonError(Exception):
     """The daemon answered, with ok=false."""
 
 
+MAX_REQUEST_BYTES = 900000  # the daemon rejects lines over 1 MiB
+
+
+def encode_request(method, params):
+    """The request line as UTF-8 bytes, at most MAX_REQUEST_BYTES. An oversized transcript is
+    shrunk (keeping its tail) so the summary still gets through."""
+    def enc(p):
+        return (json.dumps({"id": str(uuid.uuid4()), "method": method, "params": p},
+                           ensure_ascii=False) + "\n").encode("utf-8")
+
+    line = enc(params)
+    transcript = params.get("transcript")
+    if len(line) <= MAX_REQUEST_BYTES or not transcript:
+        return line
+    params = dict(params)
+    budget = len(transcript.encode("utf-8"))
+    while True:
+        # Scale by how far over we are (escaping can inflate bytes), with margin.
+        budget = int(budget * MAX_REQUEST_BYTES / len(line) * 0.97)
+        params["transcript"] = cap_tail(transcript, budget)
+        line = enc(params)
+        if len(line) <= MAX_REQUEST_BYTES or budget == 0:
+            return line
+
+
 def daemon_call(method, params, timeout=DAEMON_TIMEOUT):
     """One request/response on the daemon socket. Returns `data`; raises DaemonError on ok=false."""
-    req = json.dumps({"id": str(uuid.uuid4()), "method": method, "params": params}) + "\n"
+    req = encode_request(method, params)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect(str(SOCKET))
-        s.sendall(req.encode("utf-8"))
+        s.sendall(req)
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(65536)
@@ -333,7 +358,7 @@ def latest_fallback(p):
         " created_at, updated_at FROM claude_sessions"
         f" WHERE cwd = {sql_lit(p['cwd'])} AND {status}"
         + (f" AND session_id <> {sql_lit(p['exclude_session'])}" if p.get("exclude_session") else "")
-        + " ORDER BY created_at DESC, id DESC LIMIT 1) t;"
+        + " ORDER BY updated_at DESC, id DESC LIMIT 1) t;"
     ).strip()
     return json.loads(out) if out else None
 

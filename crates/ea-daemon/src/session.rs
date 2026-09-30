@@ -140,6 +140,9 @@ pub enum ToolScope {
     Nothing,
     /// [`PROPOSE_TOOL`] only, and the default for a new session kind.
     ///
+    /// Not [`SEARCH_SESSIONS_TOOL`] either: briefing and triage sessions render
+    /// untrusted text, and must not be able to read private transcripts.
+    ///
     /// The default is the narrow one on purpose: a kind added later gets a
     /// session that can propose (which goes through `Policy::decide` and the
     /// approval queue) and cannot write durable memory, unless somebody names
@@ -160,7 +163,7 @@ impl ToolScope {
     pub fn tools(self) -> &'static [&'static str] {
         match self {
             Self::Nothing => &[],
-            Self::Propose => &[PROPOSE_TOOL, SEARCH_SESSIONS_TOOL],
+            Self::Propose => &[PROPOSE_TOOL],
             Self::ProposeAndRemember => &[PROPOSE_TOOL, REMEMBER_TOOL, SEARCH_SESSIONS_TOOL],
         }
     }
@@ -867,17 +870,15 @@ mod tests {
         // --permission-prompts none. The flag is what makes a session able to
         // do the one thing it exists for.
         //
-        // By name, per scope. `ea-propose` advertises exactly these two tools
-        // (see its `the_server_exposes_exactly_the_two_tools`), and a third
+        // By name, per scope. `ea-propose` advertises exactly three tools
+        // (`propose_action`, `remember`, `search_sessions`; see its
+        // `the_server_exposes_exactly_the_three_tools`), and a fourth
         // arriving on either side must fail a test rather than quietly become
         // reachable -- or quietly stay denied.
         let proposing = build_argv(&request().with_tools(ToolScope::Propose), &config(&[]));
         assert_eq!(
             allowlist(&proposing),
-            vec![
-                "mcp__ea-propose__propose_action",
-                "mcp__ea-propose__search_sessions"
-            ]
+            vec!["mcp__ea-propose__propose_action"]
         );
 
         let conversing = build_argv(
@@ -964,9 +965,7 @@ mod tests {
         );
         assert_eq!(
             ToolScope::Propose.allowed_tools(),
-            format!(
-                "mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL},mcp__{PROPOSE_SERVER}__{SEARCH_SESSIONS_TOOL}"
-            )
+            format!("mcp__{PROPOSE_SERVER}__{PROPOSE_TOOL}")
         );
         assert_eq!(ToolScope::Nothing.allowed_tools(), "");
         let argv = build_argv(&request(), &config(&[]));

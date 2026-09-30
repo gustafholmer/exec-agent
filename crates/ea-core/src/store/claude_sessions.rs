@@ -186,7 +186,7 @@ impl ClaudeSessionStore {
                AND (($3 AND status IN ('pending', 'done')) \
                     OR (status = 'done' AND summary IS NOT NULL)) \
                AND ($2::text IS NULL OR session_id <> $2) \
-             ORDER BY created_at DESC, id DESC LIMIT 1"
+             ORDER BY updated_at DESC, id DESC LIMIT 1"
         ))
         .bind(cwd)
         .bind(exclude_session)
@@ -213,11 +213,11 @@ impl ClaudeSessionStore {
              FROM claude_sessions \
              WHERE ($2::text IS NULL OR cwd = $2) \
                AND ($3::timestamptz IS NULL OR created_at >= $3) \
-             ORDER BY created_at DESC, id DESC LIMIT $4"
+             ORDER BY updated_at DESC, id DESC LIMIT $4"
         } else {
             "SELECT s.session_id, s.cwd, s.git_branch, s.status, s.summary, \
                     ts_headline('simple', coalesce(s.transcript, ''), q.tsq, \
-                      'MaxFragments=2,MaxWords=30,MinWords=10') AS excerpt, \
+                      'StartSel=«, StopSel=», MaxFragments=2,MaxWords=30,MinWords=10') AS excerpt, \
                     s.created_at, s.updated_at \
              FROM claude_sessions s, websearch_to_tsquery('simple', $1) AS q(tsq) \
              WHERE s.search @@ q.tsq \
@@ -411,6 +411,29 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn latest_for_cwd_orders_by_last_update_so_a_resumed_session_wins(pool: PgPool) {
+        let store = ClaudeSessionStore::new(pool);
+        store.upsert(&new("a", "/a")).await.unwrap();
+        store
+            .finish("a", "done", Some("first"), None)
+            .await
+            .unwrap();
+        store.upsert(&new("b", "/a")).await.unwrap();
+        store
+            .finish("b", "done", Some("second"), None)
+            .await
+            .unwrap();
+        // Resume A: the upsert keeps created_at but bumps updated_at.
+        store.upsert(&new("a", "/a")).await.unwrap();
+        let latest = store
+            .latest_for_cwd("/a", None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.session_id, "a");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn latest_for_cwd_include_pending_sees_pending_rows(pool: PgPool) {
         let store = ClaudeSessionStore::new(pool);
         store.upsert(&new("old", "/a")).await.unwrap();
@@ -466,7 +489,7 @@ mod tests {
         let ids: Vec<_> = hits.iter().map(|h| h.session_id.as_str()).collect();
         assert_eq!(ids, ["s", "t"]);
         let t = &hits[1];
-        assert!(t.excerpt.as_deref().unwrap().contains("<b>zebra</b>"));
+        assert!(t.excerpt.as_deref().unwrap().contains("«zebra»"));
         assert!(store.search(&q("giraffe")).await.unwrap().is_empty());
     }
 

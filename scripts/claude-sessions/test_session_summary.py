@@ -126,6 +126,34 @@ class FinishTests(Base):
         self.assertEqual(len(params["transcript"].encode()), ss.MAX_TRANSCRIPT_BYTES)
         self.assertTrue(params["transcript"].endswith("TAIL"))
 
+    def _sent_line(self, transcript):
+        d = FakeDaemon(self.sock, {"ok": True, "data": {}})
+        self.addCleanup(d.close)
+        captured = []
+        real = ss.encode_request
+
+        def spy(method, params):
+            line = real(method, params)
+            captured.append(line)
+            return line
+        with mock.patch.object(ss, "encode_request", spy):
+            ss.finish("s", "done", "the summary", transcript)
+        return captured[0], d.request
+
+    def test_multibyte_transcript_fits_the_ipc_line_limit(self):
+        # 400 kB of 4-byte chars would be 2.4 MB with ensure_ascii escapes.
+        line, req = self._sent_line("\U0001F600" * 100_000 + "TAIL")
+        self.assertLessEqual(len(line), 900000)
+        self.assertEqual(req["params"]["summary"], "the summary")
+        self.assertTrue(req["params"]["transcript"].endswith("TAIL"))
+
+    def test_escape_heavy_transcript_is_shrunk_to_fit(self):
+        line, req = self._sent_line('"\n\x01' * 133_000 + "TAIL")
+        self.assertLessEqual(len(line), 900000)
+        self.assertEqual(req["params"]["summary"], "the summary")
+        self.assertTrue(req["params"]["transcript"].endswith("TAIL"))
+        self.assertGreater(len(req["params"]["transcript"]), 1000)
+
     def test_finish_fallback_sql_targets_claude_sessions(self):
         with mock.patch.object(ss, "daemon_call", side_effect=FileNotFoundError), \
                 mock.patch.object(ss, "psql") as ps:

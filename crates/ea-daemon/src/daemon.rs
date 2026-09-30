@@ -26,6 +26,11 @@
 //! `mcp__ea-propose__remember`, both of which come back to this same socket:
 //! the first through the gate, the second into the `facts` table.
 //!
+//! The four `claude_session.*` methods (`save`, `finish`, `latest`, `search`)
+//! are the same kind of thing again: they read and write the `claude_sessions`
+//! table, where a Python hook stores past Claude Code sessions, and nothing
+//! else. They reach no connector and no other table.
+//!
 //! What must stay absent is a method that names a connector and a tool and
 //! calls it. `connectors.call` was removed from this socket once already for
 //! exactly that reason; do not put it back. A tool call is an action, and an
