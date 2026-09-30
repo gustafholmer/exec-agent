@@ -115,7 +115,7 @@ mod tests {
         .unwrap();
         for table in [
             "events", "actions", "conversations", "messages",
-            "facts", "runs", "schedules", "kv",
+            "facts", "runs", "schedules", "kv", "claude_sessions",
         ] {
             assert!(names.contains(&table.to_string()), "missing {table}");
         }

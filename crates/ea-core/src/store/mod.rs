@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod claude_sessions;
 pub mod conversations;
 pub mod events;
 pub mod facts;
