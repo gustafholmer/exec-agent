@@ -231,15 +231,16 @@ impl ChatService {
         // *now*, not as it was when the message arrived.
         let _turn = self.turn.lock().await;
 
-        let conversation_id = self.conversations.current()?;
+        let conversation_id = self.conversations.current().await?;
         let stored = self
             .conversations
-            .append(conversation_id, "user", surface, &message)?;
+            .append(conversation_id, "user", surface, &message)
+            .await?;
 
         let outcome = self.reply_to(conversation_id, surface, &message).await;
 
         let (reply, note) = match outcome {
-            Ok(Some(reply)) => (Some(reply), self.over_budget_note()),
+            Ok(Some(reply)) => (Some(reply), self.over_budget_note().await),
             Ok(None) => (None, Some(self.why_no_reply())),
             // Not swallowed into a note: the caller asked a question and did
             // not get an answer, and a turn that failed must not leave an
@@ -252,7 +253,8 @@ impl ChatService {
 
         if let Some(reply) = &reply {
             self.conversations
-                .append(conversation_id, "assistant", surface, reply)?;
+                .append(conversation_id, "assistant", surface, reply)
+                .await?;
         }
 
         Ok(ChatTurn {
@@ -278,7 +280,7 @@ impl ChatService {
             return Ok(None);
         };
 
-        let relevant = self.facts.matching(message)?;
+        let relevant = self.facts.matching(message).await?;
         let now = Utc::now().with_timezone(&self.time_zone);
         let mut request = SessionRequest::new(
             CHAT_RUN_KIND,
@@ -302,7 +304,7 @@ impl ChatService {
         // would silently cost thirty triage passes and the price would
         // change whenever the owner changed an editor setting.
         .with_model(&self.model);
-        if let Some(previous) = self.conversations.claude_session(conversation_id)? {
+        if let Some(previous) = self.conversations.claude_session(conversation_id).await? {
             request = request.with_resume(previous);
         }
 
@@ -311,7 +313,8 @@ impl ChatService {
             // Recorded so the next message — on either surface — continues the
             // same thread rather than starting from nothing.
             self.conversations
-                .set_claude_session(conversation_id, session_id)?;
+                .set_claude_session(conversation_id, session_id)
+                .await?;
         }
         Ok(Some(outcome.text))
     }
@@ -329,8 +332,8 @@ impl ChatService {
     /// Read *after* the turn, so the session this turn just spent is included
     /// in the count: the note on the turn that crosses the line says so on
     /// that turn, not on the next one.
-    fn over_budget_note(&self) -> Option<String> {
-        match self.budget.is_spent(Utc::now()) {
+    async fn over_budget_note(&self) -> Option<String> {
+        match self.budget.is_spent(Utc::now()).await {
             Ok(false) => None,
             Ok(true) => Some(format!(
                 "answered anyway, but {} — background triage and the briefings \
@@ -426,23 +429,12 @@ mod tests {
     use crate::session::SessionOutcome;
     use crate::triage::BoxedSession;
 
-    /// A database in a temp dir. `ea_core`'s own `test_support` is
-    /// crate-private, so this crate keeps its own two lines of it.
-    fn temp_store() -> (
-        tempfile::TempDir,
-        Arc<std::sync::Mutex<rusqlite::Connection>>,
-    ) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let conn = ea_core::db::open(&dir.path().join("state.db")).unwrap();
-        (dir, Arc::new(std::sync::Mutex::new(conn)))
-    }
-
     fn a_fact(topic: &str, body: &str) -> Fact {
         Fact {
             id: 1,
             topic: topic.to_string(),
             body: body.to_string(),
-            created_at: "2026-09-24T09:00:00Z".to_string(),
+            created_at: "2026-09-24T09:00:00Z".parse().unwrap(),
             updated_at: None,
         }
     }
@@ -698,16 +690,18 @@ mod tests {
         sessions: Arc<FakeSessions>,
     }
 
-    fn harness(sessions: Arc<FakeSessions>) -> Harness {
-        let (dir, conn) = temp_store();
-        let conversations = ConversationStore::new(Arc::clone(&conn));
-        let facts = FactStore::new(Arc::clone(&conn));
+    fn harness(pool: sqlx::PgPool, sessions: Arc<FakeSessions>) -> Harness {
+        // `_dir` is a plain scratch directory now that every store `harness`
+        // builds is on Postgres; kept only because `Harness` still holds one.
+        let dir = tempfile::TempDir::new().unwrap();
+        let conversations = ConversationStore::new(pool.clone());
+        let facts = FactStore::new(pool.clone());
         let service = Arc::new(ChatService::new(
             conversations.clone(),
             facts.clone(),
             Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             Budget::new(
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool),
                 60,
                 chrono_tz::Europe::Stockholm,
             ),
@@ -724,15 +718,15 @@ mod tests {
     }
 
     impl Harness {
-        fn messages(&self) -> Vec<ea_core::store::conversations::Message> {
-            let id = self.conversations.current().unwrap();
-            self.conversations.recent(id, 100).unwrap()
+        async fn messages(&self) -> Vec<ea_core::store::conversations::Message> {
+            let id = self.conversations.current().await.unwrap();
+            self.conversations.recent(id, 100).await.unwrap()
         }
     }
 
-    #[tokio::test]
-    async fn one_message_runs_one_session_and_stores_both_sides() {
-        let h = harness(FakeSessions::new("the tenta is on the 14th"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn one_message_runs_one_session_and_stores_both_sides(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("the tenta is on the 14th"));
         let turn = h
             .service
             .say(SURFACE_CLI, "when is the tenta?")
@@ -743,7 +737,7 @@ mod tests {
         assert_eq!(turn.note, None);
         assert_eq!(h.sessions.requests().len(), 1, "exactly one session");
 
-        let messages = h.messages();
+        let messages = h.messages().await;
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].body, "when is the tenta?");
@@ -765,11 +759,11 @@ mod tests {
     /// from the one surface whose prompt is the owner's own words, which would
     /// fail silently (a tool absent from `--allowedTools` is denied without an
     /// error, and looks exactly like a model that never chooses to use it).
-    #[tokio::test]
-    async fn a_chat_session_may_call_remember_because_its_prompt_is_the_owner_talking() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_chat_session_may_call_remember_because_its_prompt_is_the_owner_talking(pool: sqlx::PgPool) {
         use crate::session::{build_argv, McpConfig, ToolScope};
 
-        let h = harness(FakeSessions::new("ok"));
+        let h = harness(pool, FakeSessions::new("ok"));
         h.service.say(SURFACE_CLI, "remember this").await.unwrap();
 
         let request = h.sessions.requests().remove(0);
@@ -786,9 +780,9 @@ mod tests {
 
     /// The 50/50 split, made real: the daemon owns the thread and both
     /// surfaces are clients of it.
-    #[tokio::test]
-    async fn a_thread_started_in_telegram_continues_in_the_terminal() {
-        let h = harness(FakeSessions::new("ok"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_thread_started_in_telegram_continues_in_the_terminal(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("ok"));
         h.service
             .say(SURFACE_TELEGRAM, "Remind me what I asked about the tenta")
             .await
@@ -798,7 +792,7 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = h.messages();
+        let messages = h.messages().await;
         assert_eq!(
             messages.len(),
             4,
@@ -837,13 +831,14 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn the_returned_session_id_is_persisted_on_the_first_turn() {
-        let h = harness(FakeSessions::new("ok"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_returned_session_id_is_persisted_on_the_first_turn(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("ok"));
         let turn = h.service.say(SURFACE_CLI, "hello").await.unwrap();
         assert_eq!(
             h.conversations
                 .claude_session(turn.conversation_id)
+                .await
                 .unwrap()
                 .as_deref(),
             Some("sess-1")
@@ -851,9 +846,9 @@ mod tests {
     }
 
     /// A failed turn must not leave an answer nobody gave.
-    #[tokio::test]
-    async fn a_failed_session_is_an_error_and_stores_no_assistant_message() {
-        let h = harness(FakeSessions::failing());
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_session_is_an_error_and_stores_no_assistant_message(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::failing());
         let err = h
             .service
             .say(SURFACE_CLI, "when is the tenta?")
@@ -864,7 +859,7 @@ mod tests {
             "{err:#}"
         );
 
-        let messages = h.messages();
+        let messages = h.messages().await;
         assert_eq!(
             messages.len(),
             1,
@@ -876,9 +871,9 @@ mod tests {
     /// Two messages at once must not become two sessions on one thread: they
     /// would resume the same `claude` session id and interleave two half
     /// answers into the transcript.
-    #[tokio::test]
-    async fn a_message_arriving_mid_session_queues_rather_than_interleaving() {
-        let h = harness(FakeSessions::slow(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_arriving_mid_session_queues_rather_than_interleaving(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::slow(
             "ok",
             std::time::Duration::from_millis(80),
         ));
@@ -903,7 +898,7 @@ mod tests {
             1,
             "two sessions were in flight on one conversation at once"
         );
-        let messages = h.messages();
+        let messages = h.messages().await;
         assert_eq!(messages.len(), 4, "{messages:?}");
         assert_eq!(
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
@@ -915,14 +910,16 @@ mod tests {
         assert_eq!(requests[1].resume.as_deref(), Some("sess-1"));
     }
 
-    #[tokio::test]
-    async fn the_prompt_carries_the_facts_that_match_the_message() {
-        let h = harness(FakeSessions::new("ok"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_prompt_carries_the_facts_that_match_the_message(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("ok"));
         h.facts
             .remember("tenta", "the databases tenta is on the 14th")
+            .await
             .unwrap();
         h.facts
             .remember("invoicing", "invoices go to Ekonomi AB")
+            .await
             .unwrap();
 
         h.service
@@ -942,10 +939,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_conversation_matching_no_facts_gets_no_facts_block() {
-        let h = harness(FakeSessions::new("ok"));
-        h.facts.remember("tenta", "on the 14th").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_conversation_matching_no_facts_gets_no_facts_block(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("ok"));
+        h.facts.remember("tenta", "on the 14th").await.unwrap();
 
         h.service.say(SURFACE_CLI, "hello there").await.unwrap();
 
@@ -957,24 +954,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_empty_message_is_refused_and_stores_nothing() {
-        let h = harness(FakeSessions::new("ok"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_empty_message_is_refused_and_stores_nothing(pool: sqlx::PgPool) {
+        let h = harness(pool, FakeSessions::new("ok"));
         let err = h.service.say(SURFACE_CLI, "   ").await.unwrap_err();
         assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
         assert!(h.sessions.requests().is_empty());
     }
 
-    #[tokio::test]
-    async fn without_a_session_runner_the_message_is_still_recorded() {
-        let (_dir, conn) = temp_store();
-        let conversations = ConversationStore::new(Arc::clone(&conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn without_a_session_runner_the_message_is_still_recorded(pool: sqlx::PgPool) {
+        let conversations = ConversationStore::new(pool.clone());
         let service = ChatService::new(
             conversations.clone(),
-            FactStore::new(Arc::clone(&conn)),
+            FactStore::new(pool.clone()),
             None,
             Budget::new(
-                RunStore::new(Arc::clone(&conn)),
+                RunStore::new(pool),
                 60,
                 chrono_tz::Europe::Stockholm,
             ),
@@ -985,7 +981,7 @@ mod tests {
         let turn = service.say(SURFACE_TELEGRAM, "hello").await.unwrap();
         assert_eq!(turn.reply, None);
         assert!(turn.note.unwrap().contains("no session runner"));
-        let id = conversations.current().unwrap();
-        assert_eq!(conversations.recent(id, 10).unwrap().len(), 1);
+        let id = conversations.current().await.unwrap();
+        assert_eq!(conversations.recent(id, 10).await.unwrap().len(), 1);
     }
 }

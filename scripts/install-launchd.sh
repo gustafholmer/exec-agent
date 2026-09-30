@@ -25,6 +25,29 @@ fi
 # Homebrew's rustc is broken on this machine; rustup's is not. Prefer it.
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# postgresql@17 is keg-only, so its client tools are not on PATH -- and an
+# older Postgres's may be, answering for the wrong server. Use the keg's.
+PG_BIN="$(brew --prefix postgresql@17 2>/dev/null)/bin"
+if [[ ! -x "$PG_BIN/pg_isready" ]]; then
+  echo "error: postgresql@17 is not installed (no $PG_BIN/pg_isready)." >&2
+  echo "  brew install postgresql@17 && brew services start postgresql@17" >&2
+  exit 1
+fi
+
+# The daemon refuses to start without a reachable Postgres, so a build that
+# would just die on first launch is caught here rather than after a five
+# minute release compile.
+if ! "$PG_BIN/pg_isready" -q; then
+  echo "error: Postgres is not accepting connections." >&2
+  echo "  brew services start postgresql@17" >&2
+  exit 1
+fi
+if ! "$PG_BIN/psql" -U ea -d exec_agent -c 'SELECT 1' >/dev/null 2>&1; then
+  echo "error: cannot reach the 'exec_agent' database as the 'ea' role." >&2
+  echo "  \"$PG_BIN/createuser\" --createdb ea && \"$PG_BIN/createdb\" -O ea exec_agent" >&2
+  exit 1
+fi
+
 echo "==> Building (release)"
 cd "$REPO"
 cargo build --release

@@ -89,6 +89,8 @@ pub struct DaemonConfig {
     pub connectors_dir: PathBuf,
     /// Present only when the `[telegram]` block was written out in full.
     pub telegram: Option<TelegramSettings>,
+    /// Where the Postgres state database is, and how its credential is read.
+    pub database: crate::database::DatabaseSettings,
 }
 
 /// The `[retention]` block: what the daily prune keeps, and how large the
@@ -180,6 +182,8 @@ struct RawConfig {
     connectors_dir: Option<PathBuf>,
     #[serde(default)]
     telegram: Option<TelegramSettings>,
+    #[serde(default)]
+    database: crate::database::DatabaseSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -294,6 +298,7 @@ impl Default for DaemonConfig {
             retention: RetentionSettings::default(),
             connectors_dir: default_connectors_dir(),
             telegram: None,
+            database: crate::database::DatabaseSettings::default(),
         }
     }
 }
@@ -333,13 +338,15 @@ impl DaemonConfig {
         let raw: RawConfig =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
 
-        // A config file carrying a bot token is a credential file, and is held
-        // to the same standard as `telegram.token`.
+        // A config file carrying a bot token or an inline database URL (which
+        // can carry a password) is a credential file, and is held to the same
+        // standard as `telegram.token` and `database.url_file`.
         if raw
             .telegram
             .as_ref()
             .and_then(|t| t.token.as_ref())
             .is_some()
+            || raw.database.url.is_some()
         {
             crate::notify::telegram::require_owner_only(&path)?;
         }
@@ -393,6 +400,7 @@ impl DaemonConfig {
             retention: raw.retention.into_settings(),
             connectors_dir: raw.connectors_dir.unwrap_or_else(default_connectors_dir),
             telegram: raw.telegram,
+            database: raw.database,
         })
     }
 }
@@ -602,6 +610,46 @@ keywords = ["invoice"]
         let text = format!("{err:#}");
         assert!(text.contains("0600"), "{text}");
         assert!(!text.contains("123:AAA"), "the token must not be echoed");
+    }
+
+    /// So is one holding an inline database URL, which can carry a password.
+    #[test]
+    fn a_world_readable_config_carrying_a_database_url_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = write(
+            &dir,
+            "[database]\nurl = \"postgres://ea:hunter2@localhost/exec_agent\"\n",
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = DaemonConfig::load_from(dir.path()).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("0600"), "{text}");
+        assert!(!text.contains("hunter2"), "the URL must not be echoed: {text}");
+    }
+
+    #[test]
+    fn a_locked_down_config_carrying_a_database_url_resolves() {
+        let dir = TempDir::new().unwrap();
+        let path = write(
+            &dir,
+            "[database]\nurl = \"postgres://ea@localhost/exec_agent\"\n",
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = DaemonConfig::load_from(dir.path()).unwrap();
+        assert_eq!(
+            config.database.resolve().unwrap(),
+            "postgres://ea@localhost/exec_agent"
+        );
+    }
+
+    /// `url_file` alone keeps the secret out of `config.toml`, so the config
+    /// file itself is not held to `0600` for it.
+    #[test]
+    fn a_config_naming_only_a_url_file_need_not_be_owner_only() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "[database]\nurl_file = \"/nonexistent/database.url\"\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        DaemonConfig::load_from(dir.path()).expect("url_file alone is not a credential");
     }
 
     #[test]

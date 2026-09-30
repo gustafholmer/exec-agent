@@ -56,32 +56,26 @@ impl NotificationLog {
     ///
     /// This is exactly the slice `NotificationPolicy::evaluate` wants; it does
     /// its own hour-window filtering, so nothing narrower is needed here.
-    pub fn recent(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<DateTime<Utc>>> {
-        let raw: Vec<String> = self.kv.get_json(SENT_KEY)?;
-        let cutoff = now - RETENTION;
-        let mut parsed: Vec<DateTime<Utc>> = raw
-            .iter()
-            .filter_map(|text| {
-                text.parse::<DateTime<Utc>>()
-                    .map_err(|err| {
-                        tracing::warn!(value = %text, error = %err, "dropping unparseable notification timestamp");
-                    })
-                    .ok()
-            })
-            .filter(|sent| *sent > cutoff)
-            .collect();
-        parsed.sort_unstable();
-        Ok(parsed)
+    pub async fn recent(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<DateTime<Utc>>> {
+        let raw: Vec<String> = self.kv.get_json(SENT_KEY).await?;
+        Ok(within_retention(&raw, now))
     }
 
     /// Record that an interruption was delivered at `at`, pruning anything
     /// older than [`RETENTION`].
-    pub fn record(&self, at: DateTime<Utc>) -> anyhow::Result<()> {
-        let mut history = self.recent(at)?;
-        history.push(at);
-        history.sort_unstable();
-        let encoded: Vec<String> = history.iter().map(|t| t.to_rfc3339()).collect();
-        self.kv.set_json(SENT_KEY, &encoded)
+    ///
+    /// Atomic ([`KvStore::update_json`]): several `NotificationLog`s share
+    /// this key across concurrently running jobs, and a lost send would make
+    /// the hourly limit under-count.
+    pub async fn record(&self, at: DateTime<Utc>) -> anyhow::Result<()> {
+        self.kv
+            .update_json(SENT_KEY, |raw: &mut Vec<String>| {
+                let mut history = within_retention(raw, at);
+                history.push(at);
+                history.sort_unstable();
+                *raw = history.iter().map(|t| t.to_rfc3339()).collect();
+            })
+            .await
     }
 
     /// Hold a line for the next digest.
@@ -92,47 +86,57 @@ impl NotificationLog {
     /// might have wanted to read is destroyed. A number they can see in `ea
     /// status` is the difference between "the daemon is quiet" and "the daemon
     /// has been throwing away your mail for a week".
-    pub fn push_digest(&self, line: impl Into<String>) -> anyhow::Result<()> {
-        let mut lines: Vec<String> = self.kv.get_json(DIGEST_KEY)?;
+    ///
+    /// One transaction over both keys, locked digest first and then the drop
+    /// count (the only order anything here takes them in): a push that
+    /// interleaved with the briefing's [`NotificationLog::drop_digest_prefix`]
+    /// would otherwise be overwritten by it, and the owner never told.
+    pub async fn push_digest(&self, line: impl Into<String>) -> anyhow::Result<()> {
+        let mut tx = self.kv.begin().await?;
+        let mut lines: Vec<String> = tx.lock_json(DIGEST_KEY).await?;
         lines.push(line.into());
+        let mut dropped_report = None;
         if lines.len() > MAX_DIGEST_LINES {
             let overflow = lines.len() - MAX_DIGEST_LINES;
             let dropped: Vec<String> = lines.drain(..overflow).collect();
-            let total = self.record_drops(overflow)?;
+            let total = tx
+                .lock_json::<u64>(DIGEST_DROPPED_KEY)
+                .await?
+                .saturating_add(overflow.try_into().unwrap_or(u64::MAX));
+            tx.set_json(DIGEST_DROPPED_KEY, &total).await?;
+            dropped_report = Some((overflow, total, dropped.into_iter().next()));
+        }
+        tx.set_json(DIGEST_KEY, &lines).await?;
+        tx.commit().await?;
+        // Logged only once the drop is durable, so the log never claims a
+        // drop that a failed commit rolled back.
+        if let Some((overflow, total, oldest)) = dropped_report {
             tracing::warn!(
                 dropped = overflow,
                 dropped_total = total,
-                oldest = %dropped.first().map(String::as_str).unwrap_or(""),
+                oldest = %oldest.as_deref().unwrap_or(""),
                 "the digest backlog is full; discarding its oldest lines"
             );
         }
-        self.kv.set_json(DIGEST_KEY, &lines)
+        Ok(())
     }
 
     /// Everything held for the digest, without clearing it.
-    pub fn digest(&self) -> anyhow::Result<Vec<String>> {
-        self.kv.get_json(DIGEST_KEY)
+    pub async fn digest(&self) -> anyhow::Result<Vec<String>> {
+        self.kv.get_json(DIGEST_KEY).await
     }
 
     /// How many lines are waiting for a digest nobody sends yet. Reported by
     /// `ea status` so a backlog that is quietly growing is something the owner
     /// can see rather than something they discover in Phase 4.
-    pub fn digest_len(&self) -> anyhow::Result<usize> {
-        Ok(self.digest()?.len())
+    pub async fn digest_len(&self) -> anyhow::Result<usize> {
+        Ok(self.digest().await?.len())
     }
 
     /// How many digest lines have been discarded to the cap over this
     /// database's whole life.
-    pub fn digest_dropped(&self) -> anyhow::Result<u64> {
-        self.kv.get_json(DIGEST_DROPPED_KEY)
-    }
-
-    fn record_drops(&self, count: usize) -> anyhow::Result<u64> {
-        let total = self
-            .digest_dropped()?
-            .saturating_add(count.try_into().unwrap_or(u64::MAX));
-        self.kv.set_json(DIGEST_DROPPED_KEY, &total)?;
-        Ok(total)
+    pub async fn digest_dropped(&self) -> anyhow::Result<u64> {
+        self.kv.get_json(DIGEST_DROPPED_KEY).await
     }
 
     /// Drop the first `count` lines of the digest, leaving the rest.
@@ -152,29 +156,46 @@ impl NotificationLog {
     /// digested events inside one session, and the cost is a handful of lines
     /// dropped a briefing early rather than anything the owner was going to be
     /// told twice.
-    pub fn drop_digest_prefix(&self, count: usize) -> anyhow::Result<()> {
+    pub async fn drop_digest_prefix(&self, count: usize) -> anyhow::Result<()> {
         if count == 0 {
             return Ok(());
         }
-        let lines: Vec<String> = self.kv.get_json(DIGEST_KEY)?;
-        let kept: Vec<String> = lines.into_iter().skip(count).collect();
-        self.kv.set_json(DIGEST_KEY, &kept)
+        self.kv
+            .update_json(DIGEST_KEY, |lines: &mut Vec<String>| {
+                lines.drain(..count.min(lines.len()));
+            })
+            .await
     }
 
     /// Everything held for the digest, clearing it.
-    pub fn take_digest(&self) -> anyhow::Result<Vec<String>> {
-        let lines = self.digest()?;
-        self.kv.set_json(DIGEST_KEY, &Vec::<String>::new())?;
-        Ok(lines)
+    pub async fn take_digest(&self) -> anyhow::Result<Vec<String>> {
+        self.kv
+            .update_json(DIGEST_KEY, |lines: &mut Vec<String>| std::mem::take(lines))
+            .await
     }
+}
+
+/// The parseable entries of a stored send history that fall within
+/// [`RETENTION`] of `now`, oldest first.
+fn within_retention(raw: &[String], now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let cutoff = now - RETENTION;
+    let mut parsed: Vec<DateTime<Utc>> = raw
+        .iter()
+        .filter_map(|text| {
+            text.parse::<DateTime<Utc>>()
+                .map_err(|err| {
+                    tracing::warn!(value = %text, error = %err, "dropping unparseable notification timestamp");
+                })
+                .ok()
+        })
+        .filter(|sent| *sent > cutoff)
+        .collect();
+    parsed.sort_unstable();
+    parsed
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use tempfile::TempDir;
-
     use super::*;
     use crate::notify::policy::NotificationPolicy;
 
@@ -187,63 +208,56 @@ mod tests {
         utc("2026-09-24T12:30:00Z")
     }
 
-    fn store(dir: &TempDir) -> NotificationLog {
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        NotificationLog::new(KvStore::new(conn))
+    fn store(pool: sqlx::PgPool) -> NotificationLog {
+        NotificationLog::new(KvStore::new(pool))
     }
 
-    #[test]
-    fn an_empty_log_reads_as_no_sends() {
-        let dir = TempDir::new().unwrap();
-        assert!(store(&dir).recent(daytime()).unwrap().is_empty());
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_empty_log_reads_as_no_sends(pool: sqlx::PgPool) {
+        assert!(store(pool).recent(daytime()).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn records_are_returned_oldest_first() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        log.record(utc("2026-09-24T12:20:00Z")).unwrap();
-        log.record(utc("2026-09-24T12:00:00Z")).unwrap();
-        let recent = log.recent(daytime()).unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn records_are_returned_oldest_first(pool: sqlx::PgPool) {
+        let log = store(pool);
+        log.record(utc("2026-09-24T12:20:00Z")).await.unwrap();
+        log.record(utc("2026-09-24T12:00:00Z")).await.unwrap();
+        let recent = log.recent(daytime()).await.unwrap();
         assert_eq!(
             recent,
             vec![utc("2026-09-24T12:00:00Z"), utc("2026-09-24T12:20:00Z")]
         );
     }
 
-    #[test]
-    fn anything_older_than_retention_is_pruned() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        log.record(utc("2026-09-22T12:00:00Z")).unwrap();
-        log.record(daytime()).unwrap();
-        assert_eq!(log.recent(daytime()).unwrap(), vec![daytime()]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn anything_older_than_retention_is_pruned(pool: sqlx::PgPool) {
+        let log = store(pool);
+        log.record(utc("2026-09-22T12:00:00Z")).await.unwrap();
+        log.record(daytime()).await.unwrap();
+        assert_eq!(log.recent(daytime()).await.unwrap(), vec![daytime()]);
     }
 
     /// Addition 3, the whole point: the rate limit has to survive a restart.
     /// The daemon runs under `launchd` with `KeepAlive`, so "the process came
     /// back" is a routine event, not an exotic one — and if the history went
     /// with it, three notifications an hour would become three per crash.
-    #[test]
-    fn the_rate_limit_survives_a_restart() {
-        let dir = TempDir::new().unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_rate_limit_survives_a_restart(pool: sqlx::PgPool) {
         let now = daytime();
         let policy = NotificationPolicy::default(); // max_per_hour = 3
 
         {
-            let log = store(&dir);
+            let log = store(pool.clone());
             for minutes in [5, 10, 15] {
-                log.record(now - Duration::minutes(minutes)).unwrap();
+                log.record(now - Duration::minutes(minutes)).await.unwrap();
             }
-            let verdict = policy.evaluate(90, now, &log.recent(now).unwrap());
+            let verdict = policy.evaluate(90, now, &log.recent(now).await.unwrap());
             assert!(!verdict.send, "the third send should already be the limit");
         }
 
         // A brand-new process, a brand-new connection, the same database.
-        let reopened = store(&dir);
-        let recent = reopened.recent(now).unwrap();
+        let reopened = store(pool);
+        let recent = reopened.recent(now).await.unwrap();
         assert_eq!(recent.len(), 3, "history must survive the restart");
         let verdict = policy.evaluate(90, now, &recent);
         assert!(
@@ -257,20 +271,19 @@ mod tests {
         let later = now + Duration::hours(2);
         assert!(
             policy
-                .evaluate(90, later, &reopened.recent(later).unwrap())
+                .evaluate(90, later, &reopened.recent(later).await.unwrap())
                 .send
         );
     }
 
-    #[test]
-    fn the_digest_accumulates_and_drains() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        log.push_digest("one").unwrap();
-        log.push_digest("two").unwrap();
-        assert_eq!(log.digest().unwrap(), vec!["one", "two"]);
-        assert_eq!(log.take_digest().unwrap(), vec!["one", "two"]);
-        assert!(log.digest().unwrap().is_empty());
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_digest_accumulates_and_drains(pool: sqlx::PgPool) {
+        let log = store(pool);
+        log.push_digest("one").await.unwrap();
+        log.push_digest("two").await.unwrap();
+        assert_eq!(log.digest().await.unwrap(), vec!["one", "two"]);
+        assert_eq!(log.take_digest().await.unwrap(), vec!["one", "two"]);
+        assert!(log.digest().await.unwrap().is_empty());
     }
 
     /// **The digest has to survive a restart**, for the same reason the rate
@@ -278,39 +291,37 @@ mod tests {
     /// backlog held in memory would be thrown away by the crash that made the
     /// owner most want to read it. It lives in the `kv` table, so nothing is
     /// lost and the morning briefing still finds it.
-    #[test]
-    fn the_digest_survives_a_restart() {
-        let dir = TempDir::new().unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_digest_survives_a_restart(pool: sqlx::PgPool) {
         {
-            let log = store(&dir);
-            log.push_digest("[kth] examiner mail (40)").unwrap();
-            log.push_digest("[notion] a page moved (30)").unwrap();
+            let log = store(pool.clone());
+            log.push_digest("[kth] examiner mail (40)").await.unwrap();
+            log.push_digest("[notion] a page moved (30)").await.unwrap();
         }
 
         // A brand-new process, a brand-new connection, the same database.
-        let reopened = store(&dir);
+        let reopened = store(pool.clone());
         assert_eq!(
-            reopened.digest().unwrap(),
+            reopened.digest().await.unwrap(),
             vec![
                 "[kth] examiner mail (40)".to_string(),
                 "[notion] a page moved (30)".to_string()
             ]
         );
-        assert_eq!(reopened.digest_len().unwrap(), 2);
+        assert_eq!(reopened.digest_len().await.unwrap(), 2);
 
         // And a drain after the restart still clears exactly what it read.
-        reopened.drop_digest_prefix(2).unwrap();
-        assert_eq!(store(&dir).digest_len().unwrap(), 0);
+        reopened.drop_digest_prefix(2).await.unwrap();
+        assert_eq!(store(pool).digest_len().await.unwrap(), 0);
     }
 
-    #[test]
-    fn the_digest_is_bounded_and_drops_the_oldest() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_digest_is_bounded_and_drops_the_oldest(pool: sqlx::PgPool) {
+        let log = store(pool);
         for i in 0..(MAX_DIGEST_LINES + 5) {
-            log.push_digest(format!("line {i}")).unwrap();
+            log.push_digest(format!("line {i}")).await.unwrap();
         }
-        let lines = log.digest().unwrap();
+        let lines = log.digest().await.unwrap();
         assert_eq!(lines.len(), MAX_DIGEST_LINES);
         assert_eq!(lines[0], "line 5");
         assert_eq!(
@@ -322,78 +333,127 @@ mod tests {
     /// Nothing may leave this system without a trace. Until the morning
     /// briefing drains the digest, the cap is the only place a held-back
     /// score is destroyed, and the count is what makes that visible.
-    #[test]
-    fn every_dropped_digest_line_is_counted() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        assert_eq!(log.digest_dropped().unwrap(), 0);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn every_dropped_digest_line_is_counted(pool: sqlx::PgPool) {
+        let log = store(pool);
+        assert_eq!(log.digest_dropped().await.unwrap(), 0);
 
         for i in 0..MAX_DIGEST_LINES {
-            log.push_digest(format!("line {i}")).unwrap();
+            log.push_digest(format!("line {i}")).await.unwrap();
         }
         assert_eq!(
-            log.digest_dropped().unwrap(),
+            log.digest_dropped().await.unwrap(),
             0,
             "nothing is dropped up to the cap"
         );
 
         for i in 0..7 {
-            log.push_digest(format!("overflow {i}")).unwrap();
+            log.push_digest(format!("overflow {i}")).await.unwrap();
         }
-        assert_eq!(log.digest_dropped().unwrap(), 7);
-        assert_eq!(log.digest_len().unwrap(), MAX_DIGEST_LINES);
+        assert_eq!(log.digest_dropped().await.unwrap(), 7);
+        assert_eq!(log.digest_len().await.unwrap(), MAX_DIGEST_LINES);
     }
 
     /// The count is the owner's evidence weeks later, so it has to outlive the
     /// process — and draining the digest must not erase it.
-    #[test]
-    fn the_dropped_count_survives_a_restart_and_a_drain() {
-        let dir = TempDir::new().unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_dropped_count_survives_a_restart_and_a_drain(pool: sqlx::PgPool) {
         {
-            let log = store(&dir);
+            let log = store(pool.clone());
             for i in 0..(MAX_DIGEST_LINES + 3) {
-                log.push_digest(format!("line {i}")).unwrap();
+                log.push_digest(format!("line {i}")).await.unwrap();
             }
-            assert_eq!(log.digest_dropped().unwrap(), 3);
-            log.take_digest().unwrap();
-            assert_eq!(log.digest_dropped().unwrap(), 3);
+            assert_eq!(log.digest_dropped().await.unwrap(), 3);
+            log.take_digest().await.unwrap();
+            assert_eq!(log.digest_dropped().await.unwrap(), 3);
         }
 
-        let reopened = store(&dir);
-        assert_eq!(reopened.digest_dropped().unwrap(), 3);
-        assert_eq!(reopened.digest_len().unwrap(), 0);
+        let reopened = store(pool);
+        assert_eq!(reopened.digest_dropped().await.unwrap(), 3);
+        assert_eq!(reopened.digest_len().await.unwrap(), 0);
     }
 
     /// The briefing's clearing rule: what it read is dropped, what arrived
     /// while it was thinking is kept for the next one.
-    #[test]
-    fn dropping_a_prefix_keeps_lines_that_arrived_during_the_briefing() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        log.push_digest("one").unwrap();
-        log.push_digest("two").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn dropping_a_prefix_keeps_lines_that_arrived_during_the_briefing(pool: sqlx::PgPool) {
+        let log = store(pool);
+        log.push_digest("one").await.unwrap();
+        log.push_digest("two").await.unwrap();
 
         // What the briefing read.
-        let read = log.digest().unwrap();
+        let read = log.digest().await.unwrap();
         assert_eq!(read.len(), 2);
         // A triage pass lands mid-session.
-        log.push_digest("three").unwrap();
+        log.push_digest("three").await.unwrap();
 
-        log.drop_digest_prefix(read.len()).unwrap();
+        log.drop_digest_prefix(read.len()).await.unwrap();
 
-        assert_eq!(log.digest().unwrap(), vec!["three".to_string()]);
+        assert_eq!(log.digest().await.unwrap(), vec!["three".to_string()]);
     }
 
-    #[test]
-    fn dropping_nothing_changes_nothing_and_over_dropping_empties() {
-        let dir = TempDir::new().unwrap();
-        let log = store(&dir);
-        log.push_digest("one").unwrap();
+    /// The kv-level race the Postgres port opened: several jobs hold their
+    /// own `NotificationLog` over the same keys, and each mutation used to be
+    /// a read and a write with a network round trip between them. Pushes,
+    /// sends and a briefing's drain run concurrently here; nothing may be
+    /// lost.
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn concurrent_mutations_lose_nothing(pool: sqlx::PgPool) {
+        // Two lines the "briefing" has read and will drop.
+        let log = store(pool.clone());
+        log.push_digest("read-0").await.unwrap();
+        log.push_digest("read-1").await.unwrap();
 
-        log.drop_digest_prefix(0).unwrap();
-        assert_eq!(log.digest_len().unwrap(), 1);
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let log = store(pool.clone());
+            tasks.spawn(async move { log.push_digest(format!("new-{i}")).await.unwrap() });
+            let log = store(pool.clone());
+            tasks.spawn(async move {
+                log.record(daytime() - Duration::minutes(i)).await.unwrap()
+            });
+        }
+        let drainer = store(pool.clone());
+        tasks.spawn(async move { drainer.drop_digest_prefix(2).await.unwrap() });
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap();
+        }
 
-        log.drop_digest_prefix(99).unwrap();
-        assert_eq!(log.digest_len().unwrap(), 0);
+        let lines = log.digest().await.unwrap();
+        // The drain may run before some pushes, in which case it removes
+        // "new" lines instead of the two it read; what must hold is that
+        // every push landed and exactly two lines were dropped.
+        assert_eq!(lines.len(), 12, "{lines:?}");
+        assert!(lines.iter().all(|l| l.starts_with("new-") || l.starts_with("read-")));
+        assert_eq!(log.recent(daytime()).await.unwrap().len(), 12, "every send is recorded");
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn concurrent_pushes_are_all_kept(pool: sqlx::PgPool) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..20 {
+            let log = store(pool.clone());
+            tasks.spawn(async move { log.push_digest(format!("line {i}")).await.unwrap() });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap();
+        }
+        let mut lines = store(pool).digest().await.unwrap();
+        lines.sort();
+        let mut expected: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        expected.sort();
+        assert_eq!(lines, expected);
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn dropping_nothing_changes_nothing_and_over_dropping_empties(pool: sqlx::PgPool) {
+        let log = store(pool);
+        log.push_digest("one").await.unwrap();
+
+        log.drop_digest_prefix(0).await.unwrap();
+        assert_eq!(log.digest_len().await.unwrap(), 1);
+
+        log.drop_digest_prefix(99).await.unwrap();
+        assert_eq!(log.digest_len().await.unwrap(), 0);
     }
 }

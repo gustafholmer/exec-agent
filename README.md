@@ -211,6 +211,10 @@ specific assumptions to re-check against a live account. See
 - **Rust**, stable. This workspace needs 1.88 or newer.
   (If `rustc` on your `PATH` is broken, use rustup's:
   `PATH="$HOME/.cargo/bin:$PATH" cargo …`.)
+- **Postgres 17**, running locally (`brew install postgresql@17 && brew
+  services start postgresql@17`). This is where everything lives now —
+  events, actions, runs, conversations, facts — and the daemon refuses to
+  start until `[database]` is configured; see [Database](#database) below.
 - **A logged-in `claude` CLI.** The daemon shells out to `claude -p` for
   tier-1 triage, the three briefings and `ea chat`. Run `claude` once
   interactively and sign in — on a subscription, not an API key; see
@@ -241,9 +245,44 @@ needs no install step.
 
 ## Configure
 
+### Database
+
+Required, and the one section below that is not optional: the daemon reads
+`[database]` before anything else and refuses to start without it. Do this
+before `./scripts/install-launchd.sh`.
+
+```bash
+brew install postgresql@17 && brew services start postgresql@17
+# postgresql@17 is keg-only: its client tools are not on PATH, and an older
+# Postgres's `psql` may be. Use the keg's explicitly.
+PG="$(brew --prefix postgresql@17)/bin"
+"$PG/createuser" --createdb ea && "$PG/createdb" -O ea exec_agent
+mkdir -p ~/.config/exec-agent
+(umask 077 && echo 'postgres://ea@localhost/exec_agent' > ~/.config/exec-agent/database.url)
+```
+
+The URL connects as the `ea` role the snippet creates, which owns the
+database; Homebrew's default `pg_hba.conf` trusts local connections, so it
+needs no password here.
+
+That leaves the connection URL in a `0600` file the daemon points `[database]
+url_file` at, in the sample `config.toml` below. `url_file` is read through
+the same `read_secret` as the Telegram token further down, refused unless the
+file is mode `0600`. Note that TOML does not expand `~` the way the shell
+does above, so the path in `config.toml` has to be written out in full — the
+sample below does that with `$HOME`.
+
+`database.url` (the file's contents) can be any `postgres://user:password@host/db`
+URL, for a Postgres that is not the local Unix socket the snippet above
+assumes. `config.toml` may instead carry the connection string inline as
+`database.url` — but a `config.toml` that carries a connection string is a
+credential file, held to the same `0600` standard as one carrying a Telegram
+token.
+
 ### The daemon
 
-Everything is optional; a missing file means defaults.
+Everything else is optional; a missing file means defaults. `[database]` is
+the one block above that is not — set it up first, per [Database](#database).
 
 ```bash
 mkdir -p ~/.config/exec-agent
@@ -286,6 +325,13 @@ conversations_days = 90       # never the one you are currently talking in
 interval_hours     = 24
 log_max_bytes      = 8388608  # rotate daemon.{out,err}.log past 8 MiB
 TOML
+# A second, unquoted heredoc: the block above is copied verbatim, but this one
+# needs $HOME to expand to an actual path, which a quoted 'TOML' delimiter
+# would suppress.
+cat >> ~/.config/exec-agent/config.toml <<DATABASE
+[database]
+url_file = "$HOME/.config/exec-agent/database.url"
+DATABASE
 ```
 
 ### Retention
@@ -309,6 +355,12 @@ past `log_max_bytes` the file is copied to `<name>.1` and truncated **in place**
 — the same inode, because `launchd` holds the descriptor and a rename would
 leave the daemon writing into the archived file. One generation is kept, so the
 ceiling is two files per stream.
+
+### Backups
+
+`cp state.db` is no longer a backup. A nightly
+`"$(brew --prefix postgresql@17)/bin/pg_dump" -U ea exec_agent > ~/.local/state/exec-agent/backup.sql`
+keeps Time Machine covering it.
 
 ### Telegram
 
@@ -686,13 +738,40 @@ except by living with a few.
 | what | where |
 |---|---|
 | configuration and credentials | `~/.config/exec-agent/` |
-| database (`events`, `actions`, `runs`, …) | `~/.local/state/exec-agent/state.db` |
+| database (`events`, `actions`, `runs`, …) | Postgres, database `exec_agent`; the daemon's connection URL lives at `~/.config/exec-agent/database.url` |
 | control socket (mode `0600`) | `~/.local/state/exec-agent/daemon.sock` |
 | daemon logs | `~/.local/state/exec-agent/daemon.{out,err}.log` (plus one rotated `.1` each) |
 | session working directory | `~/.local/state/exec-agent/sessions/` |
 
 Both directories are created mode `0700`. `$EA_CONFIG_DIR` and `$EA_STATE_DIR`
-override them, which is how the tests avoid touching yours.
+override them, which is how the tests avoid touching yours. Postgres itself is
+not under either directory — it is a separately managed service; see
+[Database](#database) and [Backups](#backups).
+
+## Remote reads
+
+The daemon is the only writer. A remote reader connects as a second role that
+can do nothing else:
+
+```sql
+CREATE ROLE ea_ro LOGIN PASSWORD '...';
+GRANT CONNECT ON DATABASE exec_agent TO ea_ro;
+GRANT USAGE ON SCHEMA public TO ea_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ea_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ea_ro;
+```
+
+Postgres listens beyond localhost only with TLS required, and `pg_hba.conf`
+restricts `ea_ro` to the expected source.
+
+**The `SELECT`-only grant is what holds the policy gate.** `Policy::decide` is
+Rust running inside the daemon, not a database constraint: a client with
+`INSERT` on `actions` can write a row with `status = 'approved'` and the
+executor will pick it up. Granting write access to anything other than the
+daemon dismantles the one safety property this system has. If remote writes
+are ever wanted, route them through `ea_core::ipc` — over TCP with TLS and a
+token instead of a Unix socket — so that every write still passes through the
+daemon that owns the gate.
 
 ## How the gate works
 
@@ -732,9 +811,9 @@ discovered connector:
 
 The decision is taken *before* the action row exists, so nothing about the
 stored row can influence whether a connector is reached. Execution then takes
-two claims — an in-memory one against a double tap, and a conditional `UPDATE`
-in SQLite that is never released — so an action can reach a connector at most
-once even across a crash.
+two claims — an in-memory one against a double tap, and a conditional
+`UPDATE ... RETURNING` in Postgres that is never released — so an action can
+reach a connector at most once even across a crash.
 
 **The control socket has no method that calls a connector.** Thirteen methods:
 `status`, `queue` and `log` read local state; `pause`, `resume` and

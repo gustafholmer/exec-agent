@@ -355,7 +355,7 @@ const START_KEYS: [&str; 2] = ["start", "overlap_start"];
 /// absorbs any offset (the largest in use anywhere is 14 hours) without
 /// trusting that. `MATERIAL_LIMIT` still caps the result, but now it caps
 /// *today's* events, after the date is known.
-pub fn todays_calendar(
+pub async fn todays_calendar(
     events: &EventStore,
     time_zone: Tz,
     now: DateTime<Utc>,
@@ -370,7 +370,8 @@ pub fn todays_calendar(
             &START_KEYS,
             &from,
             &to,
-        )?
+        )
+        .await?
         .into_iter()
         .filter(|event| starts_on(event, today, time_zone))
         .collect();
@@ -414,7 +415,7 @@ fn lines(events: &[Event]) -> String {
 }
 
 /// Everything the morning briefing is made of.
-pub fn morning_material<C: ToolCaller>(
+pub async fn morning_material<C: ToolCaller>(
     deps: &BriefingDeps<C>,
     now: DateTime<Utc>,
     since: DateTime<Utc>,
@@ -424,7 +425,7 @@ pub fn morning_material<C: ToolCaller>(
     let today = now.with_timezone(&deps.time_zone).date_naive();
     material.push(
         format!("Today's calendar ({today})"),
-        lines(&todays_calendar(&deps.events, deps.time_zone, now)?),
+        lines(&todays_calendar(&deps.events, deps.time_zone, now).await?),
     );
     // Two readings of the brief's "anything untriaged above the digest
     // threshold", and both are material a morning briefing wants. The literal
@@ -434,7 +435,7 @@ pub fn morning_material<C: ToolCaller>(
     // interruption line since the last briefing.
     material.push(
         "Not yet triaged",
-        lines(&deps.events.untriaged(MATERIAL_LIMIT)?),
+        lines(&deps.events.untriaged(MATERIAL_LIMIT).await?),
     );
     material.push(
         format!(
@@ -444,7 +445,8 @@ pub fn morning_material<C: ToolCaller>(
         lines(
             &deps
                 .events
-                .scored_since(i64::from(deps.threshold), since, MATERIAL_LIMIT)?,
+                .scored_since(i64::from(deps.threshold), since, MATERIAL_LIMIT)
+                .await?,
         ),
     );
     material.push("Digest since the last briefing", digest.join("\n"));
@@ -523,7 +525,7 @@ pub async fn vat_material<C: ToolCaller>(
     // does, this wants the same treatment `todays_calendar` got.
     material.push(
         "Upcoming declaration deadlines",
-        lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT)?),
+        lines(&deps.events.by_kind(kinds::TAX_DEADLINE, MATERIAL_LIMIT).await?),
     );
     Ok(material)
 }
@@ -588,7 +590,7 @@ async fn deliver<C: ToolCaller>(
         tracing::warn!(briefing = kind, "no session runner; skipping");
         return Ok(outcome);
     };
-    if !deps.budget.try_consume(Utc::now())? {
+    if !deps.budget.try_consume(Utc::now()).await? {
         outcome.note = Some(format!(
             "{}, so there is no briefing",
             deps.budget.spent_note()
@@ -683,8 +685,8 @@ pub async fn run_morning_briefing<C: ToolCaller>(
     // lines triage pushed while the session was running. It is also what makes
     // a second briefing on the same day report nothing twice: the first one
     // dropped exactly the lines it sent.
-    let digest = deps.log.digest()?;
-    let material = morning_material(deps, now, since, &digest)?;
+    let digest = deps.log.digest().await?;
+    let material = morning_material(deps, now, since, &digest).await?;
 
     if material.is_empty() {
         tracing::info!("nothing to brief on; sending the short line instead of a session");
@@ -705,7 +707,7 @@ pub async fn run_morning_briefing<C: ToolCaller>(
     .await?;
 
     if outcome.sent {
-        deps.log.drop_digest_prefix(digest.len())?;
+        deps.log.drop_digest_prefix(digest.len()).await?;
         outcome.digest_lines = digest.len();
         return Ok(outcome);
     }
@@ -785,8 +787,6 @@ mod tests {
     use ea_core::store::events::RecordInput;
     use ea_core::store::kv::KvStore;
     use ea_core::store::runs::RunStore;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::session::SessionOutcome;
@@ -921,8 +921,7 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
-        conn: Arc<Mutex<Connection>>,
+        pool: sqlx::PgPool,
         events: EventStore,
         log: NotificationLog,
         sessions: Arc<SpySessions>,
@@ -931,32 +930,27 @@ record_voucher = "approve"
         deps: BriefingDeps<SpyCaller>,
     }
 
-    fn fixture() -> Fixture {
-        build(SpyPusher::new(), SpyCaller::new("[]"))
+    fn fixture(pool: sqlx::PgPool) -> Fixture {
+        build(pool, SpyPusher::new(), SpyCaller::new("[]"))
     }
 
-    fn build(pusher: Arc<SpyPusher>, caller: Arc<SpyCaller>) -> Fixture {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        let events = EventStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+    fn build(pool: sqlx::PgPool, pusher: Arc<SpyPusher>, caller: Arc<SpyCaller>) -> Fixture {
+        let events = EventStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
         let sessions = SpySessions::new("the briefing");
         let deps = BriefingDeps {
             events: events.clone(),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            log: NotificationLog::new(KvStore::new(pool.clone())),
             sessions: Some(Arc::clone(&sessions) as Arc<dyn SessionBoundary>),
             pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
             caller: Arc::clone(&caller),
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            budget: Budget::new(RunStore::new(Arc::clone(&conn)), 60, Stockholm),
+            budget: Budget::new(RunStore::new(pool.clone()), 60, Stockholm),
         };
         Fixture {
-            _dir: dir,
-            conn,
+            pool,
             events,
             log,
             sessions,
@@ -970,7 +964,7 @@ record_voucher = "approve"
         text.parse().unwrap()
     }
 
-    fn record(events: &EventStore, source: &str, id: &str, kind: &str, payload: Value) -> Event {
+    async fn record(events: &EventStore, source: &str, id: &str, kind: &str, payload: Value) -> Event {
         events
             .record(RecordInput {
                 source: source.into(),
@@ -978,6 +972,7 @@ record_voucher = "approve"
                 kind: kind.into(),
                 payload,
             })
+            .await
             .unwrap()
             .0
     }
@@ -986,9 +981,9 @@ record_voucher = "approve"
 
     /// "Today" is today where the owner is, and the cut is on the event's own
     /// start rather than on when it was recorded.
-    #[tokio::test]
-    async fn todays_calendar_takes_the_owners_day_not_the_utc_one() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn todays_calendar_takes_the_owners_day_not_the_utc_one(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         // 22:30 UTC on 24 September is 00:30 on the 25th in Stockholm.
         record(
             &f.events,
@@ -996,24 +991,24 @@ record_voucher = "approve"
             "late",
             kinds::CALENDAR_EVENT,
             json!({ "title": "midnight standup", "start": "2026-09-24T22:30:00Z" }),
-        );
+        ).await;
         record(
             &f.events,
             "google",
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch", "start": "2026-09-25T10:00:00Z" }),
-        );
+        ).await;
         record(
             &f.events,
             "google",
             "tomorrow",
             kinds::CALENDAR_EVENT,
             json!({ "title": "next week", "start": "2026-09-30T10:00:00Z" }),
-        );
+        ).await;
 
         // Noon Stockholm on 25 September.
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1032,9 +1027,9 @@ record_voucher = "approve"
     /// The row that matters is recorded first and then buried under more than
     /// `MATERIAL_LIMIT` later rows, so a limit-then-filter implementation
     /// cannot pass.
-    #[tokio::test]
-    async fn todays_meeting_survives_a_hundred_later_calendar_rows() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn todays_meeting_survives_a_hundred_later_calendar_rows(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         // Recorded a week ago, as a poll's LOOKAHEAD window does: lowest id.
         record(
             &f.events,
@@ -1042,7 +1037,7 @@ record_voucher = "approve"
             "the-one-that-matters",
             kinds::CALENDAR_EVENT,
             json!({ "title": "board meeting", "start": "2026-09-25T08:00:00Z" }),
-        );
+        ).await;
         // A hundred rows recorded since, none of them today's.
         for i in 0..100 {
             record(
@@ -1051,10 +1046,10 @@ record_voucher = "approve"
                 &format!("later-{i}"),
                 kinds::CALENDAR_EVENT,
                 json!({ "title": format!("standup {i}"), "start": "2026-10-02T08:00:00Z" }),
-            );
+            ).await;
         }
 
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1065,16 +1060,16 @@ record_voucher = "approve"
 
     /// The same hazard on the conflict side, and the same window: a clash
     /// recorded days ago is still today's clash.
-    #[tokio::test]
-    async fn a_buried_conflict_is_still_on_todays_briefing() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_buried_conflict_is_still_on_todays_briefing(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         record(
             &f.events,
             "google",
             "the-clash",
             kinds::CALENDAR_CONFLICT,
             json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
-        );
+        ).await;
         for i in 0..100 {
             record(
                 &f.events,
@@ -1082,24 +1077,24 @@ record_voucher = "approve"
                 &format!("later-{i}"),
                 kinds::CALENDAR_CONFLICT,
                 json!({ "overlap_start": "2026-10-02T09:00:00Z" }),
-            );
+            ).await;
         }
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         let ids: Vec<&str> = found.iter().map(|e| e.external_id.as_str()).collect();
         assert_eq!(ids, vec!["the-clash"]);
     }
 
-    #[tokio::test]
-    async fn a_calendar_conflict_is_on_the_briefing_too() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_calendar_conflict_is_on_the_briefing_too(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         record(
             &f.events,
             "google",
             "clash",
             kinds::CALENDAR_CONFLICT,
             json!({ "overlap_start": "2026-09-25T09:00:00Z" }),
-        );
-        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).unwrap();
+        ).await;
+        let found = todays_calendar(&f.events, Stockholm, utc("2026-09-25T10:00:00Z")).await.unwrap();
         assert_eq!(found.len(), 1);
     }
 
@@ -1117,15 +1112,15 @@ record_voucher = "approve"
     /// human tap; it gets nothing else.
     ///
     /// Do not widen this scope without answering who wrote the prompt.
-    #[tokio::test]
-    async fn a_briefing_session_cannot_write_durable_memory() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_briefing_session_cannot_write_durable_memory(pool: sqlx::PgPool) {
         use crate::session::{build_argv, McpConfig};
 
-        let f = fixture();
+        let f = fixture(pool);
         // A digest line is connector-authored text, which is exactly the
         // provenance this test is about — and it is what makes the morning
         // material non-empty enough to be worth a session at all.
-        f.log.push_digest("[kth] examiner mail (40)").unwrap();
+        f.log.push_digest("[kth] examiner mail (40)").await.unwrap();
         run_morning_briefing(
             &f.deps,
             utc("2026-09-25T05:00:00Z"),
@@ -1150,32 +1145,32 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn the_morning_briefing_carries_the_calendar_the_backlog_and_the_digest() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_morning_briefing_carries_the_calendar_the_backlog_and_the_digest(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         record(
             &f.events,
             "google",
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
-        );
+        ).await;
         let scored = record(
             &f.events,
             "canvas",
             "hand-in",
             "assignment",
             json!({ "title": "XX1002 hand-in" }),
-        );
+        ).await;
         record(
             &f.events,
             "kth",
             "unread",
             "mail",
             json!({ "subject": "examiner mail" }),
-        );
-        f.events.set_salience(scored.id, 90).unwrap();
-        f.log.push_digest("[notion] a page moved (30)").unwrap();
+        ).await;
+        f.events.set_salience(scored.id, 90).await.unwrap();
+        f.log.push_digest("[notion] a page moved (30)").await.unwrap();
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1203,11 +1198,11 @@ record_voucher = "approve"
     }
 
     /// One message, not one per section.
-    #[tokio::test]
-    async fn the_morning_briefing_sends_exactly_one_message() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_morning_briefing_sends_exactly_one_message(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         for i in 0..5 {
-            f.log.push_digest(format!("line {i}")).unwrap();
+            f.log.push_digest(format!("line {i}")).await.unwrap();
         }
         run_morning_briefing(
             &f.deps,
@@ -1219,11 +1214,11 @@ record_voucher = "approve"
         assert_eq!(f.pusher.sent(), vec!["the briefing".to_string()]);
     }
 
-    #[tokio::test]
-    async fn the_morning_briefing_clears_the_digest_it_reported() {
-        let f = fixture();
-        f.log.push_digest("one").unwrap();
-        f.log.push_digest("two").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_morning_briefing_clears_the_digest_it_reported(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        f.log.push_digest("one").await.unwrap();
+        f.log.push_digest("two").await.unwrap();
 
         run_morning_briefing(
             &f.deps,
@@ -1233,7 +1228,7 @@ record_voucher = "approve"
         .await
         .unwrap();
 
-        assert_eq!(f.log.digest_len().unwrap(), 0);
+        assert_eq!(f.log.digest_len().await.unwrap(), 0);
     }
 
     /// **A second briefing on the same day must not repeat the first one.**
@@ -1242,9 +1237,9 @@ record_voucher = "approve"
     /// reported again at 07:05 teaches the owner to stop reading the 07:00
     /// one. `drop_digest_prefix` is what makes the second pass see an empty
     /// backlog, and this is the test that it is actually called.
-    #[tokio::test]
-    async fn a_second_briefing_the_same_day_does_not_repeat_the_digest() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_second_briefing_the_same_day_does_not_repeat_the_digest(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         // Something other than the digest, so the second briefing still has
         // material and takes the session path rather than the short line.
         record(
@@ -1253,8 +1248,8 @@ record_voucher = "approve"
             "today",
             kinds::CALENDAR_EVENT,
             json!({ "title": "lunch with the accountant", "start": "2026-09-25T10:00:00Z" }),
-        );
-        f.log.push_digest("[notion] a page moved (30)").unwrap();
+        ).await;
+        f.log.push_digest("[notion] a page moved (30)").await.unwrap();
 
         let first = run_morning_briefing(
             &f.deps,
@@ -1286,15 +1281,15 @@ record_voucher = "approve"
             "the second briefing must not report it again: {}",
             prompts[1].prompt
         );
-        assert_eq!(f.log.digest_len().unwrap(), 0);
+        assert_eq!(f.log.digest_len().await.unwrap(), 0);
     }
 
     /// A line pushed *while* the session was running belongs to the next
     /// briefing, not to the void: only the prefix that was read is dropped.
-    #[tokio::test]
-    async fn a_line_that_arrives_during_the_briefing_is_kept_for_the_next_one() {
-        let f = fixture();
-        f.log.push_digest("reported").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_line_that_arrives_during_the_briefing_is_kept_for_the_next_one(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        f.log.push_digest("reported").await.unwrap();
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1307,8 +1302,8 @@ record_voucher = "approve"
 
         // Standing in for a triage pass that landed mid-session: the prefix
         // rule is what decides which briefing this belongs to.
-        f.log.push_digest("arrived later").unwrap();
-        assert_eq!(f.log.digest().unwrap(), vec!["arrived later".to_string()]);
+        f.log.push_digest("arrived later").await.unwrap();
+        assert_eq!(f.log.digest().await.unwrap(), vec!["arrived later".to_string()]);
     }
 
     /// **An empty morning is a short message, not silence.**
@@ -1318,9 +1313,9 @@ record_voucher = "approve"
     /// cheapest liveness signal there is — and it costs no session, because a
     /// model asked to write about nothing produces a worse sentence than the
     /// constant does.
-    #[tokio::test]
-    async fn an_empty_digest_produces_a_short_message_rather_than_silence() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_empty_digest_produces_a_short_message_rather_than_silence(pool: sqlx::PgPool) {
+        let f = fixture(pool);
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1342,10 +1337,10 @@ record_voucher = "approve"
     /// The brief's sequence, end to end: the briefing drains the digest, and
     /// the second one that day has nothing left — so it says so rather than
     /// going quiet.
-    #[tokio::test]
-    async fn the_briefing_after_a_drain_says_nothing_needing_you() {
-        let f = fixture();
-        f.log.push_digest("[notion] a page moved (30)").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_briefing_after_a_drain_says_nothing_needing_you(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        f.log.push_digest("[notion] a page moved (30)").await.unwrap();
 
         run_morning_briefing(
             &f.deps,
@@ -1354,7 +1349,7 @@ record_voucher = "approve"
         )
         .await
         .unwrap();
-        assert_eq!(f.log.digest_len().unwrap(), 0);
+        assert_eq!(f.log.digest_len().await.unwrap(), 0);
 
         let second = run_morning_briefing(
             &f.deps,
@@ -1374,10 +1369,10 @@ record_voucher = "approve"
 
     /// **The digest must not be destroyed by a briefing that never arrived.**
     /// The owner would never learn what was in it.
-    #[tokio::test]
-    async fn a_failed_send_keeps_the_digest_for_the_next_briefing() {
-        let f = build(SpyPusher::failing(), SpyCaller::new("[]"));
-        f.log.push_digest("something the owner needs").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_send_keeps_the_digest_for_the_next_briefing(pool: sqlx::PgPool) {
+        let f = build(pool, SpyPusher::failing(), SpyCaller::new("[]"));
+        f.log.push_digest("something the owner needs").await.unwrap();
 
         let err = run_morning_briefing(
             &f.deps,
@@ -1389,7 +1384,7 @@ record_voucher = "approve"
         assert!(format!("{err:#}").contains("telegram is down"));
 
         assert_eq!(
-            f.log.digest().unwrap(),
+            f.log.digest().await.unwrap(),
             vec!["something the owner needs".to_string()],
             "the backlog survives to be reported tomorrow"
         );
@@ -1400,11 +1395,11 @@ record_voucher = "approve"
     ///
     /// It must also not be *silent*. A morning with no message is how the
     /// owner would learn about a broken install — which is to say, never.
-    #[tokio::test]
-    async fn without_a_session_runner_the_briefing_says_so_and_keeps_the_digest() {
-        let mut f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn without_a_session_runner_the_briefing_says_so_and_keeps_the_digest(pool: sqlx::PgPool) {
+        let mut f = fixture(pool);
         f.deps.sessions = None;
-        f.log.push_digest("held").unwrap();
+        f.log.push_digest("held").await.unwrap();
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1427,20 +1422,20 @@ record_voucher = "approve"
         );
 
         assert_eq!(
-            f.log.digest_len().unwrap(),
+            f.log.digest_len().await.unwrap(),
             1,
             "the short line is not a briefing, so it drains nothing"
         );
         assert_eq!(outcome.digest_lines, 0);
     }
 
-    #[tokio::test]
-    async fn a_spent_budget_skips_the_briefing_without_failing_it() {
-        let mut f = fixture();
-        f.deps.budget = Budget::new(RunStore::new(Arc::clone(&f.conn)), 0, Stockholm);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_spent_budget_skips_the_briefing_without_failing_it(pool: sqlx::PgPool) {
+        let mut f = fixture(pool);
+        f.deps.budget = Budget::new(RunStore::new(f.pool.clone()), 0, Stockholm);
         // Non-empty material, so the short-line path is not what is being
         // measured here: this is the session that must not start.
-        f.log.push_digest("something worth a briefing").unwrap();
+        f.log.push_digest("something worth a briefing").await.unwrap();
 
         let outcome = run_morning_briefing(
             &f.deps,
@@ -1457,9 +1452,9 @@ record_voucher = "approve"
 
     // -- the accounting briefings ------------------------------------------
 
-    #[tokio::test]
-    async fn the_bookkeeping_pass_reads_both_invoice_sides_and_the_ledger() {
-        let f = build(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_bookkeeping_pass_reads_both_invoice_sides_and_the_ledger(pool: sqlx::PgPool) {
+        let f = build(pool, 
             SpyPusher::new(),
             SpyCaller::new("[{\"DocumentNumber\":\"12\"}]"),
         );
@@ -1493,16 +1488,16 @@ record_voucher = "approve"
         assert_eq!(kinds, vec![json!("customer"), json!("supplier")]);
     }
 
-    #[tokio::test]
-    async fn the_vat_pass_reads_the_vat_accounts_and_the_deadline_list() {
-        let f = build(SpyPusher::new(), SpyCaller::new("{\"vat_accounts\":[]}"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_vat_pass_reads_the_vat_accounts_and_the_deadline_list(pool: sqlx::PgPool) {
+        let f = build(pool, SpyPusher::new(), SpyCaller::new("{\"vat_accounts\":[]}"));
         record(
             &f.events,
             "fortnox",
             "tax-deadline:moms:2026-09",
             kinds::TAX_DEADLINE,
             json!({ "label": "Momsdeklaration", "due_on": "2026-10-12" }),
-        );
+        ).await;
 
         run_vat_prep(&f.deps, utc("2026-10-01T07:00:00Z"))
             .await
@@ -1523,9 +1518,9 @@ record_voucher = "approve"
 
     /// `vat_prep` reports and drafts nothing, and the instruction that says so
     /// has to actually be in the system prompt.
-    #[tokio::test]
-    async fn the_vat_pass_is_told_to_draft_nothing() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_vat_pass_is_told_to_draft_nothing(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         run_vat_prep(&f.deps, utc("2026-10-01T07:00:00Z"))
             .await
             .unwrap();
@@ -1540,9 +1535,9 @@ record_voucher = "approve"
 
     /// A read the policy does not grade `auto` is refused, and the refusal
     /// names the grade. This is the same rule `run_watch_poll` holds.
-    #[tokio::test]
-    async fn a_read_the_policy_does_not_grade_auto_is_refused() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_read_the_policy_does_not_grade_auto_is_refused(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let err = read_auto(
             f.caller.as_ref(),
             &f.deps.policy,
@@ -1562,9 +1557,9 @@ record_voucher = "approve"
 
     /// A tool with no rule at all falls through to the gate's `approve`
     /// default, so an unlisted tool is refused rather than assumed harmless.
-    #[tokio::test]
-    async fn an_unlisted_tool_is_refused_too() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_unlisted_tool_is_refused_too(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         assert!(read_auto(
             f.caller.as_ref(),
             &f.deps.policy,
@@ -1580,10 +1575,10 @@ record_voucher = "approve"
     /// Every briefing session names its model and is scoped to no connector.
     /// An unset model inherits the owner's `opus[1m]`; a connector scope would
     /// spawn child processes for tools the session cannot call.
-    #[tokio::test]
-    async fn every_briefing_session_pins_its_model_and_takes_no_connectors() {
-        let f = fixture();
-        f.log.push_digest("something to brief on").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn every_briefing_session_pins_its_model_and_takes_no_connectors(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        f.log.push_digest("something to brief on").await.unwrap();
         run_morning_briefing(
             &f.deps,
             utc("2026-09-25T05:00:00Z"),
@@ -1629,25 +1624,25 @@ record_voucher = "approve"
     }
 
     /// A connector that will not answer costs that section, not the briefing.
-    #[tokio::test]
-    async fn a_connector_read_that_fails_becomes_a_line_rather_than_a_dead_briefing() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_connector_read_that_fails_becomes_a_line_rather_than_a_dead_briefing(pool: sqlx::PgPool) {
         struct Broken;
         impl ToolCaller for Broken {
             async fn call(&self, _: &str, _: &str, _: Value) -> anyhow::Result<String> {
                 anyhow::bail!("401 Unauthorized")
             }
         }
-        let f = fixture();
+        let f = fixture(pool);
         let deps = BriefingDeps {
             events: f.deps.events.clone(),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
+            log: NotificationLog::new(KvStore::new(f.pool.clone())),
             sessions: f.deps.sessions.clone(),
             pusher: f.deps.pusher.clone(),
             caller: Arc::new(Broken),
             policy: policy(),
             time_zone: Stockholm,
             threshold: 60,
-            budget: Budget::new(RunStore::new(Arc::clone(&f.conn)), 60, Stockholm),
+            budget: Budget::new(RunStore::new(f.pool.clone()), 60, Stockholm),
         };
 
         let outcome = run_vat_prep(&deps, utc("2026-10-01T07:00:00Z"))

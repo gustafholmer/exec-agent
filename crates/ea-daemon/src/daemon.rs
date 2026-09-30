@@ -11,7 +11,7 @@
 //! Every method here is exactly one of two things:
 //!
 //! * **a read of local state** — `status`, `queue`, `log` — which touches the
-//!   SQLite database and the scheduler's flags and nothing else; or
+//!   Postgres database and the scheduler's flags and nothing else; or
 //! * **a path through [`Executor`]** — `propose`, `approve` — where
 //!   `Policy::decide` has already run and, for `approve`, a human has said yes
 //!   to a specific stored action.
@@ -120,8 +120,8 @@ pub struct PauseState {
 /// Unreadable or unparseable state degrades to "not paused" (via
 /// [`KvStore::get_json`]): refusing to start would be a worse failure than
 /// running, and the owner can see the daemon is running.
-pub fn restore_pause(kv: &KvStore, scheduler: &Scheduler) -> PauseState {
-    let state: PauseState = kv.get_json(PAUSED_KEY).unwrap_or_default();
+pub async fn restore_pause(kv: &KvStore, scheduler: &Scheduler) -> PauseState {
+    let state: PauseState = kv.get_json(PAUSED_KEY).await.unwrap_or_default();
     if state.paused {
         scheduler.pause();
     }
@@ -346,7 +346,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// only symptom is that nothing ever happens again. Both are reported for
     /// every job, so a failing-but-not-yet-tripped connector is visible too.
     pub async fn status(&self, _params: Value) -> anyhow::Result<Value> {
-        let pending = self.actions.pending()?;
+        let pending = self.actions.pending().await?;
         let jobs: Vec<Value> = self
             .scheduler
             .names()
@@ -368,7 +368,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             })
             .collect();
 
-        let pause: PauseState = self.kv.get_json(PAUSED_KEY).unwrap_or_default();
+        let pause: PauseState = self.kv.get_json(PAUSED_KEY).await.unwrap_or_default();
         let paused_for_days = pause.since.map(|since| (Utc::now() - since).num_days());
 
         Ok(json!({
@@ -386,7 +386,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // daemon has decided not to look at something; that must be
             // visible here rather than only in the log, or it is exactly the
             // silent failure the rest of this endpoint exists to prevent.
-            "unscorable_events": self.events.abandoned_count().unwrap_or_default(),
+            "unscorable_events": self.events.abandoned_count().await.unwrap_or_default(),
             // Scores held back by the threshold, by quiet hours or by the
             // hourly rate limit. The morning briefing now delivers them, so
             // `digest_pending` is normally the hours since the last briefing
@@ -394,10 +394,10 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // still here: a number that keeps climbing past a day means the
             // briefing has stopped, and `digest_dropped` counts what the
             // 200-line cap has destroyed in the meantime.
-            "digest_pending": self.notify_log.digest_len().unwrap_or_default(),
-            "digest_dropped": self.notify_log.digest_dropped().unwrap_or_default(),
+            "digest_pending": self.notify_log.digest_len().await.unwrap_or_default(),
+            "digest_dropped": self.notify_log.digest_dropped().await.unwrap_or_default(),
             "jobs": jobs,
-            "schedules": self.schedule_status(),
+            "schedules": self.schedule_status().await,
             "connectors": self.connectors,
             "sessions_available": self.chat.sessions_available(),
             "notifier_configured": self.pusher.is_some(),
@@ -408,11 +408,11 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             // scoring and the briefings have stopped writing, and a digest
             // that keeps climbing past a day means the briefing that drains
             // it is not running.
-            "sessions_today": self.chat.budget().status_line(Utc::now()),
-            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).unwrap_or_default(),
+            "sessions_today": self.chat.budget().status_line(Utc::now()).await,
+            "sessions_spent_today": self.chat.budget().spent_today(Utc::now()).await.unwrap_or_default(),
             "daily_session_budget": self.chat.budget().limit(),
             "chat_model": self.chat.model(),
-            "facts": self.chat.facts().all().map(|f| f.len()).unwrap_or_default(),
+            "facts": self.chat.facts().all().await.map(|f| f.len()).unwrap_or_default(),
             "started_at": self.started_at.to_rfc3339(),
         }))
     }
@@ -428,8 +428,8 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// Read errors degrade to an empty list rather than failing `status`: this
     /// endpoint is what someone reaches for when things are already wrong, and
     /// it must answer.
-    fn schedule_status(&self) -> Vec<Value> {
-        let rows = match self.schedules.all() {
+    async fn schedule_status(&self) -> Vec<Value> {
+        let rows = match self.schedules.all().await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %format!("{err:#}"), "could not read the schedules table");
@@ -457,7 +457,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
 
     /// `queue` — the proposals waiting for a human.
     pub async fn queue(&self, _params: Value) -> anyhow::Result<Value> {
-        let pending = self.actions.pending()?;
+        let pending = self.actions.pending().await?;
         serde_json::to_value(pending).context("queue: serialising the pending actions")
     }
 
@@ -468,7 +468,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             .n
             .unwrap_or(DEFAULT_LOG_LIMIT)
             .clamp(1, MAX_LOG_LIMIT);
-        let runs = self.runs.recent(n)?;
+        let runs = self.runs.recent(n).await?;
         serde_json::to_value(runs).context("log: serialising the runs")
     }
 
@@ -524,6 +524,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
                     since: Some(since),
                 },
             )
+            .await
             .context("recording the pause so it survives a restart")?;
         tracing::info!(%since, "scheduler paused over IPC, and persisted");
         Ok(json!({ "paused": true, "since": since.to_rfc3339() }))
@@ -534,6 +535,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         self.scheduler.resume();
         self.kv
             .set_json(PAUSED_KEY, &PauseState::default())
+            .await
             .context("clearing the persisted pause")?;
         tracing::info!("scheduler resumed over IPC, and the persisted pause cleared");
         Ok(json!({ "paused": false }))
@@ -619,7 +621,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         let params: IdParams = parse_params("approve", params)?;
         // Propagates "action N does not exist" and "action N is executed, not
         // proposed" straight from the store, which is what the CLI shows.
-        self.actions.approve(params.id)?;
+        self.actions.approve(params.id).await?;
         let action = self.executor.execute_approved(params.id).await?;
         serde_json::to_value(action).context("approve: serialising the action")
     }
@@ -631,7 +633,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         let reason = params
             .reason
             .unwrap_or_else(|| "rejected by the user".into());
-        let action = self.actions.reject(params.id, &reason)?;
+        let action = self.actions.reject(params.id, &reason).await?;
         serde_json::to_value(action).context("reject: serialising the action")
     }
 
@@ -675,13 +677,17 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// [`ea_core::store::facts`].
     pub async fn remember(&self, params: Value) -> anyhow::Result<Value> {
         let params: RememberParams = parse_params("remember", params)?;
-        let fact = self.chat.facts().remember(&params.topic, &params.body)?;
+        let fact = self
+            .chat
+            .facts()
+            .remember(&params.topic, &params.body)
+            .await?;
         serde_json::to_value(fact).context("remember: serialising the fact")
     }
 
     /// `facts` — everything the assistant has been told to remember.
     pub async fn facts(&self, _params: Value) -> anyhow::Result<Value> {
-        let facts = self.chat.facts().all()?;
+        let facts = self.chat.facts().all().await?;
         serde_json::to_value(facts).context("facts: serialising the facts")
     }
 
@@ -689,7 +695,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     /// rather than reporting a deletion that did not happen.
     pub async fn forget(&self, params: Value) -> anyhow::Result<Value> {
         let params: IdParams = parse_params("forget", params)?;
-        let existed = self.chat.facts().forget(params.id)?;
+        let existed = self.chat.facts().forget(params.id).await?;
         Ok(json!({ "id": params.id, "forgotten": existed }))
     }
 
@@ -793,13 +799,15 @@ mod tests {
 
     impl SessionBoundary for FakeSessions {
         fn run_session(&self, req: SessionRequest) -> BoxedSession<'_> {
-            let run_id = self.runs.start(&req.kind, &req.prompt, &[]).unwrap();
+            let async_req = req.clone();
             self.seen.lock().unwrap().push(req);
             let reply = self.reply.clone();
             let session_id = self.session_id.clone();
             let runs = self.runs.clone();
             Box::pin(async move {
-                runs.finish(run_id, "ok", Some(&reply), &[], Some(0.001))?;
+                let run_id = runs.start(&async_req.kind, &async_req.prompt, &[]).await?;
+                runs.finish(run_id, "ok", Some(&reply), &[], Some(0.001))
+                    .await?;
                 Ok(SessionOutcome {
                     text: reply,
                     structured: None,
@@ -854,9 +862,7 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
-        /// Kept so a test can build a second `Daemon` over the same database.
-        conn: Arc<Mutex<rusqlite::Connection>>,
+        pool: sqlx::PgPool,
         daemon: Arc<Daemon<SpyCaller>>,
         log: CallLog,
         scheduler: Arc<Scheduler>,
@@ -867,29 +873,25 @@ record_voucher = "approve"
     }
 
     impl Fixture {
-        fn new() -> Self {
-            Self::build(true, 60)
+        fn new(pool: sqlx::PgPool) -> Self {
+            Self::build(pool, true, 60)
         }
 
         /// Without a session runner: the shape a daemon has when `claude`
         /// could not be resolved at startup.
-        fn without_sessions() -> Self {
-            Self::build(false, 60)
+        fn without_sessions(pool: sqlx::PgPool) -> Self {
+            Self::build(pool, false, 60)
         }
 
-        fn build(with_sessions: bool, budget: u32) -> Self {
-            let dir = TempDir::new().unwrap();
-            let conn = Arc::new(Mutex::new(
-                ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-            ));
+        fn build(pool: sqlx::PgPool, with_sessions: bool, budget: u32) -> Self {
             let sessions = with_sessions.then(|| {
-                FakeSessions::new("here is your answer", RunStore::new(Arc::clone(&conn)))
+                FakeSessions::new("here is your answer", RunStore::new(pool.clone()))
             });
             let caller = SpyCaller::default();
             let log = Arc::clone(&caller.calls);
             let executor = Arc::new(Executor::new(
-                ActionStore::new(Arc::clone(&conn)),
-                RunStore::new(Arc::clone(&conn)),
+                ActionStore::new(pool.clone()),
+                RunStore::new(pool.clone()),
                 policy(),
                 caller,
             ));
@@ -901,14 +903,14 @@ record_voucher = "approve"
                 Ok(())
             }));
             let pusher = Arc::new(FakePusher::default());
-            let conversations = ConversationStore::new(Arc::clone(&conn));
-            let facts = FactStore::new(Arc::clone(&conn));
+            let conversations = ConversationStore::new(pool.clone());
+            let facts = FactStore::new(pool.clone());
             let chat = Arc::new(ChatService::new(
                 conversations.clone(),
                 facts.clone(),
                 sessions.clone().map(|s| s as Arc<dyn SessionBoundary>),
                 Budget::new(
-                    RunStore::new(Arc::clone(&conn)),
+                    RunStore::new(pool.clone()),
                     budget,
                     crate::notify::policy::DEFAULT_TIME_ZONE,
                 ),
@@ -918,22 +920,21 @@ record_voucher = "approve"
 
             let daemon = Daemon::build(Deps {
                 executor,
-                actions: ActionStore::new(Arc::clone(&conn)),
-                events: EventStore::new(Arc::clone(&conn)),
-                runs: RunStore::new(Arc::clone(&conn)),
+                actions: ActionStore::new(pool.clone()),
+                events: EventStore::new(pool.clone()),
+                runs: RunStore::new(pool.clone()),
                 scheduler: Arc::clone(&scheduler),
-                schedules: ScheduleStore::new(Arc::clone(&conn)),
+                schedules: ScheduleStore::new(pool.clone()),
                 time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
                 chat: Arc::clone(&chat),
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
-                notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
-                kv: KvStore::new(Arc::clone(&conn)),
+                notify_log: NotificationLog::new(KvStore::new(pool.clone())),
+                kv: KvStore::new(pool.clone()),
                 connectors: vec!["canvas".to_string()],
             });
 
             Self {
-                _dir: dir,
-                conn,
+                pool,
                 daemon,
                 log,
                 scheduler,
@@ -980,18 +981,18 @@ record_voucher = "approve"
 
     // -- the brief's IPC tests ----------------------------------------------
 
-    #[tokio::test]
-    async fn status_reports_a_running_unpaused_daemon_with_an_empty_queue() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_reports_a_running_unpaused_daemon_with_an_empty_queue(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let status = f.call("status", Value::Null).await.unwrap();
         assert_eq!(status["status"], "ok");
         assert_eq!(status["paused"], false);
         assert_eq!(status["pending_actions"], 0);
     }
 
-    #[tokio::test]
-    async fn queue_lists_a_proposal() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn queue_lists_a_proposal(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("propose", params("fortnox", "record_voucher"))
             .await
             .unwrap();
@@ -1007,9 +1008,9 @@ record_voucher = "approve"
         assert_eq!(status["pending_actions"], 1);
     }
 
-    #[tokio::test]
-    async fn approve_executes_through_ipc() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn approve_executes_through_ipc(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let proposed = f
             .call("propose", params("fortnox", "record_voucher"))
             .await
@@ -1038,9 +1039,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn reject_rejects_and_never_calls_the_connector() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn reject_rejects_and_never_calls_the_connector(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let id = f
             .call("propose", params("fortnox", "record_voucher"))
             .await
@@ -1057,17 +1058,17 @@ record_voucher = "approve"
         assert!(f.calls().is_empty(), "rejection must reach no connector");
     }
 
-    #[tokio::test]
-    async fn approving_an_unknown_id_says_it_does_not_exist() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn approving_an_unknown_id_says_it_does_not_exist(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let err = f.call("approve", json!({ "id": 9999 })).await.unwrap_err();
         assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
         assert!(f.calls().is_empty());
     }
 
-    #[tokio::test]
-    async fn pause_then_status_shows_paused_and_resume_clears_it() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn pause_then_status_shows_paused_and_resume_clears_it(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("pause", Value::Null).await.unwrap();
         assert_eq!(f.call("status", Value::Null).await.unwrap()["paused"], true);
         assert!(f.scheduler.is_paused());
@@ -1085,16 +1086,16 @@ record_voucher = "approve"
     /// What `main` builds on the next start: a fresh `Scheduler` -- the old
     /// process's `AtomicBool` went with it -- over the same database, plus the
     /// startup restore `main` runs before `scheduler.start()`.
-    fn restart(f: &Fixture, connectors: &[&str]) -> (Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
+    async fn restart(f: &Fixture, connectors: &[&str]) -> (Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
         let scheduler = Arc::new(Scheduler::new(3));
-        let kv = KvStore::new(Arc::clone(&f.conn));
+        let kv = KvStore::new(f.pool.clone());
         let daemon = Daemon::build(Deps {
             executor: Arc::clone(&f.daemon.executor),
             actions: f.daemon.actions.clone(),
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f.daemon.chat),
             pusher: None,
@@ -1102,19 +1103,19 @@ record_voucher = "approve"
             kv: kv.clone(),
             connectors: connectors.iter().map(|c| (*c).to_string()).collect(),
         });
-        restore_pause(&kv, &scheduler);
+        restore_pause(&kv, &scheduler).await;
         (scheduler, daemon)
     }
 
     /// The defect: `paused` was an in-memory flag and the plist sets
     /// `KeepAlive`, so the reboot the owner is away for un-paused the daemon
     /// and it resumed polling and spending on its own.
-    #[tokio::test]
-    async fn a_pause_survives_a_restart() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_pause_survives_a_restart(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("pause", Value::Null).await.unwrap();
 
-        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        let (scheduler, daemon) = restart(&f, &["canvas"]).await;
         assert!(
             scheduler.is_paused(),
             "a restart while paused must come back paused"
@@ -1129,23 +1130,23 @@ record_voucher = "approve"
 
     /// The other half, and the one that matters more: nothing may come back
     /// paused that was not paused on purpose.
-    #[tokio::test]
-    async fn a_restart_while_running_stays_running() {
-        let f = Fixture::new();
-        let (scheduler, daemon) = restart(&f, &["canvas"]);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_restart_while_running_stays_running(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let (scheduler, daemon) = restart(&f, &["canvas"]).await;
         assert!(!scheduler.is_paused());
         let status = daemon.status(Value::Null).await.unwrap();
         assert_eq!(status["paused"], false);
         assert!(status["paused_since"].is_null());
     }
 
-    #[tokio::test]
-    async fn resume_clears_the_persisted_pause() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn resume_clears_the_persisted_pause(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("pause", Value::Null).await.unwrap();
         f.call("resume", Value::Null).await.unwrap();
 
-        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        let (scheduler, daemon) = restart(&f, &["canvas"]).await;
         assert!(
             !scheduler.is_paused(),
             "resume must outlive the process too"
@@ -1159,22 +1160,22 @@ record_voucher = "approve"
     /// and, under the plist's `KeepAlive`, the daemon comes back paused and
     /// never runs again. That is a total, silent failure of the product; this
     /// test fails the moment someone "simplifies" the fix that way.
-    #[tokio::test]
-    async fn a_clean_shutdown_does_not_persist_a_pause() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_clean_shutdown_does_not_persist_a_pause(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
 
         // The shutdown sequence from `main`, in order.
         f.scheduler.pause();
         f.scheduler.drain(Duration::from_secs(1)).await;
 
-        let kv = KvStore::new(Arc::clone(&f.conn));
+        let kv = KvStore::new(f.pool.clone());
         assert_eq!(
-            kv.get(PAUSED_KEY).unwrap(),
+            kv.get(PAUSED_KEY).await.unwrap(),
             None,
             "the shutdown drain's pause must never be recorded as the owner's intent"
         );
 
-        let (scheduler, daemon) = restart(&f, &["canvas"]);
+        let (scheduler, daemon) = restart(&f, &["canvas"]).await;
         assert!(
             !scheduler.is_paused(),
             "a daemon restarted after a clean shutdown must run"
@@ -1185,10 +1186,10 @@ record_voucher = "approve"
     /// The cost of making the pause durable: a forgotten pause now stays. The
     /// mitigation is visibility, not an expiry -- `status` says how long, and
     /// says out loud that the Fortnox grant is on a clock.
-    #[tokio::test]
-    async fn status_says_how_long_a_pause_has_stood_and_warns_about_fortnox() {
-        let f = Fixture::new();
-        let kv = KvStore::new(Arc::clone(&f.conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_says_how_long_a_pause_has_stood_and_warns_about_fortnox(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let kv = KvStore::new(f.pool.clone());
         kv.set_json(
             PAUSED_KEY,
             &PauseState {
@@ -1196,9 +1197,10 @@ record_voucher = "approve"
                 since: Some(Utc::now() - chrono::Duration::days(40)),
             },
         )
+        .await
         .unwrap();
 
-        let (_scheduler, daemon) = restart(&f, &["canvas", "fortnox"]);
+        let (_scheduler, daemon) = restart(&f, &["canvas", "fortnox"]).await;
         let status = daemon.status(Value::Null).await.unwrap();
         assert_eq!(status["paused"], true);
         assert_eq!(status["paused_for_days"], 40);
@@ -1209,15 +1211,15 @@ record_voucher = "approve"
         );
 
         // No Fortnox wired, nothing to lose to a lapse, no warning.
-        let (_scheduler, daemon) = restart(&f, &["canvas"]);
+        let (_scheduler, daemon) = restart(&f, &["canvas"]).await;
         let status = daemon.status(Value::Null).await.unwrap();
         assert_eq!(status["paused_for_days"], 40);
         assert!(status["pause_warning"].is_null(), "{status}");
     }
 
-    #[tokio::test]
-    async fn chat_appends_a_message_and_returns_the_conversation_id() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_appends_a_message_and_returns_the_conversation_id(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let first = f
             .call("chat", json!({ "message": "what is due this week?" }))
             .await
@@ -1241,9 +1243,9 @@ record_voucher = "approve"
         assert_eq!(seen[1].resume.as_deref(), Some("sess-1"));
     }
 
-    #[tokio::test]
-    async fn log_returns_the_runs_newest_first() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn log_returns_the_runs_newest_first(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         // An auto action writes one `runs` row through the executor.
         f.call("propose", params("canvas", "list_courses"))
             .await
@@ -1256,9 +1258,9 @@ record_voucher = "approve"
         assert!(rows[0]["id"].as_i64().unwrap() > rows[1]["id"].as_i64().unwrap());
     }
 
-    #[tokio::test]
-    async fn log_clamps_a_silly_limit() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn log_clamps_a_silly_limit(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         assert!(f.call("log", json!({ "n": 10_000_000 })).await.is_ok());
         assert!(f.call("log", json!({ "n": -5 })).await.is_ok());
         assert!(f.call("log", Value::Null).await.is_ok());
@@ -1266,9 +1268,9 @@ record_voucher = "approve"
 
     // -- Addition 4: a tripped breaker is visible, with its reason ----------
 
-    #[tokio::test]
-    async fn status_names_every_job_and_says_which_are_tripped_and_why() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_names_every_job_and_says_which_are_tripped_and_why(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool.clone());
         let status = f.call("status", Value::Null).await.unwrap();
         let jobs = status["jobs"].as_array().unwrap();
         let names: Vec<&str> = jobs.iter().map(|j| j["name"].as_str().unwrap()).collect();
@@ -1292,19 +1294,19 @@ record_voucher = "approve"
         }
         assert!(failing.is_tripped("canvas"));
 
-        let f2 = Fixture::new();
+        let f2 = Fixture::new(pool.clone());
         let daemon = Daemon::build(Deps {
             executor: Arc::clone(&f2.daemon.executor),
             actions: f2.daemon.actions.clone(),
             events: f2.daemon.events.clone(),
             runs: f2.daemon.runs.clone(),
             scheduler: Arc::clone(&failing),
-            schedules: ScheduleStore::new(Arc::clone(&f2.conn)),
+            schedules: ScheduleStore::new(f2.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f2.daemon.chat),
             pusher: None,
-            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f2.conn))),
-            kv: KvStore::new(Arc::clone(&f2.conn)),
+            notify_log: NotificationLog::new(KvStore::new(f2.pool.clone())),
+            kv: KvStore::new(f2.pool.clone()),
             connectors: vec!["canvas".to_string()],
         });
         let status = daemon.status(Value::Null).await.unwrap();
@@ -1325,21 +1327,21 @@ record_voucher = "approve"
     /// to send it, read by nobody. A backlog quietly growing — and then just
     /// as quietly falling off the 200-line cap — is data the owner cared about
     /// disappearing with no trace at all, so `status` carries both numbers.
-    #[tokio::test]
-    async fn status_surfaces_the_digest_backlog_and_what_the_cap_discarded() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_surfaces_the_digest_backlog_and_what_the_cap_discarded(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let before = f.call("status", Value::Null).await.unwrap();
         assert_eq!(before["digest_pending"], 0);
         assert_eq!(before["digest_dropped"], 0);
 
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&f.conn)));
-        log.push_digest("[canvas] a quiet-hours score").unwrap();
+        let log = NotificationLog::new(KvStore::new(f.pool.clone()));
+        log.push_digest("[canvas] a quiet-hours score").await.unwrap();
         let held = f.call("status", Value::Null).await.unwrap();
         assert_eq!(held["digest_pending"], 1);
         assert_eq!(held["digest_dropped"], 0);
 
         for i in 0..(crate::notify::log::MAX_DIGEST_LINES + 2) {
-            log.push_digest(format!("[canvas] score {i}")).unwrap();
+            log.push_digest(format!("[canvas] score {i}")).await.unwrap();
         }
         let overflowed = f.call("status", Value::Null).await.unwrap();
         assert_eq!(
@@ -1355,9 +1357,9 @@ record_voucher = "approve"
     /// An event triage could not score must be countable from `ea status`.
     /// The alternative is that the daemon quietly stops looking at something
     /// and the only record is a log line nobody reads.
-    #[tokio::test]
-    async fn status_counts_the_events_triage_gave_up_on() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_counts_the_events_triage_gave_up_on(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let before = f.call("status", Value::Null).await.unwrap();
         assert_eq!(before["unscorable_events"], 0);
 
@@ -1370,12 +1372,14 @@ record_voucher = "approve"
                 kind: "assignment".into(),
                 payload: json!({ "title": "essay" }),
             })
+            .await
             .unwrap()
             .0
             .id;
         f.daemon
             .events
             .abandon(id, "tier 1 never scored it")
+            .await
             .unwrap();
 
         let after = f.call("status", Value::Null).await.unwrap();
@@ -1387,8 +1391,8 @@ record_voucher = "approve"
     /// A scheduler with one job that always fails and a breaker threshold of
     /// one, plus a daemon wired to it. The finding this covers: before
     /// `resume_job`, the only way out of this state was to restart the daemon.
-    async fn tripped_fixture() -> (Fixture, Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
-        let f = Fixture::new();
+    async fn tripped_fixture(pool: sqlx::PgPool) -> (Fixture, Arc<Scheduler>, Arc<Daemon<SpyCaller>>) {
+        let f = Fixture::new(pool);
         let scheduler = Arc::new(Scheduler::new(1));
         scheduler.add(Job::new("canvas", Duration::from_secs(1800), || async {
             Err(anyhow!("canvas: no usable credentials"))
@@ -1404,20 +1408,20 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat: Arc::clone(&f.daemon.chat),
             pusher: None,
-            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
-            kv: KvStore::new(Arc::clone(&f.conn)),
+            notify_log: NotificationLog::new(KvStore::new(f.pool.clone())),
+            kv: KvStore::new(f.pool.clone()),
             connectors: vec!["canvas".to_string()],
         });
         (f, scheduler, daemon)
     }
 
-    #[tokio::test]
-    async fn resume_job_clears_a_tripped_breaker_and_status_agrees() {
-        let (_f, scheduler, daemon) = tripped_fixture().await;
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn resume_job_clears_a_tripped_breaker_and_status_agrees(pool: sqlx::PgPool) {
+        let (_f, scheduler, daemon) = tripped_fixture(pool).await;
 
         let before = daemon.status(Value::Null).await.unwrap();
         assert_eq!(before["jobs"][0]["tripped"], true);
@@ -1442,11 +1446,12 @@ record_voucher = "approve"
     /// `status` answers "when is the next briefing". A schedule that has
     /// silently stopped and one that is simply not due yet are otherwise
     /// indistinguishable from outside.
-    #[tokio::test]
-    async fn status_reports_every_schedule_and_when_it_next_runs() {
-        let f = Fixture::new();
-        let store = ScheduleStore::new(Arc::clone(&f.conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_reports_every_schedule_and_when_it_next_runs(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let store = ScheduleStore::new(f.pool.clone());
         crate::schedules::register_built_ins(&store, "2026-09-24T10:00:00Z".parse().unwrap())
+            .await
             .unwrap();
 
         let status = f.call("status", Value::Null).await.unwrap();
@@ -1468,16 +1473,17 @@ record_voucher = "approve"
 
     /// A row whose expression has been edited into nonsense reports a `null`
     /// next run rather than taking `status` down with it.
-    #[tokio::test]
-    async fn a_broken_schedule_row_does_not_break_status() {
-        let f = Fixture::new();
-        let store = ScheduleStore::new(Arc::clone(&f.conn));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_broken_schedule_row_does_not_break_status(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let store = ScheduleStore::new(f.pool.clone());
         store
             .ensure(
                 "wrong",
                 "not a cron",
                 "2026-09-24T10:00:00Z".parse().unwrap(),
             )
+            .await
             .unwrap();
 
         let status = f.call("status", Value::Null).await.unwrap();
@@ -1485,9 +1491,9 @@ record_voucher = "approve"
         assert_eq!(status["schedules"][0]["next_run_at"], Value::Null);
     }
 
-    #[tokio::test]
-    async fn resume_job_refuses_a_name_no_job_has() {
-        let (_f, scheduler, daemon) = tripped_fixture().await;
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn resume_job_refuses_a_name_no_job_has(pool: sqlx::PgPool) {
+        let (_f, scheduler, daemon) = tripped_fixture(pool).await;
         let err = daemon
             .resume_job(json!({ "job": "canavs" }))
             .await
@@ -1504,9 +1510,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn resume_job_reaches_no_connector() {
-        let (f, _scheduler, daemon) = tripped_fixture().await;
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn resume_job_reaches_no_connector(pool: sqlx::PgPool) {
+        let (f, _scheduler, daemon) = tripped_fixture(pool).await;
         daemon.resume_job(json!({ "job": "canvas" })).await.unwrap();
         assert!(
             f.calls().is_empty(),
@@ -1517,9 +1523,9 @@ record_voucher = "approve"
 
     // -- the gate -----------------------------------------------------------
 
-    #[tokio::test]
-    async fn an_auto_tool_comes_back_executed() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_auto_tool_comes_back_executed(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let action = f
             .call("propose", params("canvas", "list_courses"))
             .await
@@ -1532,9 +1538,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn an_approve_tool_comes_back_proposed() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_approve_tool_comes_back_proposed(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let action = f
             .call("propose", params("fortnox", "record_voucher"))
             .await
@@ -1545,9 +1551,9 @@ record_voucher = "approve"
 
     /// A proposal that needs a human must actually reach the human, or the
     /// phone half of this system does nothing.
-    #[tokio::test]
-    async fn a_proposal_awaiting_a_human_is_pushed_and_an_auto_one_is_not() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_proposal_awaiting_a_human_is_pushed_and_an_auto_one_is_not(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let id = f
             .call("propose", params("fortnox", "record_voucher"))
             .await
@@ -1569,9 +1575,9 @@ record_voucher = "approve"
     /// Review focus. A model that invents a connector must not crash the loop
     /// and must not be executed: the gate's `approve` default queues the
     /// nonsense for a human to see.
-    #[tokio::test]
-    async fn an_unknown_connector_is_queued_for_a_human_not_executed_and_not_an_error() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_unknown_connector_is_queued_for_a_human_not_executed_and_not_an_error(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let action = f
             .call(
                 "propose",
@@ -1593,9 +1599,9 @@ record_voucher = "approve"
         assert_eq!(next["status"], "executed");
     }
 
-    #[tokio::test]
-    async fn an_unknown_tool_on_a_known_connector_is_also_queued() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_unknown_tool_on_a_known_connector_is_also_queued(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let action = f
             .call("propose", params("canvas", "invented_tool"))
             .await
@@ -1604,9 +1610,9 @@ record_voucher = "approve"
         assert!(f.calls().is_empty());
     }
 
-    #[tokio::test]
-    async fn the_default_ttl_is_twenty_four_hours() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_default_ttl_is_twenty_four_hours(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let action = f
             .call("propose", params("fortnox", "record_voucher"))
             .await
@@ -1630,18 +1636,18 @@ record_voucher = "approve"
         (expires - created).num_seconds()
     }
 
-    #[tokio::test]
-    async fn a_non_positive_ttl_is_refused() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_non_positive_ttl_is_refused(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let mut p = params("fortnox", "record_voucher");
         p["ttl_secs"] = json!(0);
         let err = f.call("propose", p).await.unwrap_err();
         assert!(format!("{err:#}").contains("ttl_secs"), "{err:#}");
     }
 
-    #[tokio::test]
-    async fn a_sensible_ttl_still_works() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_sensible_ttl_still_works(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let mut p = params("fortnox", "record_voucher");
         p["ttl_secs"] = json!(3600);
         let action = f.call("propose", p).await.unwrap();
@@ -1656,9 +1662,9 @@ record_voucher = "approve"
     /// error. Every out-of-bounds value here must instead come back as a
     /// clean IPC error naming the bound, over a real socket, with the socket
     /// still serving afterwards.
-    #[tokio::test]
-    async fn an_out_of_bounds_ttl_is_a_clean_ipc_error_and_the_daemon_keeps_serving() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_out_of_bounds_ttl_is_a_clean_ipc_error_and_the_daemon_keeps_serving(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("d.sock");
         let mut server = ipc::Server::new(&path);
@@ -1691,9 +1697,9 @@ record_voucher = "approve"
         handle.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn params_missing_the_tool_are_an_error() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn params_missing_the_tool_are_an_error(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let err = f
             .call(
                 "propose",
@@ -1710,9 +1716,9 @@ record_voucher = "approve"
     /// The same malformed request over a real socket, because "returns an IPC
     /// error" and "the daemon stays up" are properties of the server, not of
     /// the handler.
-    #[tokio::test]
-    async fn malformed_params_are_an_ipc_error_and_the_daemon_keeps_serving() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn malformed_params_are_an_ipc_error_and_the_daemon_keeps_serving(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("d.sock");
         let mut server = ipc::Server::new(&path);
@@ -1742,9 +1748,9 @@ record_voucher = "approve"
     /// Every registered method, over a real socket, in one place — and an
     /// unknown one refused. This is the list the report's gating table is
     /// checked against.
-    #[tokio::test]
-    async fn every_registered_method_answers_over_the_socket() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn every_registered_method_answers_over_the_socket(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("d.sock");
         let mut server = ipc::Server::new(&path);
@@ -1801,9 +1807,9 @@ record_voucher = "approve"
     /// A method appearing here that is not in the module docs' gating account
     /// is exactly what this is for. `connectors.call` was on this socket once
     /// and was removed; nothing of that shape may return.
-    #[tokio::test]
-    async fn the_ipc_surface_is_exactly_these_thirteen_methods() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_ipc_surface_is_exactly_these_thirteen_methods(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let mut server = ipc::Server::new(&dir.path().join("d.sock"));
         f.daemon.register(&mut server);
@@ -1829,9 +1835,9 @@ record_voucher = "approve"
         assert_eq!(server.methods().len(), 13);
     }
 
-    #[tokio::test]
-    async fn a_proposal_round_trips_over_the_socket() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_proposal_round_trips_over_the_socket(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("d.sock");
         let mut server = ipc::Server::new(&path);
@@ -1850,18 +1856,18 @@ record_voucher = "approve"
 
     // -- chat without a session runner, and against the budget --------------
 
-    #[tokio::test]
-    async fn chat_still_records_the_message_with_no_session_runner() {
-        let f = Fixture::without_sessions();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_still_records_the_message_with_no_session_runner(pool: sqlx::PgPool) {
+        let f = Fixture::without_sessions(pool);
         let reply = f.call("chat", json!({ "message": "hello" })).await.unwrap();
         assert!(reply["conversation_id"].as_i64().unwrap() > 0);
         assert!(reply["reply"].is_null());
         assert!(reply["note"].as_str().unwrap().contains("claude"));
     }
 
-    #[tokio::test]
-    async fn chat_refuses_an_empty_message() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_refuses_an_empty_message(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let err = f
             .call("chat", json!({ "message": "   " }))
             .await
@@ -1882,9 +1888,9 @@ record_voucher = "approve"
     /// What the budget does instead is say so on every turn past the ceiling,
     /// while still counting the spend, so `ea status` stays honest and the
     /// unattended work is what stops first.
-    #[tokio::test]
-    async fn chat_answers_the_owner_even_when_the_daily_budget_is_spent() {
-        let f = Fixture::build(true, 2);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_answers_the_owner_even_when_the_daily_budget_is_spent(pool: sqlx::PgPool) {
+        let f = Fixture::build(pool, true, 2);
 
         let first = f.call("chat", json!({ "message": "hi" })).await.unwrap();
         assert_eq!(first["reply"], "here is your answer");
@@ -1925,16 +1931,16 @@ record_voucher = "approve"
     }
 
     /// The two numbers `ea status` exists to put next to each other.
-    #[tokio::test]
-    async fn status_reports_the_sessions_spent_today_against_the_ceiling() {
-        let f = Fixture::build(true, 60);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn status_reports_the_sessions_spent_today_against_the_ceiling(pool: sqlx::PgPool) {
+        let f = Fixture::build(pool, true, 60);
         let before = f.call("status", Value::Null).await.unwrap();
         assert_eq!(before["sessions_today"], "0/60");
         assert_eq!(before["daily_session_budget"], 60);
         assert_eq!(before["digest_pending"], 0);
 
         f.call("chat", json!({ "message": "hi" })).await.unwrap();
-        f.daemon.notify_log.push_digest("held back").unwrap();
+        f.daemon.notify_log.push_digest("held back").await.unwrap();
 
         let after = f.call("status", Value::Null).await.unwrap();
         assert_eq!(after["sessions_today"], "1/60");
@@ -1945,9 +1951,9 @@ record_voucher = "approve"
     /// A chat session must not be handed connector servers, and must reach the
     /// world only through propose_action. `remember` is the other tool on the
     /// list and writes a local row; neither names a connector.
-    #[tokio::test]
-    async fn a_chat_session_is_scoped_to_no_connectors() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_chat_session_is_scoped_to_no_connectors(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("chat", json!({ "message": "hi" })).await.unwrap();
         let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
         assert!(seen[0].connectors.is_empty());
@@ -1961,9 +1967,9 @@ record_voucher = "approve"
     /// inherited the human's interactive model — `opus-5[1m]`, about 30x tier
     /// 1's rate — and charged it against the same daily session budget. The
     /// model must be explicit, and it must be the configured one.
-    #[tokio::test]
-    async fn a_chat_session_names_its_model_rather_than_inheriting_one() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_chat_session_names_its_model_rather_than_inheriting_one(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call("chat", json!({ "message": "hi" })).await.unwrap();
         let seen = f.sessions.as_ref().unwrap().seen.lock().unwrap();
         assert_eq!(
@@ -1988,9 +1994,9 @@ record_voucher = "approve"
 
     /// A model the owner configured must actually be used, or the setting is
     /// decoration.
-    #[tokio::test]
-    async fn a_configured_chat_model_is_the_one_used() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_configured_chat_model_is_the_one_used(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let chat = Arc::new(ChatService::new(
             f.conversations.clone(),
             f.facts.clone(),
@@ -2009,12 +2015,12 @@ record_voucher = "approve"
             events: f.daemon.events.clone(),
             runs: f.daemon.runs.clone(),
             scheduler: Arc::clone(&f.scheduler),
-            schedules: ScheduleStore::new(Arc::clone(&f.conn)),
+            schedules: ScheduleStore::new(f.pool.clone()),
             time_zone: crate::notify::policy::DEFAULT_TIME_ZONE,
             chat,
             pusher: None,
-            notify_log: NotificationLog::new(KvStore::new(Arc::clone(&f.conn))),
-            kv: KvStore::new(Arc::clone(&f.conn)),
+            notify_log: NotificationLog::new(KvStore::new(f.pool.clone())),
+            kv: KvStore::new(f.pool.clone()),
             connectors: Vec::new(),
         });
         daemon.chat(json!({ "message": "hi" })).await.unwrap();
@@ -2033,9 +2039,9 @@ record_voucher = "approve"
 
     /// The whole point of `remember`: a fact written by a session comes back
     /// on the next conversation that mentions it.
-    #[tokio::test]
-    async fn a_remembered_fact_round_trips_through_the_socket_methods() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_remembered_fact_round_trips_through_the_socket_methods(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let stored = f
             .call(
                 "remember",
@@ -2065,9 +2071,9 @@ record_voucher = "approve"
             .is_empty());
     }
 
-    #[tokio::test]
-    async fn remembering_the_same_topic_twice_updates_rather_than_duplicating() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn remembering_the_same_topic_twice_updates_rather_than_duplicating(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let first = f
             .call(
                 "remember",
@@ -2089,9 +2095,9 @@ record_voucher = "approve"
         assert_eq!(rows[0]["body"], "moved to the 21st");
     }
 
-    #[tokio::test]
-    async fn remembering_an_empty_body_is_refused() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn remembering_an_empty_body_is_refused(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let err = f
             .call("remember", json!({ "topic": "tenta", "body": "  " }))
             .await
@@ -2106,18 +2112,18 @@ record_voucher = "approve"
             .is_empty());
     }
 
-    #[tokio::test]
-    async fn forgetting_a_fact_that_is_not_there_says_so() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn forgetting_a_fact_that_is_not_there_says_so(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let answer = f.call("forget", json!({ "id": 9999 })).await.unwrap();
         assert_eq!(answer["forgotten"], false);
     }
 
     /// The gate, restated for the three methods this task added: memory is
     /// local state, and none of it may reach a connector.
-    #[tokio::test]
-    async fn the_memory_methods_reach_no_connector() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_memory_methods_reach_no_connector(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let stored = f
             .call(
                 "remember",
@@ -2140,9 +2146,9 @@ record_voucher = "approve"
 
     /// A message from the phone and one from the terminal are two turns in one
     /// thread, and the IPC surface is how the terminal joins it.
-    #[tokio::test]
-    async fn chat_records_the_surface_it_was_told() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_records_the_surface_it_was_told(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.call(
             "chat",
             json!({ "message": "from the phone", "surface": "telegram" }),
@@ -2153,8 +2159,8 @@ record_voucher = "approve"
             .await
             .unwrap();
 
-        let id = f.conversations.current().unwrap();
-        let messages = f.conversations.recent(id, 10).unwrap();
+        let id = f.conversations.current().await.unwrap();
+        let messages = f.conversations.recent(id, 10).await.unwrap();
         assert_eq!(
             messages
                 .iter()
@@ -2165,9 +2171,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn chat_refuses_a_surface_nobody_has() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn chat_refuses_a_surface_nobody_has(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         let err = f
             .call("chat", json!({ "message": "hi", "surface": "sms" }))
             .await
@@ -2177,14 +2183,16 @@ record_voucher = "approve"
 
     /// The prompt a chat session is given must carry the facts that match, and
     /// only those.
-    #[tokio::test]
-    async fn a_chat_prompt_carries_the_matching_facts() {
-        let f = Fixture::new();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_chat_prompt_carries_the_matching_facts(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
         f.facts
             .remember("tenta", "the databases tenta is on the 14th")
+            .await
             .unwrap();
         f.facts
             .remember("invoicing", "invoices go to Ekonomi AB")
+            .await
             .unwrap();
 
         f.call("chat", json!({ "message": "when is the tenta?" }))

@@ -66,10 +66,6 @@ pub fn connector_config_dir(connector: &str) -> PathBuf {
     private_dir(config_dir().join(connector))
 }
 
-pub fn database_path() -> PathBuf {
-    state_dir().join("state.db")
-}
-
 pub fn socket_path() -> PathBuf {
     state_dir().join("daemon.sock")
 }

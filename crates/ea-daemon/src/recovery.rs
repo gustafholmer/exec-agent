@@ -53,7 +53,7 @@ pub async fn sweep_stranded(
     log: &NotificationLog,
     pusher: Option<&Arc<dyn Pusher>>,
 ) -> anyhow::Result<Vec<Action>> {
-    let stranded = actions.stranded()?;
+    let stranded = actions.stranded().await?;
     if stranded.is_empty() {
         tracing::debug!("startup sweep: no actions were stranded by a previous run");
         return Ok(Vec::new());
@@ -61,10 +61,11 @@ pub async fn sweep_stranded(
 
     let mut resolved = Vec::new();
     for action in stranded {
-        if !actions.fail_stranded(action.id, STRANDED_REASON)? {
+        if !actions.fail_stranded(action.id, STRANDED_REASON).await? {
             // Only reachable if something else resolved it between the read
             // and the write, which at startup means a second daemon — and the
-            // instance lock rules that out. Logged rather than ignored anyway.
+            // database lock (`lock::DatabaseLock`, taken before this sweep)
+            // rules that out. Logged rather than ignored anyway.
             tracing::warn!(
                 action = action.id,
                 "a stranded action resolved itself mid-sweep"
@@ -75,14 +76,18 @@ pub async fn sweep_stranded(
             action = action.id,
             connector = %action.connector,
             tool = %action.tool,
-            claimed_at = action.executed_at.as_deref().unwrap_or("?"),
+            claimed_at = action
+                .executed_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_else(|| "?".to_string()),
             "resolving an action stranded by a previous run: it was NOT retried"
         );
         log.push_digest(format!(
             "[recovery] #{} {}.{} was interrupted mid-execution by a daemon restart; \
              the outcome is unknown and it was not retried",
             action.id, action.connector, action.tool
-        ))?;
+        ))
+        .await?;
         resolved.push(action);
     }
 
@@ -123,8 +128,6 @@ mod tests {
 
     use ea_core::store::actions::{ActionStatus, ProposeInput};
     use ea_core::store::kv::KvStore;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
 
     use super::*;
 
@@ -152,12 +155,6 @@ mod tests {
         }
     }
 
-    fn db(dir: &TempDir) -> Arc<Mutex<Connection>> {
-        Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-        ))
-    }
-
     fn input() -> ProposeInput {
         ProposeInput {
             connector: "fortnox".into(),
@@ -170,20 +167,18 @@ mod tests {
     }
 
     /// Simulate the crash: approve, claim, and never write an outcome.
-    fn strand(actions: &ActionStore) -> i64 {
-        let action = actions.propose(input()).unwrap();
-        actions.approve(action.id).unwrap();
-        assert!(actions.claim_for_execution(action.id).unwrap());
+    async fn strand(actions: &ActionStore) -> i64 {
+        let action = actions.propose(input()).await.unwrap();
+        actions.approve(action.id).await.unwrap();
+        assert!(actions.claim_for_execution(action.id).await.unwrap());
         action.id
     }
 
-    #[tokio::test]
-    async fn a_stranded_action_is_resolved_visibly_and_not_re_run() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
-        let id = strand(&actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_stranded_action_is_resolved_visibly_and_not_re_run(pool: sqlx::PgPool) {
+        let actions = ActionStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
+        let id = strand(&actions).await;
 
         let pusher: Arc<dyn Pusher> = Arc::new(SpyPusher::default());
         let resolved = sweep_stranded(&actions, &log, Some(&pusher)).await.unwrap();
@@ -191,7 +186,7 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, id);
 
-        let row = actions.get(id).unwrap().unwrap();
+        let row = actions.get(id).await.unwrap().unwrap();
         assert_eq!(row.status, ActionStatus::Failed);
         let reason = row.reason.unwrap();
         assert!(reason.contains("daemon stopped"), "{reason}");
@@ -201,19 +196,17 @@ mod tests {
             "nothing was called, so there is no result to record"
         );
 
-        let digest = log.digest().unwrap();
+        let digest = log.digest().await.unwrap();
         assert_eq!(digest.len(), 1);
-        assert!(digest[0].contains("#1"), "{:?}", digest[0]);
+        assert!(digest[0].contains(&format!("#{id}")), "{:?}", digest[0]);
         assert!(digest[0].contains("not retried"), "{:?}", digest[0]);
     }
 
-    #[tokio::test]
-    async fn the_owner_is_told_on_their_phone() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
-        strand(&actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owner_is_told_on_their_phone(pool: sqlx::PgPool) {
+        let actions = ActionStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
+        strand(&actions).await;
 
         let spy = Arc::new(SpyPusher::default());
         let pusher: Arc<dyn Pusher> = Arc::clone(&spy) as Arc<dyn Pusher>;
@@ -225,20 +218,18 @@ mod tests {
         assert!(sent[0].contains("none was retried"), "{}", sent[0]);
     }
 
-    #[tokio::test]
-    async fn a_clean_start_resolves_nothing_and_says_nothing() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_clean_start_resolves_nothing_and_says_nothing(pool: sqlx::PgPool) {
+        let actions = ActionStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
 
         // A proposal waiting for a human, and an action already executed:
         // neither is stranded.
-        let waiting = actions.propose(input()).unwrap();
-        let done = actions.propose(input()).unwrap();
-        actions.approve(done.id).unwrap();
-        actions.claim_for_execution(done.id).unwrap();
-        actions.mark_executed(done.id, "ok").unwrap();
+        let waiting = actions.propose(input()).await.unwrap();
+        let done = actions.propose(input()).await.unwrap();
+        actions.approve(done.id).await.unwrap();
+        actions.claim_for_execution(done.id).await.unwrap();
+        actions.mark_executed(done.id, "ok").await.unwrap();
 
         let spy = Arc::new(SpyPusher::default());
         let pusher: Arc<dyn Pusher> = Arc::clone(&spy) as Arc<dyn Pusher>;
@@ -248,50 +239,46 @@ mod tests {
             .is_empty());
 
         assert!(spy.sent.lock().unwrap().is_empty());
-        assert!(log.digest().unwrap().is_empty());
+        assert!(log.digest().await.unwrap().is_empty());
         assert_eq!(
-            actions.get(waiting.id).unwrap().unwrap().status,
+            actions.get(waiting.id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "a proposal waiting for a human must be left alone"
         );
         assert_eq!(
-            actions.get(done.id).unwrap().unwrap().status,
+            actions.get(done.id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
     }
 
-    #[tokio::test]
-    async fn the_sweep_works_without_a_notifier() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
-        let id = strand(&actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_sweep_works_without_a_notifier(pool: sqlx::PgPool) {
+        let actions = ActionStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
+        let id = strand(&actions).await;
 
         let resolved = sweep_stranded(&actions, &log, None).await.unwrap();
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(
-            actions.get(id).unwrap().unwrap().status,
+            actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Failed
         );
     }
 
     /// The second start must find nothing: the sweep is not a recurring
     /// announcement of the same crash.
-    #[tokio::test]
-    async fn sweeping_twice_resolves_nothing_the_second_time() {
-        let dir = TempDir::new().unwrap();
-        let conn = db(&dir);
-        let actions = ActionStore::new(Arc::clone(&conn));
-        let log = NotificationLog::new(KvStore::new(Arc::clone(&conn)));
-        strand(&actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn sweeping_twice_resolves_nothing_the_second_time(pool: sqlx::PgPool) {
+        let actions = ActionStore::new(pool.clone());
+        let log = NotificationLog::new(KvStore::new(pool.clone()));
+        strand(&actions).await;
 
         assert_eq!(sweep_stranded(&actions, &log, None).await.unwrap().len(), 1);
         assert!(sweep_stranded(&actions, &log, None)
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(log.digest().unwrap().len(), 1);
+        assert_eq!(log.digest().await.unwrap().len(), 1);
     }
 }

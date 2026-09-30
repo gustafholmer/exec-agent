@@ -28,8 +28,8 @@ chrono-tz.workspace = true
 cron.workspace = true
 reqwest.workspace = true
 futures.workspace = true
+sqlx.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rusqlite.workspace = true
 wiremock.workspace = true

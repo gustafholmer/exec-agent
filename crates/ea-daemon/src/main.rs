@@ -22,7 +22,7 @@
 //! through writing events, an approved action mid-call. Only then does it
 //! close the socket and take the connector children down.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -44,7 +44,7 @@ use ea_daemon::daemon::{self, Daemon, Deps, SHUTDOWN_DRAIN};
 use ea_daemon::executor::Executor;
 use ea_daemon::ipc;
 use ea_daemon::jobs::{self, Pusher, TriageDeps};
-use ea_daemon::lock::InstanceLock;
+use ea_daemon::lock::{DatabaseLock, InstanceLock};
 use ea_daemon::notify::log::NotificationLog;
 use ea_daemon::notify::policy::NotificationPolicy;
 use ea_daemon::notify::telegram::{Notifier, TelegramConfig, TelegramTransport, TOKEN_FILE};
@@ -100,15 +100,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(connectors = ?connector_names, "loaded connectors and their policies");
 
     // --- state -------------------------------------------------------------
-    let db_path = ea_core::paths::database_path();
-    let conn = Arc::new(Mutex::new(ea_core::db::open(&db_path).with_context(
-        || format!("opening the state database at {}", db_path.display()),
-    )?));
+    let database_url = config.database.resolve()?;
+    let pool = ea_core::db::connect_with_retry(&database_url, std::time::Duration::from_secs(60))
+        .await
+        .context("the state database is not reachable")?;
+    // The file lock above guards the state directory; this guards the
+    // database, which another state directory (or another machine) can also
+    // point at. Taken before anything reads or writes state — above all
+    // before the stranded-action sweep, which would otherwise fail a live
+    // daemon's in-flight actions. Held for the whole of `main`. See `lock`.
+    let _database_lock = DatabaseLock::acquire(&pool).await?;
 
     let registry = Arc::new(Registry::new(manifests.clone()));
     let executor = Arc::new(Executor::new(
-        ActionStore::new(Arc::clone(&conn)),
-        RunStore::new(Arc::clone(&conn)),
+        ActionStore::new(pool.clone()),
+        RunStore::new(pool.clone()),
         policy.clone(),
         Arc::clone(&registry),
     ));
@@ -119,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     // approvals and the whole gate still work, and only the thinking stops.
     // Saying so loudly beats refusing to start.
     let sessions: Option<Arc<dyn SessionBoundary>> = match SessionRunner::discover(
-        RunStore::new(Arc::clone(&conn)),
+        RunStore::new(pool.clone()),
         state_dir.join(SESSION_DIR),
         manifests.clone(),
     ) {
@@ -144,13 +150,13 @@ async fn main() -> anyhow::Result<()> {
     // not refund the day's spend, and bounded by the owner's midnight rather
     // than UTC's. See `ea_daemon::budget`.
     let budget = Budget::new(
-        RunStore::new(Arc::clone(&conn)),
+        RunStore::new(pool.clone()),
         config.daily_session_budget,
         config.notify.time_zone,
     );
     let chat = Arc::new(ChatService::new(
-        ConversationStore::new(Arc::clone(&conn)),
-        FactStore::new(Arc::clone(&conn)),
+        ConversationStore::new(pool.clone()),
+        FactStore::new(pool.clone()),
         sessions.clone(),
         budget.clone(),
         config.chat_model.clone(),
@@ -165,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         let notifier = Arc::new(
             Notifier::new(
                 TelegramTransport::from_config(&credentials)?,
-                ActionStore::new(Arc::clone(&conn)),
+                ActionStore::new(pool.clone()),
                 Arc::clone(&executor),
                 credentials.owner_id,
             )
@@ -181,8 +187,8 @@ async fn main() -> anyhow::Result<()> {
             poller,
             Arc::clone(&notifier),
             credentials.chat_id,
-            OffsetStore::new(KvStore::new(Arc::clone(&conn))),
-            HandledUpdates::new(KvStore::new(Arc::clone(&conn))),
+            OffsetStore::new(KvStore::new(pool.clone())),
+            HandledUpdates::new(KvStore::new(pool.clone())),
         ));
         pusher = Some(notifier as Arc<dyn Pusher>);
         tracing::info!(owner = %credentials.owner_id, "telegram configured");
@@ -199,8 +205,8 @@ async fn main() -> anyhow::Result<()> {
     // resolved as failed-with-unknown-outcome and never retried. See
     // `recovery`.
     ea_daemon::recovery::sweep_stranded(
-        &ActionStore::new(Arc::clone(&conn)),
-        &NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        &ActionStore::new(pool.clone()),
+        &NotificationLog::new(KvStore::new(pool.clone())),
         pusher.as_ref(),
     )
     .await?;
@@ -221,18 +227,18 @@ async fn main() -> anyhow::Result<()> {
             manifest.name.clone(),
             manifest.watch_interval,
             Arc::clone(&registry),
-            EventStore::new(Arc::clone(&conn)),
+            EventStore::new(pool.clone()),
             policy.clone(),
         ));
     }
     scheduler.add(jobs::triage_job(
         config.triage_interval,
         Arc::new(TriageDeps {
-            events: EventStore::new(Arc::clone(&conn)),
-            actions: ActionStore::new(Arc::clone(&conn)),
+            events: EventStore::new(pool.clone()),
+            actions: ActionStore::new(pool.clone()),
             sessions: sessions.clone(),
             pusher: pusher.clone(),
-            log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+            log: NotificationLog::new(KvStore::new(pool.clone())),
             notify: NotificationPolicy::new(config.notify.clone()),
             rules: config.tier0.clone(),
             budget: budget.clone(),
@@ -242,11 +248,11 @@ async fn main() -> anyhow::Result<()> {
     // than on an interval. Registered in the `schedules` table first, which
     // anchors a fresh install to *now* so that installing at 15:00 does not
     // immediately fire all three; see `ea_core::store::schedules`.
-    let schedule_store = ScheduleStore::new(Arc::clone(&conn));
-    schedules::register_built_ins(&schedule_store, chrono::Utc::now())?;
+    let schedule_store = ScheduleStore::new(pool.clone());
+    schedules::register_built_ins(&schedule_store, chrono::Utc::now()).await?;
     let briefings = Arc::new(BriefingDeps {
-        events: EventStore::new(Arc::clone(&conn)),
-        log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
+        events: EventStore::new(pool.clone()),
+        log: NotificationLog::new(KvStore::new(pool.clone())),
         sessions: sessions.clone(),
         pusher: pusher.clone(),
         caller: Arc::clone(&registry),
@@ -269,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
     scheduler.add(retention_job(
         config.retention.interval,
         Arc::new(RetentionDeps {
-            store: RetentionStore::new(Arc::clone(&conn)),
+            store: RetentionStore::new(pool.clone()),
             policy: config.retention.policy,
             // Where the plist points StandardOutPath and StandardErrorPath.
             log_dir: state_dir.clone(),
@@ -281,16 +287,16 @@ async fn main() -> anyhow::Result<()> {
     // --- the socket --------------------------------------------------------
     let daemon = Daemon::build(Deps {
         executor,
-        actions: ActionStore::new(Arc::clone(&conn)),
-        events: EventStore::new(Arc::clone(&conn)),
-        runs: RunStore::new(Arc::clone(&conn)),
+        actions: ActionStore::new(pool.clone()),
+        events: EventStore::new(pool.clone()),
+        runs: RunStore::new(pool.clone()),
         scheduler: Arc::clone(&scheduler),
         schedules: schedule_store,
         time_zone: config.notify.time_zone,
         chat,
         pusher,
-        notify_log: NotificationLog::new(KvStore::new(Arc::clone(&conn))),
-        kv: KvStore::new(Arc::clone(&conn)),
+        notify_log: NotificationLog::new(KvStore::new(pool.clone())),
+        kv: KvStore::new(pool.clone()),
         connectors: connector_names,
     });
 
@@ -307,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
     // paused for. Applied before `start`, so no tick can slip through in
     // between. The write side lives in `Daemon::pause`/`resume`, never in
     // `Scheduler::pause` -- the shutdown drain below calls that one.
-    let pause = daemon::restore_pause(&KvStore::new(Arc::clone(&conn)), &scheduler);
+    let pause = daemon::restore_pause(&KvStore::new(pool.clone()), &scheduler).await;
     if pause.paused {
         tracing::warn!(
             since = ?pause.since,

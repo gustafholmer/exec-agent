@@ -83,10 +83,11 @@ pub struct RetentionSummary {
 /// or a file somebody has moved is a nuisance; letting it count as a job
 /// failure would eventually trip the breaker and stop the pruning too, which
 /// is the more important half.
-pub fn run_retention(deps: &RetentionDeps) -> anyhow::Result<RetentionSummary> {
+pub async fn run_retention(deps: &RetentionDeps) -> anyhow::Result<RetentionSummary> {
     let pruned = deps
         .store
         .prune(&deps.policy, Utc::now())
+        .await
         .context("pruning old rows")?;
     if pruned.total() > 0 {
         tracing::info!(?pruned, "retention: pruned old rows");
@@ -160,11 +161,7 @@ pub fn retention_job(interval: Duration, deps: Arc<RetentionDeps>) -> Job {
     Job::new(RETENTION_JOB, interval, move || {
         let deps = Arc::clone(&deps);
         async move {
-            // Synchronous, like every other database access in this daemon:
-            // one `Arc<Mutex<Connection>>` shared by everything, and a prune
-            // of a few hundred rows is far shorter than the connector calls
-            // that already hold it.
-            let summary = run_retention(&deps)?;
+            let summary = run_retention(&deps).await?;
             tracing::debug!(?summary, "retention pass");
             Ok(())
         }
@@ -173,24 +170,17 @@ pub fn retention_job(interval: Duration, deps: Arc<RetentionDeps>) -> Job {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::*;
 
-    fn deps(dir: &TempDir, max_bytes: u64) -> (Arc<Mutex<Connection>>, RetentionDeps) {
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-        ));
-        let deps = RetentionDeps {
-            store: RetentionStore::new(Arc::clone(&conn)),
+    fn deps(pool: sqlx::PgPool, dir: &TempDir, max_bytes: u64) -> RetentionDeps {
+        RetentionDeps {
+            store: RetentionStore::new(pool),
             policy: RetentionPolicy::default(),
             log_dir: dir.path().to_path_buf(),
             log_max_bytes: max_bytes,
-        };
-        (conn, deps)
+        }
     }
 
     fn write_log(dir: &TempDir, name: &str, bytes: usize) -> PathBuf {
@@ -289,22 +279,22 @@ mod tests {
         assert!(!rotate_if_large(&dir.path().join("nothing.log"), 1).unwrap());
     }
 
-    #[test]
-    fn a_pass_prunes_and_rotates_together() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_pass_prunes_and_rotates_together(pool: sqlx::PgPool) {
         let dir = TempDir::new().unwrap();
-        let (conn, deps) = deps(&dir, 1024);
-        conn.lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO runs (kind, prompt, outcome, started_at, finished_at)
-                 VALUES ('chat','p','ok',?1,?1)",
-                rusqlite::params![(Utc::now() - chrono::Duration::days(400)).to_rfc3339()],
-            )
-            .unwrap();
+        let deps = deps(pool.clone(), &dir, 1024);
+        sqlx::query(
+            "INSERT INTO runs (kind, prompt, outcome, started_at, finished_at)
+             VALUES ('chat','p','ok',$1,$1)",
+        )
+        .bind(Utc::now() - chrono::Duration::days(400))
+        .execute(&pool)
+        .await
+        .unwrap();
         write_log(&dir, "daemon.err.log", 4096);
         write_log(&dir, "daemon.out.log", 10);
 
-        let summary = run_retention(&deps).unwrap();
+        let summary = run_retention(&deps).await.unwrap();
 
         assert_eq!(summary.pruned.runs, 1);
         assert_eq!(summary.rotated.len(), 1, "only the oversized one");
@@ -314,16 +304,18 @@ mod tests {
     /// The prune is the half that matters; a log directory the daemon cannot
     /// write to must not take it down, or the breaker would eventually stop
     /// the pruning as well.
-    #[test]
-    fn a_log_that_cannot_be_rotated_does_not_fail_the_pass() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_log_that_cannot_be_rotated_does_not_fail_the_pass(pool: sqlx::PgPool) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
-        let (_conn, deps) = deps(&dir, 1024);
+        let deps = deps(pool, &dir, 1024);
         let path = write_log(&dir, "daemon.err.log", 4096);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let summary = run_retention(&deps).expect("a rotation failure must not fail the pass");
+        let summary = run_retention(&deps)
+            .await
+            .expect("a rotation failure must not fail the pass");
         assert!(summary.rotated.is_empty());
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();

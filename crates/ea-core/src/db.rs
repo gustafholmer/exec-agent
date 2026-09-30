@@ -1,323 +1,166 @@
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+//! The state database.
+//!
+//! `connect` opens the Postgres pool every store module targets, and applies
+//! the migrations in `crates/ea-core/migrations/` before handing it back.
+
+use std::time::Duration;
 
 use anyhow::Context;
-use rusqlite::Connection;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::PgPool;
 
-const SCHEMA: &str = include_str!("schema.sql");
+/// The schema, embedded at compile time so the daemon carries its own
+/// migrations and nothing extra installs on the target machine.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// Opens (creating if needed) the state database with WAL and a busy timeout,
-/// applying the schema idempotently.
-pub fn open(path: &Path) -> anyhow::Result<Connection> {
-    open_with_busy_timeout(path, 5000)
+/// Connect, run any pending migrations, and hand back the pool.
+///
+/// Eight connections is ample: the daemon's real concurrency is a handful of
+/// tasks, and a personal assistant polls rather than serves.
+pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
+    let pool = open_pool(parse_url(url)?).await?;
+    migrate(&pool).await?;
+    Ok(pool)
 }
 
-/// Same as [`open`], but with an explicit `busy_timeout` in milliseconds.
-///
-/// Production always goes through [`open`] with the 5-second default; this
-/// exists so tests can set the timeout to 0 and have a blocked read surface
-/// immediately as `SQLITE_BUSY` instead of being silently absorbed.
-pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u32) -> anyhow::Result<Connection> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening the database at {}", path.display()))?;
-
-    // WAL lets the CLI read while the daemon writes; the busy timeout absorbs
-    // the brief exclusive locks a checkpoint still takes.
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", busy_timeout_ms)?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.execute_batch(SCHEMA)
-        .context("applying the database schema")?;
-    migrate(&conn).context("migrating the database schema")?;
-    restrict(path);
-    Ok(conn)
+/// The URL as connect options. The error deliberately does not repeat the
+/// URL, which can carry a password.
+fn parse_url(url: &str) -> anyhow::Result<PgConnectOptions> {
+    url.parse().context("parsing the state database URL")
 }
 
-/// Tighten the database and its two WAL sidecars to `0600`.
-///
-/// SQLite creates all three at the ambient umask — `0644` on this machine —
-/// and this file is the approval queue, the action ledger and every event the
-/// connectors have fetched: the owner's mail subjects, calendar entries and
-/// coursework. The `0700` state directory already keeps other users out, but
-/// that is one mistake away from being the only thing that does (a directory
-/// copied with `cp -R`, a backup tool that flattens modes, a state dir
-/// relocated somewhere looser via `$EA_STATE_DIR`). Defence in depth, on the
-/// files themselves.
-///
-/// Re-applied on every open rather than once at creation: `-wal` and `-shm`
-/// are deleted on a clean close and recreated — at the ambient umask again —
-/// by whichever process next opens the database.
-///
-/// Best effort. A database that opened fine must not fail to be usable because
-/// its mode could not be changed (a read-only mount, a file owned by another
-/// user); the failure is logged and the daemon runs.
-fn restrict(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.as_os_str().to_os_string();
-        file.push(suffix);
-        let file = std::path::PathBuf::from(file);
-        if !file.exists() {
-            continue;
-        }
-        if let Err(err) = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(
-                path = %file.display(),
-                error = %err,
-                "could not restrict the database file to owner-only"
-            );
-        }
-    }
+/// Open the pool, without migrating: the step that can fail because the
+/// server is not up yet.
+async fn open_pool(options: PgConnectOptions) -> anyhow::Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await
+        .context("connecting to the state database")
 }
 
-/// Columns added to a table that already exists in somebody's database.
-///
-/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already there,
-/// so a column added to `schema.sql` reaches a fresh database and no other. A
-/// daemon that has been running for weeks is exactly the case that matters, so
-/// every added column is also listed here. `ALTER TABLE ... ADD COLUMN` is the
-/// one schema change SQLite does cheaply and in place, and `pragma_table_info`
-/// says whether it is needed, so this is idempotent without a version table.
-///
-/// The table and column names come from this constant and never from data, so
-/// the `format!` below is not a string-built query in the dangerous sense.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
-    ("events", "triage_attempts", "INTEGER NOT NULL DEFAULT 0"),
-    ("events", "triage_error", "TEXT"),
-    ("facts", "updated_at", "TEXT"),
-];
+async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .context("applying database migrations")
+}
 
-/// Indexes over columns from [`ADDED_COLUMNS`]. They cannot live in
-/// `schema.sql`, which is applied *before* the migration and would fail on a
-/// database that does not have the columns yet.
-const LATE_INDEXES: &[&str] = &["CREATE INDEX IF NOT EXISTS events_untriaged
-       ON events (triaged_at, triage_attempts, id)"];
+/// [`connect`], with the *connection* retried with backoff for up to `budget`.
+///
+/// `launchd` starts the daemon at boot and will sometimes start it before
+/// Postgres is accepting connections. A daemon that cannot reach its store is
+/// dead rather than degraded, so this gives up cleanly and lets `launchd`'s
+/// existing restart policy handle it, instead of hanging forever.
+///
+/// Only connecting is retried. A migration that fails against a reachable
+/// server — a checksum mismatch, a failing statement — will fail the same way
+/// every time, so it is fatal at once rather than spending the whole budget
+/// under a log line that blames reachability.
+pub async fn connect_with_retry(url: &str, budget: Duration) -> anyhow::Result<PgPool> {
+    connect_options_with_retry(parse_url(url)?, budget).await
+}
 
-fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    for (table, column, decl) in ADDED_COLUMNS {
-        let existing: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-            rusqlite::params![table, column],
-            |row| row.get(0),
-        )?;
-        if existing == 0 {
-            tracing::info!(table, column, "adding a column to an existing database");
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+/// [`connect_with_retry`] for connect options already in hand.
+pub async fn connect_options_with_retry(
+    options: PgConnectOptions,
+    budget: Duration,
+) -> anyhow::Result<PgPool> {
+    let pool = open_pool_with_retry(options, budget).await?;
+    migrate(&pool).await?;
+    Ok(pool)
+}
+
+async fn open_pool_with_retry(options: PgConnectOptions, budget: Duration) -> anyhow::Result<PgPool> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut wait = Duration::from_millis(250);
+    loop {
+        match open_pool(options.clone()).await {
+            Ok(pool) => return Ok(pool),
+            Err(err) if std::time::Instant::now() + wait < deadline => {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    retry_in_ms = wait.as_millis() as u64,
+                    "the state database is not reachable yet"
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(5));
+            }
+            Err(err) => return Err(err),
         }
     }
-    for statement in LATE_INDEXES {
-        conn.execute_batch(statement)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn temp_db() -> (TempDir, Connection) {
-        let dir = TempDir::new().unwrap();
-        let conn = open(&dir.path().join("state.db")).unwrap();
-        (dir, conn)
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn connect_returns_a_usable_pool(pool: sqlx::PgPool) {
+        // Cast to bigint: an untyped integer literal comes back as Postgres's
+        // `int4`, which does not decode into `i64`.
+        let one: i64 = sqlx::query_scalar("SELECT 1::bigint")
+            .fetch_one(&pool)
+            .await
+            .expect("a connected pool must answer a trivial query");
+        assert_eq!(one, 1);
     }
 
-    #[test]
-    fn creates_every_table() {
-        let (_dir, conn) = temp_db();
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-            .unwrap();
-        let names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn creates_every_table(pool: sqlx::PgPool) {
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         for table in [
-            "events",
-            "actions",
-            "conversations",
-            "messages",
-            "facts",
-            "runs",
-            "schedules",
-            "kv",
+            "events", "actions", "conversations", "messages",
+            "facts", "runs", "schedules", "kv",
         ] {
             assert!(names.contains(&table.to_string()), "missing {table}");
         }
     }
 
-    /// The case the migration exists for: a database created before a column
-    /// was added to `schema.sql`. `CREATE TABLE IF NOT EXISTS` would leave it
-    /// without the column and every query naming it would fail.
-    #[test]
-    fn a_database_predating_a_column_gains_it_on_open() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        {
-            // The events table as it was before triage attempts existed.
-            let old = Connection::open(&path).unwrap();
-            old.execute_batch(
-                "CREATE TABLE events (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   source TEXT NOT NULL, external_id TEXT NOT NULL,
-                   kind TEXT NOT NULL, payload TEXT NOT NULL,
-                   salience INTEGER, triaged_at TEXT, created_at TEXT NOT NULL,
-                   UNIQUE (source, external_id))",
-            )
+    /// A migration failure against a reachable server is fatal at once: it
+    /// would fail identically on every retry. Simulated with a checksum
+    /// mismatch on the applied migration.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_migration_failure_is_not_retried(pool: sqlx::PgPool) {
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00'::bytea")
+            .execute(&pool)
+            .await
             .unwrap();
-            old.execute_batch(
-                "INSERT INTO events (source, external_id, kind, payload, created_at)
-                 VALUES ('canvas','e1','assignment','{}','2026-09-01T00:00:00Z')",
-            )
-            .unwrap();
-        }
+        let options = (*pool.connect_options()).clone();
 
-        let conn = open(&path).expect("opening an older database must migrate it");
-        let attempts: i64 = conn
-            .query_row("SELECT triage_attempts FROM events WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .expect("the added column must exist and default for existing rows");
-        assert_eq!(attempts, 0);
-        let error: Option<String> = conn
-            .query_row("SELECT triage_error FROM events WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(error, None);
+        let started = std::time::Instant::now();
+        let err = super::connect_options_with_retry(options, std::time::Duration::from_secs(30))
+            .await
+            .expect_err("a checksum mismatch must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a migration failure must not be retried for the whole budget (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("applying database migrations"),
+            "{err:#}"
+        );
     }
 
-    /// `facts` predates `updated_at`: every daemon that has been running since
-    /// Phase 1 has the table without the column, and `remember` writes it.
-    #[test]
-    fn a_facts_table_predating_updated_at_gains_the_column() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        {
-            let old = Connection::open(&path).unwrap();
-            old.execute_batch(
-                "CREATE TABLE facts (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   topic TEXT NOT NULL, body TEXT NOT NULL,
-                   created_at TEXT NOT NULL)",
-            )
-            .unwrap();
-        }
-
-        let conn = open(&path).expect("opening an older database must migrate it");
-        conn.execute_batch(
-            "INSERT INTO facts (topic, body, created_at)
-             VALUES ('tenta','on the 14th','2026-09-01T00:00:00Z')",
+    /// Review Focus #4 belongs to Task 10, but the constraint itself is created
+    /// here, so its shape is pinned here too.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn the_status_check_rejects_an_unknown_status(pool: sqlx::PgPool) {
+        let err = sqlx::query(
+            "INSERT INTO actions (connector, tool, args, preview, rationale, status, expires_at)
+             VALUES ('x','y','{}','p','r','nonsense', now())",
         )
-        .unwrap();
-        let updated: Option<String> = conn
-            .query_row("SELECT updated_at FROM facts WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .expect("the added column must exist");
-        assert_eq!(updated, None);
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        drop(open(&path).unwrap());
-        open(&path).expect("reopening an existing database must succeed");
-    }
-
-    /// The database is the approval queue and the whole event history. The
-    /// state directory being `0700` is not a reason for the files inside it to
-    /// be world-readable.
-    #[test]
-    fn the_database_and_its_wal_sidecars_are_owner_only() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        let conn = open(&path).unwrap();
-        // Force the WAL sidecars into existence with a real write.
-        conn.execute_batch(
-            "INSERT INTO events (source, external_id, kind, payload, created_at)
-             VALUES ('canvas','e1','assignment','{}','2026-09-23T00:00:00Z')",
-        )
-        .unwrap();
-
-        for suffix in ["", "-wal", "-shm"] {
-            let file = dir.path().join(format!("state.db{suffix}"));
-            assert!(file.exists(), "{} should exist", file.display());
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{} must be owner-only", file.display());
-        }
-    }
-
-    /// The sidecars are recreated at the ambient umask by whoever opens the
-    /// database next, so the tightening has to happen on every open.
-    #[test]
-    fn a_reopened_database_is_tightened_again() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        drop(open(&path).unwrap());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let _conn = open(&path).unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[test]
-    fn enables_wal() {
-        let (_dir, conn) = temp_db();
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal");
-    }
-
-    // Review Focus #4: a concurrent reader must not hit SQLITE_BUSY.
-    //
-    // This has to actually exercise WAL's core guarantee (readers don't block
-    // on a writer's uncommitted transaction), not just SQLite's normal lock
-    // semantics. A single small INSERT never forces dirty pages out of the
-    // writer's private page cache before COMMIT, so a reader can succeed
-    // there under any journal mode -- that isn't evidence of anything. To
-    // force the writer to actually touch the WAL file before commit, insert
-    // enough rows (30k, well past the default ~500-page cache limit measured
-    // empirically for this schema at the default 4096-byte page size)
-    // inside one BEGIN IMMEDIATE transaction to spill its page cache. And to
-    // make sure a block would be visible rather than
-    // silently absorbed, the reader's busy_timeout is set to 0 so any
-    // blocking surfaces immediately as SQLITE_BUSY instead of being retried
-    // for up to the production 5-second default.
-    //
-    // Verified manually: patching `journal_mode` to `DELETE` in `open`
-    // (temporarily, for this check only) makes this test fail with
-    // `SQLITE_BUSY` on the reader's query, and restoring WAL makes it pass
-    // again. See the fix report for the exact command output.
-    #[test]
-    fn concurrent_reader_is_not_blocked_by_an_open_write() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        let writer = open(&path).unwrap();
-        let reader = open_with_busy_timeout(&path, 0).unwrap();
-
-        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        {
-            let mut stmt = writer
-                .prepare(
-                    "INSERT INTO events (source, external_id, kind, payload, created_at)
-                     VALUES ('canvas', ?1, 'assignment', '{}', '2026-09-23T00:00:00Z')",
-                )
-                .unwrap();
-            for i in 0..30_000 {
-                stmt.execute([format!("e{i}")]).unwrap();
-            }
-        }
-
-        let count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-            .expect("read during an open write transaction must succeed");
-        assert_eq!(count, 0, "the uncommitted rows must not be visible");
-
-        writer.execute_batch("COMMIT").unwrap();
+        .execute(&pool)
+        .await
+        .expect_err("an unknown status must be refused by the database");
+        assert!(
+            format!("{err}").contains("actions_status_check"),
+            "expected the CHECK constraint to be named in the error, got: {err}"
+        );
     }
 }

@@ -1,10 +1,11 @@
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, Row};
 use serde::Serialize;
+
+use super::timestamp::{serialize_rfc3339, serialize_rfc3339_opt};
+use sqlx::{postgres::PgRow, types::Json, PgPool, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,10 +57,18 @@ pub struct Action {
     pub status: ActionStatus,
     pub reason: Option<String>,
     pub result: Option<String>,
-    pub created_at: String,
-    pub expires_at: String,
-    pub decided_at: Option<String>,
-    pub executed_at: Option<String>,
+    // Serialized explicitly as RFC 3339 (rather than left to chrono's default
+    // `Serialize`, which renders a UTC offset as `Z`) so that the daemon's IPC
+    // responses, `ea pending`, and the `propose` tool keep the exact timestamp
+    // format `to_rfc3339()` produces.
+    #[serde(serialize_with = "serialize_rfc3339")]
+    pub created_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_rfc3339")]
+    pub expires_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_rfc3339_opt")]
+    pub decided_at: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "serialize_rfc3339_opt")]
+    pub executed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,26 +83,32 @@ pub struct ProposeInput {
 
 #[derive(Clone)]
 pub struct ActionStore {
-    conn: Arc<Mutex<Connection>>,
+    pool: PgPool,
 }
 
-fn hydrate(row: &Row<'_>) -> rusqlite::Result<Action> {
-    let args: String = row.get("args")?;
-    let status: String = row.get("status")?;
+/// Builds an [`Action`] from a `SELECT *` / `RETURNING *` row, reading every
+/// column by name so the table's column order never matters.
+///
+/// An unrecognised `status` hydrates as `Failed`, as it always has: the CHECK
+/// constraint makes that unreachable, and a row the code cannot classify must
+/// never look like something still waiting to run.
+fn hydrate(row: &PgRow) -> anyhow::Result<Action> {
+    let args: Json<serde_json::Value> = row.try_get("args")?;
+    let status: String = row.try_get("status")?;
     Ok(Action {
-        id: row.get("id")?,
-        connector: row.get("connector")?,
-        tool: row.get("tool")?,
-        args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
-        preview: row.get("preview")?,
-        rationale: row.get("rationale")?,
+        id: row.try_get("id")?,
+        connector: row.try_get("connector")?,
+        tool: row.try_get("tool")?,
+        args: args.0,
+        preview: row.try_get("preview")?,
+        rationale: row.try_get("rationale")?,
         status: status.parse().unwrap_or(ActionStatus::Failed),
-        reason: row.get("reason")?,
-        result: row.get("result")?,
-        created_at: row.get("created_at")?,
-        expires_at: row.get("expires_at")?,
-        decided_at: row.get("decided_at")?,
-        executed_at: row.get("executed_at")?,
+        reason: row.try_get("reason")?,
+        result: row.try_get("result")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        decided_at: row.try_get("decided_at")?,
+        executed_at: row.try_get("executed_at")?,
     })
 }
 
@@ -108,70 +123,72 @@ enum Stamp {
 }
 
 impl ActionStore {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
-    pub fn propose(&self, input: ProposeInput) -> anyhow::Result<Action> {
+    pub async fn propose(&self, input: ProposeInput) -> anyhow::Result<Action> {
         let now = Utc::now();
         // `DateTime + Duration` panics on overflow. The daemon validates
         // `ttl_secs` against a sane bound before it ever reaches here, but
         // this is the store's own defense: a checked add so a future or
         // different caller gets an error instead of taking the whole
-        // connection down.
+        // daemon down.
         let expires = now
             .checked_add_signed(input.ttl)
             .ok_or_else(|| anyhow!("propose: ttl overflows when added to the current time"))?;
-        let id = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO actions
-                   (connector, tool, args, preview, rationale, status, created_at, expires_at)
-                 VALUES (?1,?2,?3,?4,?5,'proposed',?6,?7)",
-                params![
-                    input.connector,
-                    input.tool,
-                    serde_json::to_string(&input.args)?,
-                    input.preview,
-                    input.rationale,
-                    now.to_rfc3339(),
-                    expires.to_rfc3339(),
-                ],
-            )?;
-            conn.last_insert_rowid()
-        };
-        self.get(id)?
-            .ok_or_else(|| anyhow!("action {id} vanished after insert"))
+        // `created_at` is bound rather than left to the column default so that
+        // `expires_at - created_at` is exactly the requested ttl.
+        let row = sqlx::query(
+            "INSERT INTO actions
+               (connector, tool, args, preview, rationale, status, created_at, expires_at)
+             VALUES ($1,$2,$3,$4,$5,'proposed',$6,$7)
+             RETURNING *",
+        )
+        .bind(&input.connector)
+        .bind(&input.tool)
+        .bind(Json(&input.args))
+        .bind(&input.preview)
+        .bind(&input.rationale)
+        .bind(now)
+        .bind(expires)
+        .fetch_one(&self.pool)
+        .await
+        .context("proposing an action")?;
+        hydrate(&row)
     }
 
-    pub fn get(&self, id: i64) -> anyhow::Result<Option<Action>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM actions WHERE id = ?1")?;
-        let mut rows = stmt.query_map(params![id], hydrate)?;
-        Ok(match rows.next() {
-            Some(row) => Some(row?),
-            None => None,
-        })
+    pub async fn get(&self, id: i64) -> anyhow::Result<Option<Action>> {
+        let row = sqlx::query("SELECT * FROM actions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("reading an action")?;
+        row.as_ref().map(hydrate).transpose()
     }
 
-    pub fn pending(&self) -> anyhow::Result<Vec<Action>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT * FROM actions WHERE status = 'proposed' ORDER BY id")?;
-        let rows = stmt.query_map([], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    pub async fn pending(&self) -> anyhow::Result<Vec<Action>> {
+        let rows = sqlx::query("SELECT * FROM actions WHERE status = 'proposed' ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .context("listing pending actions")?;
+        rows.iter().map(hydrate).collect()
     }
 
-    /// One conditional UPDATE, so two concurrent callers cannot both succeed.
-    /// This is what makes a double-tapped Telegram button safe.
+    /// One conditional `UPDATE ... RETURNING`, so two concurrent callers
+    /// cannot both succeed, and the winner gets the updated row back from the
+    /// same statement rather than a second read that could observe a later
+    /// write. This is what makes a double-tapped Telegram button safe.
     ///
-    /// The statement always references all six placeholders (`?1`..`?6`) and
-    /// `params![]` always supplies six values, so the parameter count rusqlite
-    /// validates against the prepared statement never drifts. `reason` and
-    /// `result` are optional per-transition: when a caller doesn't supply one,
-    /// `COALESCE(?N, column)` preserves whatever the column already held
-    /// instead of the `SET` clause being conditionally omitted.
-    fn transition(
+    /// `reason` and `result` are optional per-transition: when a caller
+    /// doesn't supply one, `COALESCE($N, column)` preserves whatever the
+    /// column already held instead of the `SET` clause being conditionally
+    /// omitted, so the statement text is fixed per [`Stamp`] and every
+    /// placeholder is always bound.
+    ///
+    /// Only when no row matched does this read the row back, purely to say
+    /// *why* in the error; that read decides nothing.
+    async fn transition(
         &self,
         id: i64,
         from: ActionStatus,
@@ -180,34 +197,38 @@ impl ActionStore {
         result: Option<&str>,
         stamp: Stamp,
     ) -> anyhow::Result<Action> {
-        let now = Utc::now().to_rfc3339();
         const DECIDED_SQL: &str = "UPDATE actions SET \
-             status = ?1, \
-             reason = COALESCE(?4, reason), \
-             result = COALESCE(?5, result), \
-             decided_at = ?6 \
-             WHERE id = ?2 AND status = ?3";
+             status = $2, \
+             reason = COALESCE($4, reason), \
+             result = COALESCE($5, result), \
+             decided_at = now() \
+             WHERE id = $1 AND status = $3 RETURNING *";
         const EXECUTED_SQL: &str = "UPDATE actions SET \
-             status = ?1, \
-             reason = COALESCE(?4, reason), \
-             result = COALESCE(?5, result), \
-             executed_at = ?6 \
-             WHERE id = ?2 AND status = ?3";
+             status = $2, \
+             reason = COALESCE($4, reason), \
+             result = COALESCE($5, result), \
+             executed_at = now() \
+             WHERE id = $1 AND status = $3 RETURNING *";
         let sql = match stamp {
             Stamp::Decided => DECIDED_SQL,
             Stamp::Executed => EXECUTED_SQL,
         };
 
-        let changed = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                sql,
-                params![to.as_str(), id, from.as_str(), reason, result, now],
-            )?
-        };
+        let updated = sqlx::query(sql)
+            .bind(id)
+            .bind(to.as_str())
+            .bind(from.as_str())
+            .bind(reason)
+            .bind(result)
+            .fetch_optional(&self.pool)
+            .await
+            .context("transitioning an action")?;
 
-        if changed == 0 {
-            return match self.get(id)? {
+        match updated {
+            Some(row) => hydrate(&row),
+            // No row matched: either it does not exist, or it is in another
+            // status. Both get the same helpful error they always have.
+            None => match self.get(id).await? {
                 None => Err(anyhow!("action {id} does not exist")),
                 Some(current) => Err(anyhow!(
                     "action {id} is {}, not {}; cannot move to {}",
@@ -215,12 +236,11 @@ impl ActionStore {
                     from.as_str(),
                     to.as_str()
                 )),
-            };
+            },
         }
-        self.get(id)?.ok_or_else(|| anyhow!("action {id} vanished"))
     }
 
-    pub fn approve(&self, id: i64) -> anyhow::Result<Action> {
+    pub async fn approve(&self, id: i64) -> anyhow::Result<Action> {
         self.transition(
             id,
             ActionStatus::Proposed,
@@ -229,9 +249,10 @@ impl ActionStore {
             None,
             Stamp::Decided,
         )
+        .await
     }
 
-    pub fn reject(&self, id: i64, reason: &str) -> anyhow::Result<Action> {
+    pub async fn reject(&self, id: i64, reason: &str) -> anyhow::Result<Action> {
         self.transition(
             id,
             ActionStatus::Proposed,
@@ -240,9 +261,10 @@ impl ActionStore {
             None,
             Stamp::Decided,
         )
+        .await
     }
 
-    pub fn mark_executed(&self, id: i64, result: &str) -> anyhow::Result<Action> {
+    pub async fn mark_executed(&self, id: i64, result: &str) -> anyhow::Result<Action> {
         self.transition(
             id,
             ActionStatus::Approved,
@@ -251,9 +273,10 @@ impl ActionStore {
             Some(result),
             Stamp::Executed,
         )
+        .await
     }
 
-    pub fn mark_failed(&self, id: i64, reason: &str) -> anyhow::Result<Action> {
+    pub async fn mark_failed(&self, id: i64, reason: &str) -> anyhow::Result<Action> {
         self.transition(
             id,
             ActionStatus::Approved,
@@ -262,6 +285,7 @@ impl ActionStore {
             None,
             Stamp::Executed,
         )
+        .await
     }
 
     /// Durably claim an approved action for execution, one conditional UPDATE.
@@ -282,23 +306,21 @@ impl ActionStore {
     /// something does, that half-state is the difference between a recovery
     /// pass and a second voucher posted to real company accounting.
     ///
-    /// No new status variant and no schema change: `executed_at` is a bare
-    /// `TEXT` column, and `mark_executed`/`mark_failed` stamp it anyway, so a
-    /// claimed action that completes normally is indistinguishable from one
+    /// No new status variant and no schema change: `executed_at` is a plain
+    /// nullable `TIMESTAMPTZ` column, and `mark_executed`/`mark_failed` stamp
+    /// it anyway, so a claimed action that completes normally is indistinguishable from one
     /// that was never claimed. `pending()` and `expire_stale()` only look at
     /// `proposed` rows and are unaffected.
-    pub fn claim_for_execution(&self, id: i64) -> anyhow::Result<bool> {
-        let now = Utc::now().to_rfc3339();
-        let changed = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE actions SET executed_at = ?2
-                 WHERE id = ?1 AND status = 'approved' AND executed_at IS NULL",
-                params![id, now],
-            )
-            .context("claiming an action for execution")?
-        };
-        Ok(changed == 1)
+    pub async fn claim_for_execution(&self, id: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE actions SET executed_at = now()
+             WHERE id = $1 AND status = 'approved' AND executed_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("claiming an action for execution")?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Every action left in the half-state [`claim_for_execution`] creates:
@@ -314,15 +336,16 @@ impl ActionStore {
     /// Oldest first, so a report of them reads chronologically.
     ///
     /// [`claim_for_execution`]: ActionStore::claim_for_execution
-    pub fn stranded(&self) -> anyhow::Result<Vec<Action>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+    pub async fn stranded(&self) -> anyhow::Result<Vec<Action>> {
+        let rows = sqlx::query(
             "SELECT * FROM actions
              WHERE status = 'approved' AND executed_at IS NOT NULL
              ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], hydrate)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("listing stranded actions")?;
+        rows.iter().map(hydrate).collect()
     }
 
     /// Resolve one stranded row as `failed`, with `reason`, **keeping the
@@ -335,33 +358,35 @@ impl ActionStore {
     /// flight in a live executor — that row has no stamp yet.
     ///
     /// Returns `false` when the row was not (or is no longer) stranded.
-    pub fn fail_stranded(&self, id: i64, reason: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE actions SET status = 'failed', reason = ?2
-                 WHERE id = ?1 AND status = 'approved' AND executed_at IS NOT NULL",
-                params![id, reason],
-            )
-            .context("resolving a stranded action")?;
-        Ok(changed == 1)
+    pub async fn fail_stranded(&self, id: i64, reason: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE actions SET status = 'failed', reason = $2
+             WHERE id = $1 AND status = 'approved' AND executed_at IS NOT NULL",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .context("resolving a stranded action")?;
+        Ok(result.rows_affected() == 1)
     }
 
-    pub fn expire_stale(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+    pub async fn expire_stale(&self, now: DateTime<Utc>) -> anyhow::Result<usize> {
+        let result = sqlx::query(
             "UPDATE actions SET status = 'expired', reason = 'proposal expired'
-             WHERE status = 'proposed' AND expires_at <= ?1",
-            params![now.to_rfc3339()],
+             WHERE status = 'proposed' AND expires_at <= $1",
         )
-        .context("expiring stale proposals")
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("expiring stale proposals")?;
+        Ok(result.rows_affected() as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::test_support::temp_store;
 
     fn input() -> ProposeInput {
         ProposeInput {
@@ -374,201 +399,199 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stores_a_proposal_and_round_trips_args() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn stores_a_proposal_and_round_trips_args(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
         assert_eq!(a.status, ActionStatus::Proposed);
         assert_eq!(a.args["term"], "HT26");
         assert_eq!(
-            store.get(a.id).unwrap().unwrap().preview,
+            store.get(a.id).await.unwrap().unwrap().preview,
             "List courses for HT26"
         );
     }
 
-    #[test]
-    fn pending_lists_only_proposals() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.propose(input()).unwrap();
-        store.reject(a.id, "not now").unwrap();
-        let pending = store.pending().unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn pending_lists_only_proposals(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.propose(input()).await.unwrap();
+        store.reject(a.id, "not now").await.unwrap();
+        let pending = store.pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].status, ActionStatus::Proposed);
     }
 
-    #[test]
-    fn approving_twice_fails_the_second_time() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        assert_eq!(store.approve(a.id).unwrap().status, ActionStatus::Approved);
-        assert!(store.approve(a.id).is_err());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn approving_twice_fails_the_second_time(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        assert_eq!(
+            store.approve(a.id).await.unwrap().status,
+            ActionStatus::Approved
+        );
+        assert!(store.approve(a.id).await.is_err());
     }
 
-    #[test]
-    fn a_rejected_action_cannot_be_approved() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.reject(a.id, "no").unwrap();
-        assert!(store.approve(a.id).is_err());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_rejected_action_cannot_be_approved(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.reject(a.id, "no").await.unwrap();
+        assert!(store.approve(a.id).await.is_err());
     }
 
-    #[test]
-    fn execution_requires_approval_first() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        assert!(store.mark_executed(a.id, "ok").is_err());
-        store.approve(a.id).unwrap();
-        let done = store.mark_executed(a.id, "ok").unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn execution_requires_approval_first(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        assert!(store.mark_executed(a.id, "ok").await.is_err());
+        store.approve(a.id).await.unwrap();
+        let done = store.mark_executed(a.id, "ok").await.unwrap();
         assert_eq!(done.status, ActionStatus::Executed);
         assert_eq!(done.result.as_deref(), Some("ok"));
         assert!(done.executed_at.is_some());
     }
 
-    #[test]
-    fn failure_records_the_reason() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-        let failed = store.mark_failed(a.id, "connector timed out").unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn failure_records_the_reason(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
+        let failed = store
+            .mark_failed(a.id, "connector timed out")
+            .await
+            .unwrap();
         assert_eq!(failed.status, ActionStatus::Failed);
         assert_eq!(failed.reason.as_deref(), Some("connector timed out"));
     }
 
     /// A crash between the claim and the outcome leaves exactly this row, and
     /// before `stranded()` nothing in the system could see it.
-    #[test]
-    fn a_claimed_but_unfinished_action_is_stranded() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-        assert!(store.claim_for_execution(a.id).unwrap());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_claimed_but_unfinished_action_is_stranded(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
+        assert!(store.claim_for_execution(a.id).await.unwrap());
         // ... and now the process dies.
 
         assert!(
-            store.pending().unwrap().is_empty(),
+            store.pending().await.unwrap().is_empty(),
             "a stranded row is invisible to pending()"
         );
         assert_eq!(
             store
                 .expire_stale(Utc::now() + Duration::days(365))
+                .await
                 .unwrap(),
             0,
             "a stranded row is invisible to expire_stale"
         );
 
-        let stranded = store.stranded().unwrap();
+        let stranded = store.stranded().await.unwrap();
         assert_eq!(stranded.len(), 1);
         assert_eq!(stranded[0].id, a.id);
     }
 
-    #[test]
-    fn an_approved_action_nobody_has_claimed_is_not_stranded() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn an_approved_action_nobody_has_claimed_is_not_stranded(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
         assert!(
-            store.stranded().unwrap().is_empty(),
+            store.stranded().await.unwrap().is_empty(),
             "an approved-but-unclaimed action is waiting for the executor, not stranded"
         );
     }
 
-    #[test]
-    fn finished_actions_are_not_stranded() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn finished_actions_are_not_stranded(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
         for outcome in ["executed", "failed"] {
-            let a = store.propose(input()).unwrap();
-            store.approve(a.id).unwrap();
-            assert!(store.claim_for_execution(a.id).unwrap());
+            let a = store.propose(input()).await.unwrap();
+            store.approve(a.id).await.unwrap();
+            assert!(store.claim_for_execution(a.id).await.unwrap());
             if outcome == "executed" {
-                store.mark_executed(a.id, "ok").unwrap();
+                store.mark_executed(a.id, "ok").await.unwrap();
             } else {
-                store.mark_failed(a.id, "nope").unwrap();
+                store.mark_failed(a.id, "nope").await.unwrap();
             }
         }
-        assert!(store.stranded().unwrap().is_empty());
+        assert!(store.stranded().await.unwrap().is_empty());
     }
 
-    #[test]
-    fn resolving_a_stranded_action_keeps_the_claim_stamp() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-        store.claim_for_execution(a.id).unwrap();
-        let claimed_at = store.get(a.id).unwrap().unwrap().executed_at.unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn resolving_a_stranded_action_keeps_the_claim_stamp(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
+        store.claim_for_execution(a.id).await.unwrap();
+        let claimed_at = store.get(a.id).await.unwrap().unwrap().executed_at.unwrap();
 
-        assert!(store.fail_stranded(a.id, "the daemon crashed").unwrap());
+        assert!(store
+            .fail_stranded(a.id, "the daemon crashed")
+            .await
+            .unwrap());
 
-        let row = store.get(a.id).unwrap().unwrap();
+        let row = store.get(a.id).await.unwrap().unwrap();
         assert_eq!(row.status, ActionStatus::Failed);
         assert_eq!(row.reason.as_deref(), Some("the daemon crashed"));
         assert_eq!(
-            row.executed_at.as_deref(),
-            Some(claimed_at.as_str()),
+            row.executed_at,
+            Some(claimed_at),
             "the claim stamp is the only record of when the lost attempt started"
         );
-        assert!(store.stranded().unwrap().is_empty());
+        assert!(store.stranded().await.unwrap().is_empty());
     }
 
     /// The conjunct that matters: an approved action with no claim stamp is
     /// one the executor may be about to run, and must not be failed from under
     /// it by a recovery sweep.
-    #[test]
-    fn fail_stranded_refuses_an_unclaimed_approved_action() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-        assert!(!store.fail_stranded(a.id, "crash").unwrap());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn fail_stranded_refuses_an_unclaimed_approved_action(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
+        assert!(!store.fail_stranded(a.id, "crash").await.unwrap());
         assert_eq!(
-            store.get(a.id).unwrap().unwrap().status,
+            store.get(a.id).await.unwrap().unwrap().status,
             ActionStatus::Approved
         );
     }
 
-    #[test]
-    fn expire_stale_only_touches_expired_proposals() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn expire_stale_only_touches_expired_proposals(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
         let stale = store
             .propose(ProposeInput {
                 ttl: chrono::Duration::seconds(1),
                 ..input()
             })
+            .await
             .unwrap();
-        let fresh = store.propose(input()).unwrap();
+        let fresh = store.propose(input()).await.unwrap();
 
         let later = chrono::Utc::now() + chrono::Duration::seconds(5);
-        assert_eq!(store.expire_stale(later).unwrap(), 1);
+        assert_eq!(store.expire_stale(later).await.unwrap(), 1);
         assert_eq!(
-            store.get(stale.id).unwrap().unwrap().status,
+            store.get(stale.id).await.unwrap().unwrap().status,
             ActionStatus::Expired
         );
         assert_eq!(
-            store.get(fresh.id).unwrap().unwrap().status,
+            store.get(fresh.id).await.unwrap().unwrap().status,
             ActionStatus::Proposed
         );
     }
 
-    #[test]
-    fn claiming_for_execution_succeeds_once_and_then_refuses() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn claiming_for_execution_succeeds_once_and_then_refuses(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
 
-        assert!(store.claim_for_execution(a.id).unwrap());
-        let claimed = store.get(a.id).unwrap().unwrap();
+        assert!(store.claim_for_execution(a.id).await.unwrap());
+        let claimed = store.get(a.id).await.unwrap().unwrap();
         assert_eq!(
             claimed.status,
             ActionStatus::Approved,
@@ -580,109 +603,183 @@ mod tests {
         );
 
         assert!(
-            !store.claim_for_execution(a.id).unwrap(),
+            !store.claim_for_execution(a.id).await.unwrap(),
             "an approved row with a non-null executed_at is a half-state, not a fresh action"
         );
     }
 
-    #[test]
-    fn an_unapproved_action_cannot_be_claimed_for_execution() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        assert!(!store.claim_for_execution(a.id).unwrap());
-        assert!(store.get(a.id).unwrap().unwrap().executed_at.is_none());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn an_unapproved_action_cannot_be_claimed_for_execution(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        assert!(!store.claim_for_execution(a.id).await.unwrap());
+        assert!(store
+            .get(a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .executed_at
+            .is_none());
     }
 
-    #[test]
-    fn a_claimed_action_still_completes_normally() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-        assert!(store.claim_for_execution(a.id).unwrap());
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_claimed_action_still_completes_normally(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        store.approve(a.id).await.unwrap();
+        assert!(store.claim_for_execution(a.id).await.unwrap());
 
         // mark_executed matches on status alone, so the claim does not block it.
-        let done = store.mark_executed(a.id, "ok").unwrap();
+        let done = store.mark_executed(a.id, "ok").await.unwrap();
         assert_eq!(done.status, ActionStatus::Executed);
         assert!(done.executed_at.is_some());
     }
 
-    #[test]
-    fn claiming_and_expiring_do_not_see_each_other() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn claiming_and_expiring_do_not_see_each_other(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
         let a = store
             .propose(ProposeInput {
                 ttl: chrono::Duration::seconds(1),
                 ..input()
             })
+            .await
             .unwrap();
-        store.approve(a.id).unwrap();
-        assert!(store.claim_for_execution(a.id).unwrap());
+        store.approve(a.id).await.unwrap();
+        assert!(store.claim_for_execution(a.id).await.unwrap());
 
         // expire_stale only touches `proposed` rows, so a claimed approval is
         // untouched and pending() never showed it in the first place.
         let later = chrono::Utc::now() + chrono::Duration::seconds(5);
-        assert_eq!(store.expire_stale(later).unwrap(), 0);
+        assert_eq!(store.expire_stale(later).await.unwrap(), 0);
         assert_eq!(
-            store.get(a.id).unwrap().unwrap().status,
+            store.get(a.id).await.unwrap().unwrap().status,
             ActionStatus::Approved
         );
-        assert!(store.pending().unwrap().is_empty());
+        assert!(store.pending().await.unwrap().is_empty());
     }
 
-    /// Two threads, one approved action, one conditional UPDATE. Exactly one
-    /// of them is allowed to reach a connector.
-    #[test]
-    fn two_concurrent_claims_and_exactly_one_wins() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Barrier;
+    /// The claim is the difference between a recovery pass and a second
+    /// voucher posted to real company accounting. It must succeed exactly
+    /// once, including when several callers race: eight tasks, each on its
+    /// own pooled connection, one approved action, one conditional UPDATE.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn only_one_concurrent_caller_claims_an_action(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool.clone());
+        let action = store.propose(input()).await.unwrap();
+        store.approve(action.id).await.unwrap();
 
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn.clone());
-        let a = store.propose(input()).unwrap();
-        store.approve(a.id).unwrap();
-
-        let winners = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(8));
-        let mut handles = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
         for _ in 0..8 {
-            let store = ActionStore::new(conn.clone());
-            let winners = Arc::clone(&winners);
-            let barrier = Arc::clone(&barrier);
-            let id = a.id;
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                if store.claim_for_execution(id).unwrap() {
-                    winners.fetch_add(1, Ordering::SeqCst);
-                }
-            }));
+            let store = store.clone();
+            set.spawn(async move { store.claim_for_execution(action.id).await.unwrap() });
         }
-        for h in handles {
-            h.join().unwrap();
+        let mut claims = 0;
+        while let Some(won) = set.join_next().await {
+            if won.unwrap() {
+                claims += 1;
+            }
         }
+        assert_eq!(claims, 1, "exactly one caller may own the execution");
+    }
 
+    /// Review Focus #4: the CHECK constraint must accept everything
+    /// `ActionStatus::as_str` can produce, or an ordinary transition becomes a
+    /// database error.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn every_action_status_is_accepted_by_the_database(pool: sqlx::PgPool) {
+        for status in [
+            ActionStatus::Proposed,
+            ActionStatus::Approved,
+            ActionStatus::Rejected,
+            ActionStatus::Expired,
+            ActionStatus::Executed,
+            ActionStatus::Failed,
+        ] {
+            sqlx::query(
+                "INSERT INTO actions (connector, tool, args, preview, rationale, status, expires_at)
+                 VALUES ('c','t','{}','p','r',$1, now())",
+            )
+            .bind(status.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("status {:?} was refused: {e}", status));
+        }
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_transition_from_the_wrong_status_names_the_current_one(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let action = store.propose(input()).await.unwrap();
+        store.approve(action.id).await.unwrap();
+        let err = format!("{:#}", store.approve(action.id).await.unwrap_err());
+        assert!(
+            err.contains("approved"),
+            "the error must name the current status: {err}"
+        );
         assert_eq!(
-            winners.load(Ordering::SeqCst),
-            1,
-            "exactly one claimant may own the execution"
+            err,
+            format!(
+                "action {} is approved, not proposed; cannot move to approved",
+                action.id
+            ),
+            "the message text names the current and requested status"
         );
     }
 
-    #[test]
-    fn an_expired_proposal_cannot_be_approved() {
-        let (_dir, conn) = temp_store();
-        let store = ActionStore::new(conn);
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn transitioning_a_missing_action_says_it_does_not_exist(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let err = format!("{:#}", store.approve(987_654).await.unwrap_err());
+        assert_eq!(err, "action 987654 does not exist");
+    }
+
+    /// The row a transition returns is the row the UPDATE wrote, stamp
+    /// included, and the untouched optional column survives the COALESCE.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_transition_returns_the_row_it_wrote(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        assert!(a.decided_at.is_none());
+        assert_eq!(a.expires_at - a.created_at, chrono::Duration::hours(24));
+        let rejected = store.reject(a.id, "not now").await.unwrap();
+        assert_eq!(rejected.status, ActionStatus::Rejected);
+        assert_eq!(rejected.reason.as_deref(), Some("not now"));
+        assert!(rejected.result.is_none());
+        assert!(rejected.decided_at.is_some());
+        let reread = store.get(a.id).await.unwrap().unwrap();
+        assert_eq!(reread.decided_at, rejected.decided_at);
+    }
+
+    /// `Action` serializes its timestamps with `to_rfc3339()`, so `ea pending`
+    /// and the IPC responses get a stable, predictable timestamp format
+    /// rather than chrono's default `Serialize`.
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn timestamps_serialize_as_rfc3339(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
+        let a = store.propose(input()).await.unwrap();
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["expires_at"], a.expires_at.to_rfc3339());
+        assert_eq!(json["created_at"], a.created_at.to_rfc3339());
+        assert!(json["expires_at"].as_str().unwrap().ends_with("+00:00"));
+        assert!(json["decided_at"].is_null());
+        assert!(json["executed_at"].is_null());
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn an_expired_proposal_cannot_be_approved(pool: sqlx::PgPool) {
+        let store = ActionStore::new(pool);
         let a = store
             .propose(ProposeInput {
                 ttl: chrono::Duration::seconds(1),
                 ..input()
             })
+            .await
             .unwrap();
         store
             .expire_stale(chrono::Utc::now() + chrono::Duration::seconds(5))
+            .await
             .unwrap();
-        assert!(store.approve(a.id).is_err());
+        assert!(store.approve(a.id).await.is_err());
     }
 }

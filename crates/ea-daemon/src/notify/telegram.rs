@@ -265,7 +265,7 @@ enum Callback {
 /// Everything here is total. `split_once` returns an `Option` rather than
 /// indexing; the id goes through `i64::from_str`, whose overflow and
 /// non-numeric cases are `Err` and not a panic; and an id is required to be
-/// positive because SQLite rowids are, so `0` and negatives are refused before
+/// positive because action ids are, so `0` and negatives are refused before
 /// they reach a query. Anything else — an unknown verb, no colon, an empty
 /// payload, a second colon — is `None`, which the caller answers politely.
 fn parse_callback(data: &str) -> Option<Callback> {
@@ -347,7 +347,8 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     pub async fn push_action(&self, id: i64) -> anyhow::Result<()> {
         let action = self
             .actions
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| anyhow!("action {id} does not exist"))?;
         if action.status != ActionStatus::Proposed {
             bail!(
@@ -359,7 +360,11 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
         let text = truncate(
             &format!(
                 "Approve this action?\n\n#{id} · {}.{}\n\n{}\n\nWhy: {}\n\nExpires: {}",
-                action.connector, action.tool, action.preview, action.rationale, action.expires_at,
+                action.connector,
+                action.tool,
+                action.preview,
+                action.rationale,
+                action.expires_at.to_rfc3339(),
             ),
             MAX_MESSAGE_BYTES,
         );
@@ -422,7 +427,7 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 
         match parse_callback(data) {
             Some(Callback::Approve(id)) => self.approve(id).await,
-            Some(Callback::Reject(id)) => self.reject(id),
+            Some(Callback::Reject(id)) => self.reject(id).await,
             None => {
                 // Not an error: old buttons from a previous build, or someone
                 // poking the bot. Deliberately does not echo `data` back.
@@ -483,12 +488,12 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     /// UPDATE, so of two concurrent taps exactly one proceeds to the executor.
     /// No extra lock here — see the module docs.
     async fn approve(&self, id: i64) -> String {
-        if let Err(err) = self.actions.approve(id) {
+        if let Err(err) = self.actions.approve(id).await {
             // Almost always the losing half of a double tap, occasionally an
             // expired proposal. Either way the row itself is the authority on
             // what to say, so read it rather than surfacing this error.
             tracing::debug!(action = id, error = %err, "approve transition did not apply");
-            return self.already_handled(id);
+            return self.already_handled(id).await;
         }
 
         match self.executor.execute_approved(id).await {
@@ -508,12 +513,12 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
 
     /// Reject. Nothing is executed and the connector is never reached — there
     /// is no call to the executor on this path at all.
-    fn reject(&self, id: i64) -> String {
-        match self.actions.reject(id, "rejected from Telegram") {
+    async fn reject(&self, id: i64) -> String {
+        match self.actions.reject(id, "rejected from Telegram").await {
             Ok(_) => format!("Rejected #{id}. Nothing was called."),
             Err(err) => {
                 tracing::debug!(action = id, error = %err, "reject transition did not apply");
-                self.already_handled(id)
+                self.already_handled(id).await
             }
         }
     }
@@ -537,8 +542,8 @@ impl<T: Transport, C: ToolCaller> Notifier<T, C> {
     /// This is the double-tap loser's reply, and the reason it reads the row
     /// back instead of formatting the transition error: a person holding a
     /// phone needs "already handled", not a status-machine diagnostic.
-    fn already_handled(&self, id: i64) -> String {
-        match self.actions.get(id) {
+    async fn already_handled(&self, id: i64) -> String {
+        match self.actions.get(id).await {
             Ok(Some(action)) => match action.status {
                 // The transition failed but the row still looks decidable.
                 // Rare — a store fault rather than a race.
@@ -1100,19 +1105,13 @@ record_voucher = "approve"
     }
 
     struct Fixture {
-        _dir: TempDir,
         notifier: Notifier<FakeTransport, FakeCaller>,
         sent: Arc<Mutex<Vec<Sent>>>,
         calls: Arc<Mutex<Vec<(String, String, Value)>>>,
         actions: ActionStore,
     }
 
-    fn fixture_with_delay(delay: Duration) -> Fixture {
-        let dir = TempDir::new().unwrap();
-        let conn = Arc::new(Mutex::new(
-            ea_core::db::open(&dir.path().join("state.db")).unwrap(),
-        ));
-
+    fn fixture_with_delay(pool: sqlx::PgPool, delay: Duration) -> Fixture {
         let transport = FakeTransport::default();
         let sent = transport.sent.clone();
         let caller = FakeCaller {
@@ -1122,23 +1121,22 @@ record_voucher = "approve"
         let calls = caller.calls.clone();
 
         let executor = Arc::new(Executor::new(
-            ActionStore::new(conn.clone()),
-            RunStore::new(conn.clone()),
+            ActionStore::new(pool.clone()),
+            RunStore::new(pool.clone()),
             policy(),
             caller,
         ));
 
         Fixture {
-            _dir: dir,
-            notifier: Notifier::new(transport, ActionStore::new(conn.clone()), executor, OWNER),
+            notifier: Notifier::new(transport, ActionStore::new(pool.clone()), executor, OWNER),
             sent,
             calls,
-            actions: ActionStore::new(conn),
+            actions: ActionStore::new(pool),
         }
     }
 
-    fn fixture() -> Fixture {
-        fixture_with_delay(Duration::ZERO)
+    fn fixture(pool: sqlx::PgPool) -> Fixture {
+        fixture_with_delay(pool, Duration::ZERO)
     }
 
     /// A chat service that records what it was asked and answers a canned
@@ -1216,15 +1214,15 @@ record_voucher = "approve"
     }
 
     /// A fixture whose notifier also answers free text.
-    fn chat_fixture(chat: Arc<FakeChat>) -> (Fixture, Arc<FakeChat>) {
-        let mut f = fixture();
+    fn chat_fixture(pool: sqlx::PgPool, chat: Arc<FakeChat>) -> (Fixture, Arc<FakeChat>) {
+        let mut f = fixture(pool);
         f.notifier = f
             .notifier
             .with_chat(Arc::clone(&chat) as Arc<dyn crate::chat::ChatResponder>);
         (f, chat)
     }
 
-    fn propose(actions: &ActionStore) -> i64 {
+    async fn propose(actions: &ActionStore) -> i64 {
         actions
             .propose(ProposeInput {
                 connector: "fortnox".into(),
@@ -1234,6 +1232,7 @@ record_voucher = "approve"
                 rationale: "the receipt arrived by mail".into(),
                 ttl: chrono::Duration::hours(24),
             })
+            .await
             .unwrap()
             .id
     }
@@ -1253,10 +1252,10 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn pushing_an_action_carries_the_preview_and_both_callback_ids() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn pushing_an_action_carries_the_preview_and_both_callback_ids(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         f.notifier.push_action(id).await.unwrap();
 
@@ -1280,10 +1279,10 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn an_approve_callback_approves_and_executes() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_approve_callback_approves_and_executes(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier
@@ -1292,7 +1291,7 @@ record_voucher = "approve"
 
         assert!(reply.contains("Executed"), "{reply}");
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
 
@@ -1303,10 +1302,10 @@ record_voucher = "approve"
         assert_eq!(calls[0].2["amount"], 4200);
     }
 
-    #[tokio::test]
-    async fn a_reject_callback_rejects_and_never_reaches_the_connector() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_reject_callback_rejects_and_never_reaches_the_connector(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier
@@ -1314,7 +1313,7 @@ record_voucher = "approve"
             .await;
 
         assert!(reply.contains("Rejected"), "{reply}");
-        let action = f.actions.get(id).unwrap().unwrap();
+        let action = f.actions.get(id).await.unwrap().unwrap();
         assert_eq!(action.status, ActionStatus::Rejected);
         assert!(action.reason.is_some(), "a rejection must record why");
         assert!(
@@ -1323,9 +1322,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn an_unknown_action_id_answers_gracefully() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_unknown_action_id_answers_gracefully(pool: sqlx::PgPool) {
+        let f = fixture(pool);
 
         let reply = f.notifier.handle_callback(OWNER, "approve:999999").await;
 
@@ -1338,12 +1337,12 @@ record_voucher = "approve"
 
     /// Callback data is attacker-reachable input. Nothing in this list may
     /// panic, and none of it may reach a connector.
-    #[tokio::test]
-    async fn malformed_callback_data_answers_gracefully() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn malformed_callback_data_answers_gracefully(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         // A real action exists, so a payload that *nearly* parses cannot be
         // dismissed just because the store is empty.
-        let id = propose(&f.actions);
+        let id = propose(&f.actions).await;
 
         let malformed = [
             "",
@@ -1380,7 +1379,7 @@ record_voucher = "approve"
             "malformed callback data must never reach a connector"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "and must never move a real action"
         );
@@ -1394,10 +1393,10 @@ record_voucher = "approve"
     /// await point, so the second callback is genuinely evaluated while the
     /// first is mid-flight. The loser must get a sentence with "already" in it,
     /// not a transition diagnostic.
-    #[tokio::test]
-    async fn a_double_tapped_approve_executes_exactly_once() {
-        let f = fixture_with_delay(Duration::from_millis(50));
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_double_tapped_approve_executes_exactly_once(pool: sqlx::PgPool) {
+        let f = fixture_with_delay(pool, Duration::from_millis(50));
+        let id = propose(&f.actions).await;
 
         // Bound to locals rather than inlined: `tokio::join!` holds both
         // futures past the end of the statement, so a `&format!(..)` temporary
@@ -1428,7 +1427,7 @@ record_voucher = "approve"
             "a raw store diagnostic reached the human: {replies}"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Executed
         );
     }
@@ -1436,10 +1435,19 @@ record_voucher = "approve"
     /// The same race with the two taps spread across tokio worker threads,
     /// so they can be running in the store at literally the same moment rather
     /// than interleaving at await points on one thread.
+    /// `#[sqlx::test]` does not support a non-default runtime flavor, so this
+    /// connects to `DATABASE_URL` directly instead (same pattern as
+    /// `database.rs`'s dead-server test). This test does not assert on the
+    /// `runs` table, only on the connector call count and the action status,
+    /// so sharing the real database with other direct-connect tests is safe.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_double_tapped_approve_executes_exactly_once_across_threads() {
-        let f = Arc::new(fixture_with_delay(Duration::from_millis(50)));
-        let id = propose(&f.actions);
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = ea_core::db::connect(&url).await.expect("a live database");
+        let f = Arc::new(fixture_with_delay(pool, Duration::from_millis(50)));
+        let id = propose(&f.actions).await;
 
         let one = {
             let f = f.clone();
@@ -1468,10 +1476,10 @@ record_voucher = "approve"
     }
 
     /// Approving something a human already rejected must not run it.
-    #[tokio::test]
-    async fn approving_an_already_rejected_action_changes_nothing() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn approving_an_already_rejected_action_changes_nothing(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         f.notifier
             .handle_callback(OWNER, &format!("reject:{id}"))
@@ -1484,16 +1492,16 @@ record_voucher = "approve"
         assert!(reply.contains("already handled: rejected"), "{reply}");
         assert!(f.calls.lock().unwrap().is_empty());
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Rejected
         );
     }
 
-    #[tokio::test]
-    async fn pushing_an_already_decided_action_is_refused() {
-        let f = fixture();
-        let id = propose(&f.actions);
-        f.actions.reject(id, "no").unwrap();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn pushing_an_already_decided_action_is_refused(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
+        f.actions.reject(id, "no").await.unwrap();
 
         assert!(f.notifier.push_action(id).await.is_err());
         assert!(
@@ -1502,9 +1510,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn notify_sends_a_plain_message_with_no_buttons() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn notify_sends_a_plain_message_with_no_buttons(pool: sqlx::PgPool) {
+        let f = fixture(pool);
 
         f.notifier
             .notify("digest: 3 things happened")
@@ -1532,10 +1540,10 @@ record_voucher = "approve"
     /// The button posts a real voucher to company accounting. A tap from
     /// anyone but the owner must change nothing at all: no transition, no
     /// connector call, and a reply that does not admit the action exists.
-    #[tokio::test]
-    async fn a_callback_from_anyone_but_the_owner_does_nothing() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_callback_from_anyone_but_the_owner_does_nothing(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         for data in [format!("approve:{id}"), format!("reject:{id}")] {
             let reply = f.notifier.handle_callback(STRANGER, &data).await;
@@ -1569,7 +1577,7 @@ record_voucher = "approve"
             "a non-owner tap must make zero connector calls"
         );
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed,
             "a non-owner tap must not move the action"
         );
@@ -1579,10 +1587,10 @@ record_voucher = "approve"
     /// asserted rather than assumed: if a stranger's reply for a *valid* id
     /// differed from the reply to garbage by even one byte, anyone who found
     /// the bot could walk the id space and learn which vouchers are pending.
-    #[tokio::test]
-    async fn a_wrong_sender_and_malformed_data_get_byte_identical_replies() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_wrong_sender_and_malformed_data_get_byte_identical_replies(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         let malformed_from_owner = f.notifier.handle_callback(OWNER, "nonsense").await;
         let valid_from_stranger = f
@@ -1606,16 +1614,16 @@ record_voucher = "approve"
 
         assert!(f.calls.lock().unwrap().is_empty());
         assert_eq!(
-            f.actions.get(id).unwrap().unwrap().status,
+            f.actions.get(id).await.unwrap().unwrap().status,
             ActionStatus::Proposed
         );
     }
 
     /// And the owner is unaffected by any of it.
-    #[tokio::test]
-    async fn the_owner_still_approves_exactly_as_before() {
-        let f = fixture();
-        let id = propose(&f.actions);
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owner_still_approves_exactly_as_before(pool: sqlx::PgPool) {
+        let f = fixture(pool);
+        let id = propose(&f.actions).await;
 
         let reply = f
             .notifier
@@ -2223,9 +2231,9 @@ record_voucher = "approve"
 
     // -- free text ----------------------------------------------------------
 
-    #[tokio::test]
-    async fn the_owners_message_reaches_the_conversation_and_comes_back_answered() {
-        let (f, chat) = chat_fixture(FakeChat::answering("the tenta is on the 14th"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_owners_message_reaches_the_conversation_and_comes_back_answered(pool: sqlx::PgPool) {
+        let (f, chat) = chat_fixture(pool, FakeChat::answering("the tenta is on the 14th"));
 
         let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
 
@@ -2242,9 +2250,9 @@ record_voucher = "approve"
     /// `message.from.id` is the person; `message.chat.id` is the room. A
     /// stranger must get the *same* sentence a stranger's button press gets,
     /// byte for byte, or the two replies become an oracle for probing.
-    #[tokio::test]
-    async fn a_message_from_anyone_but_the_owner_is_refused_identically_to_a_callback() {
-        let (f, chat) = chat_fixture(FakeChat::answering("secret answer"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_from_anyone_but_the_owner_is_refused_identically_to_a_callback(pool: sqlx::PgPool) {
+        let (f, chat) = chat_fixture(pool, FakeChat::answering("secret answer"));
 
         let to_a_message = f.notifier.handle_message(STRANGER, "hello?").await;
         let to_a_callback = f.notifier.handle_callback(STRANGER, "approve:1").await;
@@ -2271,9 +2279,9 @@ record_voucher = "approve"
     /// An off-by-one neighbour of the owner's id is the bug this guards; so is
     /// the *chat* id being used as the person. The configured chat in these
     /// tests is not the owner's user id, and a notifier handed it must refuse.
-    #[tokio::test]
-    async fn the_chat_id_is_not_an_identity() {
-        let (f, chat) = chat_fixture(FakeChat::answering("secret answer"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_chat_id_is_not_an_identity(pool: sqlx::PgPool) {
+        let (f, chat) = chat_fixture(pool, FakeChat::answering("secret answer"));
         // What `message.chat.id` would be in the owner's own DM with a group
         // bot: a different number entirely.
         let as_if_chat_were_the_person = TelegramUserId(-1_001_234_567_890);
@@ -2287,9 +2295,9 @@ record_voucher = "approve"
         assert!(chat.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn a_message_to_a_daemon_with_no_chat_service_says_so_to_the_owner_only() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_to_a_daemon_with_no_chat_service_says_so_to_the_owner_only(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         assert_eq!(
             f.notifier.handle_message(OWNER, "hello").await,
             NO_CHAT_REPLY
@@ -2301,9 +2309,9 @@ record_voucher = "approve"
         );
     }
 
-    #[tokio::test]
-    async fn a_message_with_no_text_is_answered_rather_than_ignored() {
-        let (f, chat) = chat_fixture(FakeChat::answering("hi"));
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_message_with_no_text_is_answered_rather_than_ignored(pool: sqlx::PgPool) {
+        let (f, chat) = chat_fixture(pool, FakeChat::answering("hi"));
         assert_eq!(f.notifier.handle_message(OWNER, "   ").await, NO_TEXT_REPLY);
         assert!(
             chat.seen().is_empty(),
@@ -2318,9 +2326,9 @@ record_voucher = "approve"
     /// status` from, so it must show both. Taking the reply and dropping the
     /// note leaves the owner crossing a spending bound they were never told
     /// about.
-    #[tokio::test]
-    async fn an_over_budget_turn_shows_the_owner_the_note_as_well_as_the_reply() {
-        let (f, _chat) = chat_fixture(FakeChat::answering_with_note(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn an_over_budget_turn_shows_the_owner_the_note_as_well_as_the_reply(pool: sqlx::PgPool) {
+        let (f, _chat) = chat_fixture(pool, FakeChat::answering_with_note(
             "the tenta is on the 14th",
             "answered anyway, but the daily session budget of 60 is spent",
         ));
@@ -2346,13 +2354,13 @@ record_voucher = "approve"
     /// case where the note matters most is the one where it vanished, and the
     /// owner was billed past their ceiling without being told. The reply is
     /// what gets cut; the note is reserved before the cut is made.
-    #[tokio::test]
-    async fn a_long_reply_is_cut_to_make_room_for_the_over_budget_note() {
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_long_reply_is_cut_to_make_room_for_the_over_budget_note(pool: sqlx::PgPool) {
         const NOTE: &str = "answered anyway, but the daily session budget of 60 is spent";
         // Multi-byte all the way through: the cut has to keep landing on a
         // character boundary, whatever the reserved length pushes it onto.
         let long = "ä".repeat(4_000);
-        let (f, _chat) = chat_fixture(FakeChat::answering_with_note(&long, NOTE));
+        let (f, _chat) = chat_fixture(pool, FakeChat::answering_with_note(&long, NOTE));
 
         let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
 
@@ -2378,9 +2386,9 @@ record_voucher = "approve"
     }
 
     /// And a turn with only a note still shows it: that is the no-reply case.
-    #[tokio::test]
-    async fn a_turn_with_only_a_note_still_shows_the_note() {
-        let (f, _chat) = chat_fixture(FakeChat::noting(
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_turn_with_only_a_note_still_shows_the_note(pool: sqlx::PgPool) {
+        let (f, _chat) = chat_fixture(pool, FakeChat::noting(
             "recorded, but this daemon has no session runner",
         ));
 
@@ -2391,9 +2399,9 @@ record_voucher = "approve"
 
     /// A session that failed stored no assistant message, so the phone is told
     /// the turn failed rather than being handed a plausible-looking answer.
-    #[tokio::test]
-    async fn a_failed_turn_is_a_sentence_not_a_panic() {
-        let (f, _chat) = chat_fixture(FakeChat::failing());
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_failed_turn_is_a_sentence_not_a_panic(pool: sqlx::PgPool) {
+        let (f, _chat) = chat_fixture(pool, FakeChat::failing());
         let reply = f.notifier.handle_message(OWNER, "when is the tenta?").await;
         assert!(reply.contains("Something went wrong"), "{reply}");
         assert!(

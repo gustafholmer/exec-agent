@@ -59,9 +59,9 @@ use ea_core::store::runs::RunStore;
 /// The daily ceiling on sessions the daemon starts, counted from the `runs`
 /// table over the owner's own day.
 ///
-/// Cheap to clone: a `RunStore` is an `Arc<Mutex<Connection>>` behind a
-/// handle, and every dependency struct that needs a budget owns one rather
-/// than sharing a reference.
+/// Cheap to clone: a `RunStore` is a `PgPool` behind a handle, and every
+/// dependency struct that needs a budget owns one rather than sharing a
+/// reference.
 #[derive(Clone)]
 pub struct Budget {
     runs: RunStore,
@@ -117,16 +117,19 @@ impl Budget {
     ///
     /// Read from the database on every call. See the module docs for why
     /// there is no counter.
-    pub fn spent_today(&self, now: DateTime<Utc>) -> Result<u32> {
+    pub async fn spent_today(&self, now: DateTime<Utc>) -> Result<u32> {
         let spent = self
             .runs
-            .count_since(self.day_start(now), Some(crate::executor::RUN_KIND))?;
+            .count_since(self.day_start(now), Some(crate::executor::RUN_KIND))
+            .await?;
         Ok(u32::try_from(spent.max(0)).unwrap_or(u32::MAX))
     }
 
     /// How many sessions are left today. Saturates at zero.
-    pub fn remaining(&self, now: DateTime<Utc>) -> Result<u32> {
-        Ok(self.daily_sessions.saturating_sub(self.spent_today(now)?))
+    pub async fn remaining(&self, now: DateTime<Utc>) -> Result<u32> {
+        Ok(self
+            .daily_sessions
+            .saturating_sub(self.spent_today(now).await?))
     }
 
     /// Is the day's budget gone?
@@ -138,8 +141,8 @@ impl Budget {
     /// This is a *report*, not a gate. Read it when the answer is "and then do
     /// something cheaper or say why"; use [`Budget::try_consume`] when the
     /// answer is "and then do not run a session".
-    pub fn is_spent(&self, now: DateTime<Utc>) -> Result<bool> {
-        Ok(self.spent_today(now)? >= self.daily_sessions)
+    pub async fn is_spent(&self, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self.spent_today(now).await? >= self.daily_sessions)
     }
 
     /// May a session start now?
@@ -159,15 +162,15 @@ impl Budget {
     /// triage runs one session per pass under the scheduler's overlap guard,
     /// the briefings are cron entries minutes apart, and chat holds a mutex
     /// for the whole of a turn.
-    pub fn try_consume(&self, now: DateTime<Utc>) -> Result<bool> {
-        Ok(!self.is_spent(now)?)
+    pub async fn try_consume(&self, now: DateTime<Utc>) -> Result<bool> {
+        Ok(!self.is_spent(now).await?)
     }
 
     /// `"7/60"` — the pair `ea status` shows, and the reason it is one string:
     /// a count without its ceiling says nothing, and reading two fields and
     /// dividing them is work the owner should not be doing at a glance.
-    pub fn status_line(&self, now: DateTime<Utc>) -> String {
-        match self.spent_today(now) {
+    pub async fn status_line(&self, now: DateTime<Utc>) -> String {
+        match self.spent_today(now).await {
             Ok(spent) => format!("{spent}/{}", self.daily_sessions),
             // `status` is what someone reaches for when things are already
             // wrong; it must answer.
@@ -195,10 +198,7 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use chrono_tz::Europe::Stockholm;
-    use tempfile::TempDir;
 
     use super::*;
 
@@ -206,29 +206,16 @@ mod tests {
         text.parse().unwrap()
     }
 
-    type Conn = Arc<std::sync::Mutex<rusqlite::Connection>>;
-
     struct Fixture {
-        _dir: TempDir,
-        path: std::path::PathBuf,
-        conn: Conn,
+        pool: sqlx::PgPool,
         runs: RunStore,
     }
 
-    fn fixture() -> Fixture {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("state.db");
-        let conn = open(&path);
+    fn fixture(pool: sqlx::PgPool) -> Fixture {
         Fixture {
-            _dir: dir,
-            path,
-            runs: RunStore::new(Arc::clone(&conn)),
-            conn,
+            runs: RunStore::new(pool.clone()),
+            pool,
         }
-    }
-
-    fn open(path: &std::path::Path) -> Conn {
-        Arc::new(std::sync::Mutex::new(ea_core::db::open(path).unwrap()))
     }
 
     /// A `runs` row with a chosen `started_at`.
@@ -238,63 +225,65 @@ mod tests {
     /// it and the test reaches the column directly. Every other property here
     /// — which kinds count, what survives a restart — goes through the real
     /// store.
-    fn run_at(f: &Fixture, kind: &str, at: DateTime<Utc>) {
-        let id = f.runs.start(kind, "prompt", &[]).unwrap();
-        f.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE runs SET started_at = ?1 WHERE id = ?2",
-                rusqlite::params![at.to_rfc3339(), id],
-            )
+    async fn run_at(f: &Fixture, kind: &str, at: DateTime<Utc>) {
+        let id = f.runs.start(kind, "prompt", &[]).await.unwrap();
+        sqlx::query("UPDATE runs SET started_at = $1 WHERE id = $2")
+            .bind(at)
+            .bind(id)
+            .execute(&f.pool)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn consuming_below_the_limit_succeeds_and_the_call_at_the_limit_fails() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn consuming_below_the_limit_succeeds_and_the_call_at_the_limit_fails(
+        pool: sqlx::PgPool,
+    ) {
+        let f = fixture(pool);
         let budget = Budget::new(f.runs.clone(), 3, Stockholm);
         let now = utc("2026-09-24T12:00:00Z");
 
         for expected in 0..3u32 {
-            assert_eq!(budget.spent_today(now).unwrap(), expected);
-            assert!(budget.try_consume(now).unwrap(), "session {expected}");
-            run_at(&f, "triage.tier1", now);
+            assert_eq!(budget.spent_today(now).await.unwrap(), expected);
+            assert!(budget.try_consume(now).await.unwrap(), "session {expected}");
+            run_at(&f, "triage.tier1", now).await;
         }
 
-        assert_eq!(budget.spent_today(now).unwrap(), 3);
+        assert_eq!(budget.spent_today(now).await.unwrap(), 3);
         assert!(
-            !budget.try_consume(now).unwrap(),
+            !budget.try_consume(now).await.unwrap(),
             "the call at the limit must fail"
         );
-        assert_eq!(budget.remaining(now).unwrap(), 0);
+        assert_eq!(budget.remaining(now).await.unwrap(), 0);
     }
 
     /// A ceiling of zero is the documented off switch.
-    #[test]
-    fn a_zero_budget_is_spent_before_anything_runs() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_zero_budget_is_spent_before_anything_runs(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         assert!(!Budget::new(f.runs.clone(), 0, Stockholm)
             .try_consume(utc("2026-09-24T12:00:00Z"))
+            .await
             .unwrap());
         assert!(Budget::new(f.runs, 1, Stockholm)
             .try_consume(utc("2026-09-24T12:00:00Z"))
+            .await
             .unwrap());
     }
 
     /// The executor writes a `runs` row per connector call. Those are not
     /// sessions and cost no model tokens; counting them would exhaust the
     /// budget on a day the daemon merely approved a lot of actions.
-    #[test]
-    fn connector_calls_are_not_sessions() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn connector_calls_are_not_sessions(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let budget = Budget::new(f.runs.clone(), 2, Stockholm);
         let now = utc("2026-09-24T12:00:00Z");
         for _ in 0..50 {
-            run_at(&f, crate::executor::RUN_KIND, now);
+            run_at(&f, crate::executor::RUN_KIND, now).await;
         }
-        assert_eq!(budget.spent_today(now).unwrap(), 0);
-        assert!(budget.try_consume(now).unwrap());
+        assert_eq!(budget.spent_today(now).await.unwrap(), 0);
+        assert!(budget.try_consume(now).await.unwrap());
     }
 
     /// **The boundary is the owner's midnight, not UTC's.**
@@ -303,15 +292,15 @@ mod tests {
     /// is 21:30Z, and at 00:30 local on the 25th the budget must be fresh —
     /// while a UTC-midnight boundary would still be counting that session for
     /// another hour and a half.
-    #[test]
-    fn the_day_resets_at_local_midnight_and_not_at_utc_midnight() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_day_resets_at_local_midnight_and_not_at_utc_midnight(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let budget = Budget::new(f.runs.clone(), 1, Stockholm);
 
         // 23:30 Stockholm on the 24th.
         let late = utc("2026-09-24T21:30:00Z");
-        run_at(&f, "chat", late);
-        assert!(!budget.try_consume(late).unwrap(), "spent for the 24th");
+        run_at(&f, "chat", late).await;
+        assert!(!budget.try_consume(late).await.unwrap(), "spent for the 24th");
 
         // 00:30 Stockholm on the 25th — still 22:30Z on the 24th, so a
         // UTC-midnight boundary would say the budget is still spent.
@@ -322,7 +311,7 @@ mod tests {
             "the day begins at 00:00 Stockholm, which is 22:00Z the day before"
         );
         assert!(
-            budget.try_consume(just_after_local_midnight).unwrap(),
+            budget.try_consume(just_after_local_midnight).await.unwrap(),
             "a new local day is a new budget"
         );
 
@@ -330,15 +319,16 @@ mod tests {
         // the bug this test exists to keep out.
         assert!(!Budget::new(f.runs.clone(), 1, chrono_tz::UTC)
             .try_consume(just_after_local_midnight)
+            .await
             .unwrap());
     }
 
     /// Winter and summer boundaries differ by an hour in UTC and by nothing at
     /// all on the owner's clock, which is the point of using a zone rather
     /// than an offset.
-    #[test]
-    fn the_boundary_follows_daylight_saving() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_boundary_follows_daylight_saving(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let budget = Budget::new(f.runs, 60, Stockholm);
         // CEST, UTC+2.
         assert_eq!(
@@ -355,9 +345,9 @@ mod tests {
     /// The autumn day with two 02:00s is 25 hours long, and all 25 of them are
     /// one budget: the boundary is the *earlier* of the two candidate
     /// instants for the following midnight, not a 24-hour offset.
-    #[test]
-    fn the_long_and_short_dst_days_are_still_one_day_each() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_long_and_short_dst_days_are_still_one_day_each(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let budget = Budget::new(f.runs, 60, Stockholm);
         // 2026-10-25 is the autumn transition; local noon that day is 11:00Z.
         assert_eq!(
@@ -376,39 +366,40 @@ mod tests {
     /// **The count has to survive a restart**, because the daemon restarts
     /// whenever it crashes and an in-memory counter would hand a crash loop an
     /// unlimited budget.
-    #[test]
-    fn the_count_survives_a_daemon_restart() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_count_survives_a_daemon_restart(pool: sqlx::PgPool) {
+        let f = fixture(pool.clone());
         let now = utc("2026-09-24T12:00:00Z");
         {
             let budget = Budget::new(f.runs.clone(), 2, Stockholm);
-            run_at(&f, "triage.tier1", now);
-            run_at(&f, "chat", now);
-            assert!(!budget.try_consume(now).unwrap());
+            run_at(&f, "triage.tier1", now).await;
+            run_at(&f, "chat", now).await;
+            assert!(!budget.try_consume(now).await.unwrap());
         }
 
-        // A brand-new process, a brand-new connection, the same database.
-        let reopened = Budget::new(RunStore::new(open(&f.path)), 2, Stockholm);
-        assert_eq!(reopened.spent_today(now).unwrap(), 2);
+        // A brand-new store handle, the same pool -- standing in for "a
+        // brand-new process, a brand-new connection, the same database".
+        let reopened = Budget::new(RunStore::new(pool), 2, Stockholm);
+        assert_eq!(reopened.spent_today(now).await.unwrap(), 2);
         assert!(
-            !reopened.try_consume(now).unwrap(),
+            !reopened.try_consume(now).await.unwrap(),
             "a restart must not refund the day's spend"
         );
     }
 
-    #[test]
-    fn the_status_line_is_the_pair() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_status_line_is_the_pair(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let now = utc("2026-09-24T12:00:00Z");
         let budget = Budget::new(f.runs.clone(), 60, Stockholm);
-        assert_eq!(budget.status_line(now), "0/60");
-        run_at(&f, "chat", now);
-        assert_eq!(budget.status_line(now), "1/60");
+        assert_eq!(budget.status_line(now).await, "0/60");
+        run_at(&f, "chat", now).await;
+        assert_eq!(budget.status_line(now).await, "1/60");
     }
 
-    #[test]
-    fn the_spent_note_names_the_zone_the_owner_has_to_wait_for() {
-        let f = fixture();
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn the_spent_note_names_the_zone_the_owner_has_to_wait_for(pool: sqlx::PgPool) {
+        let f = fixture(pool);
         let note = Budget::new(f.runs, 60, Stockholm).spent_note();
         assert!(note.contains("budget"), "{note}");
         assert!(note.contains("Europe/Stockholm"), "{note}");
