@@ -1599,6 +1599,9 @@ mod tests {
                 ea_core::store::kv::KvStore::new(pool.clone()),
             ),
             kv: ea_core::store::kv::KvStore::new(pool.clone()),
+            claude_sessions: ea_core::store::claude_sessions::ClaudeSessionStore::new(
+                pool.clone(),
+            ),
             connectors: Vec::new(),
         })
         .register(&mut server);

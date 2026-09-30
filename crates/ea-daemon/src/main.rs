@@ -297,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
         pusher,
         notify_log: NotificationLog::new(KvStore::new(pool.clone())),
         kv: KvStore::new(pool.clone()),
+        claude_sessions: ea_core::store::claude_sessions::ClaudeSessionStore::new(pool.clone()),
         connectors: connector_names,
     });
 

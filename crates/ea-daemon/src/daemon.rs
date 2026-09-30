@@ -38,6 +38,7 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use ea_core::store::actions::{ActionStore, ProposeInput};
+use ea_core::store::claude_sessions::{ClaudeSessionStore, NewSession, SessionQuery};
 use ea_core::store::events::EventStore;
 use ea_core::store::kv::KvStore;
 use ea_core::store::runs::RunStore;
@@ -217,6 +218,52 @@ struct RememberParams {
     body: String,
 }
 
+/// Params of `claude_session.save`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSessionSaveParams {
+    session_id: String,
+    cwd: String,
+    #[serde(default)]
+    git_branch: Option<String>,
+    reason: String,
+}
+
+/// Params of `claude_session.finish`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSessionFinishParams {
+    session_id: String,
+    status: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    transcript: Option<String>,
+}
+
+/// Params of `claude_session.latest`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSessionLatestParams {
+    cwd: String,
+    #[serde(default)]
+    exclude_session: Option<String>,
+}
+
+/// Params of `claude_session.search`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSessionSearchParams {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    days: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 /// Params of `resume_job`.
 #[derive(Debug, Clone, Deserialize)]
 struct JobParams {
@@ -255,6 +302,9 @@ pub struct Deps<C: ToolCaller> {
     /// restart, and where `status` reads it back from. The same `kv` table
     /// `notify_log` uses, under [`PAUSED_KEY`].
     pub kv: KvStore,
+    /// Session handoff notes and transcripts, behind the `claude_session.*`
+    /// methods.
+    pub claude_sessions: ClaudeSessionStore,
     pub connectors: Vec<String>,
 }
 
@@ -271,6 +321,7 @@ pub struct Daemon<C: ToolCaller> {
     pusher: Option<Arc<dyn Pusher>>,
     notify_log: NotificationLog,
     kv: KvStore,
+    claude_sessions: ClaudeSessionStore,
     connectors: Vec<String>,
     started_at: DateTime<Utc>,
 }
@@ -289,6 +340,7 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
             pusher: deps.pusher,
             notify_log: deps.notify_log,
             kv: deps.kv,
+            claude_sessions: deps.claude_sessions,
             connectors: deps.connectors,
             started_at: Utc::now(),
         })
@@ -298,10 +350,11 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
     ///
     /// One place, so that "what can be asked of the daemon over its socket" is
     /// a list you can read in ten seconds rather than something scattered
-    /// through `main`. Thirteen methods; see the module docs for how each one
+    /// through `main`. Seventeen methods; see the module docs for how each one
     /// relates to the gate. The three added with the chat surface — `remember`,
     /// `facts`, `forget` — are reads and writes of the `facts` table, and none
-    /// of them reaches a connector.
+    /// of them reaches a connector. The four `claude_session.*` methods likewise
+    /// touch only the `claude_sessions` table.
     pub fn register(self: &Arc<Self>, server: &mut ipc::Server) {
         macro_rules! method {
             ($name:literal, $call:ident) => {
@@ -326,6 +379,10 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         method!("remember", remember);
         method!("facts", facts);
         method!("forget", forget);
+        method!("claude_session.save", claude_session_save);
+        method!("claude_session.finish", claude_session_finish);
+        method!("claude_session.latest", claude_session_latest);
+        method!("claude_session.search", claude_session_search);
     }
 
     // ----------------------------------------------------------------------
@@ -699,6 +756,78 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         Ok(json!({ "id": params.id, "forgotten": existed }))
     }
 
+    // ----------------------------------------------------------------------
+    // Claude Code sessions
+    //
+    // Four methods over the `claude_sessions` table, called by the session
+    // hook, the MCP tool and the CLI. Local state only, like the memory
+    // methods above.
+    // ----------------------------------------------------------------------
+
+    /// `claude_session.save` — record that a session ended; returns the row.
+    pub async fn claude_session_save(&self, params: Value) -> anyhow::Result<Value> {
+        let params: ClaudeSessionSaveParams = parse_params("claude_session.save", params)?;
+        let row = self
+            .claude_sessions
+            .upsert(&NewSession {
+                session_id: params.session_id,
+                cwd: params.cwd,
+                git_branch: params.git_branch,
+                reason: params.reason,
+            })
+            .await?;
+        serde_json::to_value(row).context("claude_session.save: serialising the session")
+    }
+
+    /// `claude_session.finish` — store the summary and transcript.
+    pub async fn claude_session_finish(&self, params: Value) -> anyhow::Result<Value> {
+        let params: ClaudeSessionFinishParams = parse_params("claude_session.finish", params)?;
+        let updated = self
+            .claude_sessions
+            .finish(
+                &params.session_id,
+                &params.status,
+                params.summary.as_deref(),
+                params.transcript.as_deref(),
+            )
+            .await?;
+        Ok(json!({ "updated": updated }))
+    }
+
+    /// `claude_session.latest` — newest session in a directory, or `null`.
+    pub async fn claude_session_latest(&self, params: Value) -> anyhow::Result<Value> {
+        let params: ClaudeSessionLatestParams = parse_params("claude_session.latest", params)?;
+        let row = self
+            .claude_sessions
+            .latest_for_cwd(&params.cwd, params.exclude_session.as_deref())
+            .await?;
+        serde_json::to_value(row).context("claude_session.latest: serialising the session")
+    }
+
+    /// `claude_session.search` — full-text search over past sessions.
+    pub async fn claude_session_search(&self, params: Value) -> anyhow::Result<Value> {
+        let params: ClaudeSessionSearchParams = parse_params("claude_session.search", params)?;
+        let since = match params.days {
+            None => None,
+            Some(days) if (1..=365).contains(&days) => {
+                Some(Utc::now() - chrono::Duration::days(days))
+            }
+            Some(days) => {
+                bail!("claude_session.search: days must be between 1 and 365, got {days}")
+            }
+        };
+        let hits = self
+            .claude_sessions
+            .search(&SessionQuery {
+                query: params.query.unwrap_or_default(),
+                cwd: params.cwd,
+                since,
+                limit: params.limit,
+            })
+            .await?;
+        serde_json::to_value(hits).context("claude_session.search: serialising the hits")
+    }
+
     /// Put a proposal in front of the human, if there is a way to.
     async fn push(&self, id: i64) {
         let Some(pusher) = self.pusher.as_ref() else {
@@ -930,6 +1059,7 @@ record_voucher = "approve"
                 pusher: Some(Arc::clone(&pusher) as Arc<dyn Pusher>),
                 notify_log: NotificationLog::new(KvStore::new(pool.clone())),
                 kv: KvStore::new(pool.clone()),
+                claude_sessions: ClaudeSessionStore::new(pool.clone()),
                 connectors: vec!["canvas".to_string()],
             });
 
@@ -964,6 +1094,10 @@ record_voucher = "approve"
                 "remember" => self.daemon.remember(params).await,
                 "facts" => self.daemon.facts(params).await,
                 "forget" => self.daemon.forget(params).await,
+                "claude_session.save" => self.daemon.claude_session_save(params).await,
+                "claude_session.finish" => self.daemon.claude_session_finish(params).await,
+                "claude_session.latest" => self.daemon.claude_session_latest(params).await,
+                "claude_session.search" => self.daemon.claude_session_search(params).await,
                 other => panic!("no such method {other}"),
             }
         }
@@ -1101,6 +1235,7 @@ record_voucher = "approve"
             pusher: None,
             notify_log: NotificationLog::new(kv.clone()),
             kv: kv.clone(),
+            claude_sessions: ClaudeSessionStore::new(f.pool.clone()),
             connectors: connectors.iter().map(|c| (*c).to_string()).collect(),
         });
         restore_pause(&kv, &scheduler).await;
@@ -1307,6 +1442,7 @@ record_voucher = "approve"
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(f2.pool.clone())),
             kv: KvStore::new(f2.pool.clone()),
+            claude_sessions: ClaudeSessionStore::new(f2.pool.clone()),
             connectors: vec!["canvas".to_string()],
         });
         let status = daemon.status(Value::Null).await.unwrap();
@@ -1414,6 +1550,7 @@ record_voucher = "approve"
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(f.pool.clone())),
             kv: KvStore::new(f.pool.clone()),
+            claude_sessions: ClaudeSessionStore::new(f.pool.clone()),
             connectors: vec!["canvas".to_string()],
         });
         (f, scheduler, daemon)
@@ -1808,7 +1945,7 @@ record_voucher = "approve"
     /// is exactly what this is for. `connectors.call` was on this socket once
     /// and was removed; nothing of that shape may return.
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
-    async fn the_ipc_surface_is_exactly_these_thirteen_methods(pool: sqlx::PgPool) {
+    async fn the_ipc_surface_is_exactly_these_seventeen_methods(pool: sqlx::PgPool) {
         let f = Fixture::new(pool);
         let dir = TempDir::new().unwrap();
         let mut server = ipc::Server::new(&dir.path().join("d.sock"));
@@ -1819,6 +1956,10 @@ record_voucher = "approve"
             vec![
                 "approve",
                 "chat",
+                "claude_session.finish",
+                "claude_session.latest",
+                "claude_session.save",
+                "claude_session.search",
                 "facts",
                 "forget",
                 "log",
@@ -1832,7 +1973,7 @@ record_voucher = "approve"
                 "status",
             ]
         );
-        assert_eq!(server.methods().len(), 13);
+        assert_eq!(server.methods().len(), 17);
     }
 
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
@@ -2021,6 +2162,7 @@ record_voucher = "approve"
             pusher: None,
             notify_log: NotificationLog::new(KvStore::new(f.pool.clone())),
             kv: KvStore::new(f.pool.clone()),
+            claude_sessions: ClaudeSessionStore::new(f.pool.clone()),
             connectors: Vec::new(),
         });
         daemon.chat(json!({ "message": "hi" })).await.unwrap();
@@ -2117,6 +2259,106 @@ record_voucher = "approve"
         let f = Fixture::new(pool);
         let answer = f.call("forget", json!({ "id": 9999 })).await.unwrap();
         assert_eq!(answer["forgotten"], false);
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn a_claude_session_round_trips_save_finish_search(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let saved = f
+            .call(
+                "claude_session.save",
+                json!({ "session_id": "s1", "cwd": "/w/app", "git_branch": "main", "reason": "exit" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["session_id"], "s1");
+        assert_eq!(saved["status"], "pending");
+
+        let done = f
+            .call(
+                "claude_session.finish",
+                json!({
+                    "session_id": "s1",
+                    "status": "done",
+                    "summary": "wired up the pgvector migration",
+                    "transcript": "we discussed the zebra indexing strategy at length",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done, json!({ "updated": true }));
+        let missing = f
+            .call(
+                "claude_session.finish",
+                json!({ "session_id": "nope", "status": "done" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing, json!({ "updated": false }));
+
+        let hits = f
+            .call(
+                "claude_session.search",
+                json!({ "query": "zebra", "cwd": "/w/app", "days": 7, "limit": 3 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["session_id"], "s1");
+        assert_eq!(hits[0]["summary"], "wired up the pgvector migration");
+
+        let latest = f
+            .call("claude_session.latest", json!({ "cwd": "/w/app" }))
+            .await
+            .unwrap();
+        assert_eq!(latest["session_id"], "s1");
+        let excluded = f
+            .call(
+                "claude_session.latest",
+                json!({ "cwd": "/w/app", "exclude_session": "s1" }),
+            )
+            .await
+            .unwrap();
+        assert!(excluded.is_null());
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claude_session_latest_is_null_for_an_unknown_cwd(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let answer = f
+            .call("claude_session.latest", json!({ "cwd": "/nowhere" }))
+            .await
+            .unwrap();
+        assert!(answer.is_null());
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claude_session_search_refuses_days_out_of_range(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        for days in [0, 366, -1] {
+            let err = f
+                .call("claude_session.search", json!({ "days": days }))
+                .await
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("claude_session.search") && msg.contains("days"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claude_session_methods_refuse_unknown_params(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        let err = f
+            .call("claude_session.latest", json!({ "cwd": "/w", "bogus": 1 }))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("claude_session.latest"),
+            "{err:#}"
+        );
     }
 
     /// The gate, restated for the three methods this task added: memory is
