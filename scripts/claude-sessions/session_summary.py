@@ -4,6 +4,8 @@
 Hook entry points (read hook JSON on stdin, always exit 0):
   save              SessionEnd and PreCompact: insert a pending row, summarize in the background
   load              SessionStart: print the latest summary for this folder as additionalContext
+  record            UserPromptSubmit and Stop: append the prompt or reply to our own session log,
+                    used when Claude Code has not written a transcript file
 Internal:
   summarize <id>    build the summary for one row with `claude -p`
 
@@ -25,6 +27,7 @@ GUARD = "EA_SESSION_SUMMARY"
 URL_FILE = Path.home() / ".config/exec-agent/database.url"
 STATE_DIR = Path.home() / ".local/state/exec-agent"
 LOG_FILE = STATE_DIR / "session-summaries.log"
+SESSION_LOG_DIR = STATE_DIR / "session-logs"
 PSQL_CANDIDATES = ["/opt/homebrew/opt/postgresql@17/bin/psql", "/usr/local/opt/postgresql@17/bin/psql"]
 CLAUDE_CANDIDATES = [str(Path.home() / ".local/bin/claude")]
 
@@ -116,14 +119,20 @@ def git_branch(cwd):
         return None
 
 
+def session_log(session_id):
+    return SESSION_LOG_DIR / f"{os.path.basename(session_id)}.jsonl"
+
+
 def find_transcript(path, session_id):
-    if path and os.path.isfile(path) and os.path.getsize(path) > 0:
-        return path
+    """Claude Code's transcript when it has messages, else our own session log."""
+    candidates = [path] if path else []
     if session_id:
-        hits = glob.glob(str(Path.home() / ".claude/projects/**" / f"{session_id}.jsonl"), recursive=True)
-        hits = [h for h in hits if os.path.getsize(h) > 0]
-        if hits:
-            return max(hits, key=os.path.getsize)
+        candidates += glob.glob(str(Path.home() / ".claude/projects/**" / f"{session_id}.jsonl"), recursive=True)
+    candidates = [c for c in candidates if os.path.isfile(c) and extract_text(c)[1] > 0]
+    if candidates:
+        return max(candidates, key=os.path.getsize)
+    if session_id and session_log(session_id).is_file():
+        return str(session_log(session_id))
     return None
 
 
@@ -161,6 +170,24 @@ def read_hook_input():
         return json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return {}
+
+
+def cmd_record():
+    data = read_hook_input()
+    session_id = data.get("session_id")
+    event = data.get("hook_event_name")
+    if event == "UserPromptSubmit":
+        kind, text = "user", data.get("prompt")
+    elif event == "Stop":
+        kind, text = "assistant", data.get("last_assistant_message")
+    else:
+        return
+    if not session_id or not isinstance(text, str) or not text.strip():
+        return
+    SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {"type": kind, "message": {"content": text}, "timestamp": datetime.now().isoformat(timespec="seconds")}
+    with session_log(session_id).open("a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def cmd_save():
@@ -285,6 +312,8 @@ def main():
             cmd_save()
         elif cmd == "load":
             cmd_load()
+        elif cmd == "record":
+            cmd_record()
         elif cmd == "summarize" and len(sys.argv) > 2:
             cmd_summarize(sys.argv[2])
         else:
