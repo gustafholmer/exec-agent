@@ -2,58 +2,46 @@
 """Claude Code session summaries in the exec_agent Postgres.
 
 Hook entry points (read hook JSON on stdin, always exit 0):
-  save              SessionEnd and PreCompact: insert a pending row, summarize in the background
+  save              SessionEnd and PreCompact: upsert a pending row, summarize in the background
   load              SessionStart: print the latest summary for this folder as additionalContext
   record            UserPromptSubmit and Stop: append the prompt or reply to our own session log,
                     used when Claude Code has not written a transcript file
 Internal:
-  summarize <id>    build the summary for one row with `claude -p`
+  summarize <session_id> <transcript_path>
+                    build the summary with `claude -p` and store it with the transcript
 
-Separate from the exec-agent daemon and its migrations. See
-docs/superpowers/specs/2026-09-30-session-summaries-design.md.
+Writes go through the exec-agent daemon (claude_session.* over its unix socket). When the
+daemon is not running, the same rows are written with psql. The table claude_sessions is
+owned by the daemon's migrations. See
+docs/superpowers/specs/2026-09-30-claude-sessions-in-daemon-design.md.
 """
 
 import glob
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
-import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 GUARD = "EA_SESSION_SUMMARY"
 URL_FILE = Path.home() / ".config/exec-agent/database.url"
 STATE_DIR = Path.home() / ".local/state/exec-agent"
+SOCKET = Path(os.environ.get("EA_STATE_DIR") or STATE_DIR) / "daemon.sock"
 LOG_FILE = STATE_DIR / "session-summaries.log"
 SESSION_LOG_DIR = STATE_DIR / "session-logs"
 PSQL_CANDIDATES = ["/opt/homebrew/opt/postgresql@17/bin/psql", "/usr/local/opt/postgresql@17/bin/psql"]
 CLAUDE_CANDIDATES = [str(Path.home() / ".local/bin/claude")]
 
 MAX_TRANSCRIPT_CHARS = 150_000
+MAX_TRANSCRIPT_BYTES = 400_000
+MAX_SUMMARY_BYTES = 8_000
 MIN_USER_MESSAGES = 2
-LOAD_WAIT_SECONDS = 45
-LOAD_PENDING_MAX_AGE = 300
+DAEMON_TIMEOUT = 5
 SUMMARIZE_TIMEOUT = 240
-
-SCHEMA_SQL = """
-CREATE SCHEMA IF NOT EXISTS claude_code;
-CREATE TABLE IF NOT EXISTS claude_code.session_summaries (
-  id              bigserial PRIMARY KEY,
-  session_id      text        NOT NULL,
-  cwd             text        NOT NULL,
-  git_branch      text,
-  reason          text        NOT NULL,
-  transcript_path text        NOT NULL,
-  summary         text,
-  status          text        NOT NULL DEFAULT 'pending',
-  created_at      timestamptz NOT NULL DEFAULT now(),
-  updated_at      timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS session_summaries_cwd_created
-  ON claude_code.session_summaries (cwd, created_at DESC);
-"""
 
 PROMPT = """Below is a Claude Code session transcript (user and assistant text only).
 Write a handoff note for the next session in the same folder. Format:
@@ -106,8 +94,69 @@ def psql(sql, **params):
     return r.stdout
 
 
-def ensure_schema():
-    psql(SCHEMA_SQL)
+def sql_lit(v):
+    """SQL string literal (standard_conforming_strings), NULL for None; NUL bytes cannot be stored."""
+    if v is None:
+        return "NULL"
+    return "'" + v.replace("\0", "").replace("'", "''") + "'"
+
+
+def cap_tail(s, max_bytes):
+    """The last max_bytes bytes of s, moved forward to a UTF-8 char boundary."""
+    b = s.encode("utf-8")
+    if len(b) <= max_bytes:
+        return s
+    return b[len(b) - max_bytes:].decode("utf-8", errors="ignore")
+
+
+def cap_head(s, max_bytes):
+    """The first max_bytes bytes of s, cut back to a UTF-8 char boundary."""
+    b = s.encode("utf-8")
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", errors="ignore")
+
+
+class DaemonError(Exception):
+    """The daemon answered, with ok=false."""
+
+
+def daemon_call(method, params, timeout=DAEMON_TIMEOUT):
+    """One request/response on the daemon socket. Returns `data`; raises DaemonError on ok=false."""
+    req = json.dumps({"id": str(uuid.uuid4()), "method": method, "params": params}) + "\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(SOCKET))
+        s.sendall(req.encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                raise ConnectionError("daemon closed the connection without a full response")
+            buf += chunk
+    resp = json.loads(buf.split(b"\n", 1)[0])
+    if not resp.get("ok"):
+        raise DaemonError(resp.get("error") or "unknown daemon error")
+    return resp.get("data")
+
+
+def rpc(method, params, fallback):
+    """Call the daemon; when it is down (socket error or timeout) run fallback() instead.
+    A daemon-side error is logged and re-raised, never retried through the fallback."""
+    try:
+        return daemon_call(method, params)
+    except DaemonError as e:
+        log(f"{method}: daemon error: {e}")
+        raise
+    except (OSError, socket.timeout) as e:
+        log(f"{method}: daemon unavailable ({e!r}), using psql")
+    try:
+        return fallback()
+    except RuntimeError as e:
+        if "does not exist" in str(e):
+            log(f"{method}: claude_sessions table missing, is the daemon migrated? {e}")
+            return None
+        raise
 
 
 def git_branch(cwd):
@@ -137,7 +186,7 @@ def find_transcript(path, session_id):
 
 
 def extract_text(transcript_path):
-    """Return (text, user_message_count): user and assistant text, tool traffic dropped."""
+    """Return (text, user_message_count): all user and assistant text, tool traffic dropped."""
     parts, users = [], 0
     with open(transcript_path, errors="replace") as f:
         for line in f:
@@ -161,8 +210,7 @@ def extract_text(transcript_path):
             if kind == "user":
                 users += 1
             parts.append(f"[{kind}] {text}")
-    joined = "\n\n".join(parts)
-    return joined[-MAX_TRANSCRIPT_CHARS:], users
+    return "\n\n".join(parts), users
 
 
 def read_hook_input():
@@ -190,6 +238,15 @@ def cmd_record():
         f.write(json.dumps(entry) + "\n")
 
 
+def save_fallback(p):
+    psql(
+        "INSERT INTO claude_sessions (session_id, cwd, git_branch, reason)"
+        f" VALUES ({sql_lit(p['session_id'])}, {sql_lit(p['cwd'])}, {sql_lit(p['git_branch'])}, {sql_lit(p['reason'])})"
+        " ON CONFLICT (session_id) DO UPDATE SET cwd = EXCLUDED.cwd, git_branch = EXCLUDED.git_branch,"
+        " reason = EXCLUDED.reason, status = 'pending', updated_at = now();"
+    )
+
+
 def cmd_save():
     data = read_hook_input()
     session_id = data.get("session_id") or ""
@@ -197,51 +254,47 @@ def cmd_save():
     event = data.get("hook_event_name") or ""
     reason = "compact" if event == "PreCompact" else (data.get("reason") or "other")
     transcript = data.get("transcript_path") or ""
-    ensure_schema()
-    row_id = psql(
-        "INSERT INTO claude_code.session_summaries (session_id, cwd, git_branch, reason, transcript_path)"
-        " VALUES (:'sid', :'cwd', NULLIF(:'branch', ''), :'reason', :'tp') RETURNING id;",
-        sid=session_id, cwd=cwd, branch=git_branch(cwd) or "", reason=reason, tp=transcript,
-    ).strip()
-    log(f"save id={row_id} session={session_id} reason={reason} transcript={transcript}")
+    if not session_id.strip():
+        log("save: no session_id, nothing to record")
+        return
+    params = {"session_id": session_id, "cwd": cwd, "git_branch": git_branch(cwd), "reason": reason}
+    rpc("claude_session.save", params, lambda: save_fallback(params))
+    log(f"save session={session_id} reason={reason} transcript={transcript}")
     env = dict(os.environ, **{GUARD: "1"})
     subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "summarize", row_id],
+        [sys.executable, os.path.abspath(__file__), "summarize", session_id, transcript],
         env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
 
-def set_status(row_id, status, summary=None):
+def finish_fallback(p):
     psql(
-        "UPDATE claude_code.session_summaries SET status = :'st', summary = NULLIF(:'sm', ''),"
-        " updated_at = now() WHERE id = :'id'::bigint;",
-        st=status, sm=summary or "", id=row_id,
+        f"UPDATE claude_sessions SET status = {sql_lit(p['status'])}, summary = {sql_lit(p.get('summary'))},"
+        f" transcript = {sql_lit(p.get('transcript'))}, updated_at = now()"
+        f" WHERE session_id = {sql_lit(p['session_id'])};"
     )
 
 
-def cmd_summarize(row_id):
-    row = psql(
-        "SELECT json_build_object('sid', session_id, 'tp', transcript_path)"
-        " FROM claude_code.session_summaries WHERE id = :'id'::bigint;",
-        id=row_id,
-    ).strip()
-    if not row:
-        log(f"summarize id={row_id}: no such row")
-        return
-    row = json.loads(row)
-    path = find_transcript(row["tp"], row["sid"])
+def finish(session_id, status, summary=None, transcript=None):
+    params = {"session_id": session_id, "status": status}
+    if summary:
+        params["summary"] = cap_head(summary, MAX_SUMMARY_BYTES)
+    if transcript:
+        params["transcript"] = cap_tail(transcript, MAX_TRANSCRIPT_BYTES)
+    rpc("claude_session.finish", params, lambda: finish_fallback(params))
+
+
+def cmd_summarize(session_id, transcript_path):
+    path = find_transcript(transcript_path, session_id)
     if not path:
-        log(f"summarize id={row_id}: transcript not found ({row['tp']})")
-        set_status(row_id, "failed", "transcript not found")
+        log(f"summarize {session_id}: transcript not found ({transcript_path})")
+        finish(session_id, "failed", "transcript not found")
         return
-    if path != row["tp"]:
-        psql("UPDATE claude_code.session_summaries SET transcript_path = :'tp' WHERE id = :'id'::bigint;",
-             tp=path, id=row_id)
     text, users = extract_text(path)
     if users < MIN_USER_MESSAGES:
-        set_status(row_id, "skipped")
-        log(f"summarize id={row_id}: skipped, {users} user message(s)")
+        finish(session_id, "skipped", transcript=text)
+        log(f"summarize {session_id}: skipped, {users} user message(s)")
         return
     claude = first_existing(CLAUDE_CANDIDATES, "claude")
     work = STATE_DIR / "summarizer"
@@ -249,34 +302,38 @@ def cmd_summarize(row_id):
     try:
         r = subprocess.run(
             [claude, "-p", "--model", "haiku"],
-            input=PROMPT.format(transcript=text), capture_output=True, text=True,
+            input=PROMPT.format(transcript=text[-MAX_TRANSCRIPT_CHARS:]), capture_output=True, text=True,
             timeout=SUMMARIZE_TIMEOUT, cwd=work,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        set_status(row_id, "failed")
-        log(f"summarize id={row_id}: claude error {e}")
+        finish(session_id, "failed", transcript=text)
+        log(f"summarize {session_id}: claude error {e}")
         return
     summary = r.stdout.strip()
     if r.returncode != 0 or not summary:
-        set_status(row_id, "failed")
-        log(f"summarize id={row_id}: claude exit {r.returncode}: {r.stderr.strip()[:300]}")
+        finish(session_id, "failed", transcript=text)
+        log(f"summarize {session_id}: claude exit {r.returncode}: {r.stderr.strip()[:300]}")
         return
-    set_status(row_id, "done", summary)
-    log(f"summarize id={row_id}: done ({len(summary)} chars)")
+    finish(session_id, "done", summary, text)
+    log(f"summarize {session_id}: done ({len(summary)} chars)")
+
+
+def latest_fallback(p):
+    out = psql(
+        "SELECT row_to_json(t) FROM (SELECT id, session_id, cwd, git_branch, reason, status, summary,"
+        " created_at, updated_at FROM claude_sessions"
+        f" WHERE cwd = {sql_lit(p['cwd'])} AND status = 'done' AND summary IS NOT NULL"
+        + (f" AND session_id <> {sql_lit(p['exclude_session'])}" if p.get("exclude_session") else "")
+        + " ORDER BY created_at DESC, id DESC LIMIT 1) t;"
+    ).strip()
+    return json.loads(out) if out else None
 
 
 def latest_row(cwd, exclude_session):
-    out = psql(
-        "SELECT json_build_object('id', id, 'status', status, 'summary', summary,"
-        " 'tp', transcript_path, 'branch', git_branch, 'reason', reason,"
-        " 'created', to_char(created_at, 'YYYY-MM-DD HH24:MI'),"
-        " 'age', extract(epoch FROM now() - created_at))"
-        " FROM claude_code.session_summaries"
-        " WHERE cwd = :'cwd' AND session_id <> :'sid' AND status IN ('pending', 'done')"
-        " ORDER BY created_at DESC LIMIT 1;",
-        cwd=cwd, sid=exclude_session,
-    ).strip()
-    return json.loads(out) if out else None
+    params = {"cwd": cwd}
+    if exclude_session:
+        params["exclude_session"] = exclude_session
+    return rpc("claude_session.latest", params, lambda: latest_fallback(params))
 
 
 def cmd_load():
@@ -284,22 +341,19 @@ def cmd_load():
     if data.get("source") not in ("startup", "clear"):
         return
     cwd = data.get("cwd") or os.getcwd()
-    ensure_schema()
     row = latest_row(cwd, data.get("session_id") or "")
     if not row:
         return
-    deadline = time.monotonic() + LOAD_WAIT_SECONDS
-    while row and row["status"] == "pending" and row["age"] < LOAD_PENDING_MAX_AGE and time.monotonic() < deadline:
-        time.sleep(2)
-        row = latest_row(cwd, data.get("session_id") or "")
-    if not row:
-        return
-    head = f"Previous Claude Code session in this folder ({row['created']}, ended by {row['reason']}"
-    head += f", branch {row['branch']})" if row["branch"] else ")"
-    if row["status"] == "done":
-        body = f"{head}. Summary:\n\n{row['summary']}\n\nFull transcript: {row['tp']}"
-    else:
-        body = f"{head}. Its summary is not ready yet. Full transcript: {row['tp']}"
+    created = (row.get("created_at") or "")[:16].replace("T", " ")
+    head = f"Previous Claude Code session in this folder ({created}, ended by {row['reason']}"
+    head += f", branch {row['git_branch']})" if row.get("git_branch") else ")"
+    body = f"{head}. Summary:\n\n{row['summary']}"
+    try:
+        tp = find_transcript(None, row["session_id"])
+    except OSError:
+        tp = None
+    if tp:
+        body += f"\n\nFull transcript: {tp}"
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": body}}))
 
 
@@ -315,7 +369,7 @@ def main():
         elif cmd == "record":
             cmd_record()
         elif cmd == "summarize" and len(sys.argv) > 2:
-            cmd_summarize(sys.argv[2])
+            cmd_summarize(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "")
         else:
             print(__doc__, file=sys.stderr)
     except Exception as e:  # a hook must never break a session
