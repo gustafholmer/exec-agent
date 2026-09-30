@@ -248,6 +248,9 @@ struct ClaudeSessionLatestParams {
     cwd: String,
     #[serde(default)]
     exclude_session: Option<String>,
+    /// Also return a pending row, so the caller can wait for its summary.
+    #[serde(default)]
+    include_pending: bool,
 }
 
 /// Params of `claude_session.search`.
@@ -799,7 +802,11 @@ impl<C: ToolCaller + Send + Sync + 'static> Daemon<C> {
         let params: ClaudeSessionLatestParams = parse_params("claude_session.latest", params)?;
         let row = self
             .claude_sessions
-            .latest_for_cwd(&params.cwd, params.exclude_session.as_deref())
+            .latest_for_cwd(
+                &params.cwd,
+                params.exclude_session.as_deref(),
+                params.include_pending,
+            )
             .await?;
         serde_json::to_value(row).context("claude_session.latest: serialising the session")
     }
@@ -2320,6 +2327,31 @@ record_voucher = "approve"
             .await
             .unwrap();
         assert!(excluded.is_null());
+    }
+
+    #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]
+    async fn claude_session_latest_include_pending_returns_pending_row(pool: sqlx::PgPool) {
+        let f = Fixture::new(pool);
+        f.call(
+            "claude_session.save",
+            json!({ "session_id": "p1", "cwd": "/w/p", "reason": "clear" }),
+        )
+        .await
+        .unwrap();
+        let plain = f
+            .call("claude_session.latest", json!({ "cwd": "/w/p" }))
+            .await
+            .unwrap();
+        assert!(plain.is_null());
+        let pending = f
+            .call(
+                "claude_session.latest",
+                json!({ "cwd": "/w/p", "include_pending": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending["session_id"], "p1");
+        assert_eq!(pending["status"], "pending");
     }
 
     #[sqlx::test(migrator = "ea_core::db::MIGRATOR")]

@@ -19,12 +19,14 @@ docs/superpowers/specs/2026-09-30-claude-sessions-in-daemon-design.md.
 import glob
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 GUARD = "EA_SESSION_SUMMARY"
@@ -42,6 +44,9 @@ MAX_SUMMARY_BYTES = 8_000
 MIN_USER_MESSAGES = 2
 DAEMON_TIMEOUT = 5
 SUMMARIZE_TIMEOUT = 240
+LOAD_WAIT_SECONDS = 45
+LOAD_PENDING_MAX_AGE = 300
+LOAD_POLL_SECONDS = 2
 
 PROMPT = """Below is a Claude Code session transcript (user and assistant text only).
 Write a handoff note for the next session in the same folder. Format:
@@ -319,10 +324,14 @@ def cmd_summarize(session_id, transcript_path):
 
 
 def latest_fallback(p):
+    if p.get("include_pending"):
+        status = "status IN ('pending', 'done')"
+    else:
+        status = "status = 'done' AND summary IS NOT NULL"
     out = psql(
         "SELECT row_to_json(t) FROM (SELECT id, session_id, cwd, git_branch, reason, status, summary,"
         " created_at, updated_at FROM claude_sessions"
-        f" WHERE cwd = {sql_lit(p['cwd'])} AND status = 'done' AND summary IS NOT NULL"
+        f" WHERE cwd = {sql_lit(p['cwd'])} AND {status}"
         + (f" AND session_id <> {sql_lit(p['exclude_session'])}" if p.get("exclude_session") else "")
         + " ORDER BY created_at DESC, id DESC LIMIT 1) t;"
     ).strip()
@@ -330,10 +339,39 @@ def latest_fallback(p):
 
 
 def latest_row(cwd, exclude_session):
-    params = {"cwd": cwd}
+    """Newest pending or done row for cwd, so load can wait for a summary still being written."""
+    params = {"cwd": cwd, "include_pending": True}
     if exclude_session:
         params["exclude_session"] = exclude_session
     return rpc("claude_session.latest", params, lambda: latest_fallback(params))
+
+
+def parse_ts(value):
+    """A daemon or psql timestamp as an aware datetime, or None."""
+    text = str(value).replace("Z", "+00:00")
+    # older Pythons only accept 3 or 6 fractional digits
+    text = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def row_age(row):
+    """Seconds since the row was last set pending (updated_at, else created_at)."""
+    ts = parse_ts(row.get("updated_at") or row.get("created_at"))
+    if ts is None:
+        return float("inf")
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    return (datetime.now(timezone.utc) - ts).total_seconds()
+
+
+def local_stamp(value):
+    ts = parse_ts(value)
+    if ts is None:
+        return str(value or "")[:16].replace("T", " ")
+    return ts.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def cmd_load():
@@ -341,19 +379,27 @@ def cmd_load():
     if data.get("source") not in ("startup", "clear"):
         return
     cwd = data.get("cwd") or os.getcwd()
-    row = latest_row(cwd, data.get("session_id") or "")
+    exclude = data.get("session_id") or ""
+    row = latest_row(cwd, exclude)
     if not row:
         return
-    created = (row.get("created_at") or "")[:16].replace("T", " ")
-    head = f"Previous Claude Code session in this folder ({created}, ended by {row['reason']}"
+    deadline = time.monotonic() + LOAD_WAIT_SECONDS
+    while row and row["status"] == "pending" and row_age(row) < LOAD_PENDING_MAX_AGE and time.monotonic() < deadline:
+        time.sleep(LOAD_POLL_SECONDS)
+        row = latest_row(cwd, exclude)
+    if not row:
+        return
+    head = f"Previous Claude Code session in this folder ({local_stamp(row.get('created_at'))}, ended by {row['reason']}"
     head += f", branch {row['git_branch']})" if row.get("git_branch") else ")"
-    body = f"{head}. Summary:\n\n{row['summary']}"
     try:
         tp = find_transcript(None, row["session_id"])
     except OSError:
         tp = None
-    if tp:
-        body += f"\n\nFull transcript: {tp}"
+    tail = f" Full transcript: {tp}" if tp else ""
+    if row["status"] == "done" and row.get("summary"):
+        body = f"{head}. Summary:\n\n{row['summary']}" + (f"\n\nFull transcript: {tp}" if tp else "")
+    else:
+        body = f"{head}. Its summary is not ready yet.{tail}"
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": body}}))
 
 

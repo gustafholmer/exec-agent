@@ -170,21 +170,27 @@ impl ClaudeSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Newest finished session with a summary in `cwd`, optionally skipping
-    /// the session that is asking.
+    /// Newest session in `cwd`, optionally skipping the session that is
+    /// asking. By default only finished sessions with a summary count; with
+    /// `include_pending` the newest pending or done row wins, so a caller can
+    /// wait for a summary that is still being written.
     pub async fn latest_for_cwd(
         &self,
         cwd: &str,
         exclude_session: Option<&str>,
+        include_pending: bool,
     ) -> anyhow::Result<Option<ClaudeSession>> {
         sqlx::query_as::<_, ClaudeSession>(&format!(
             "SELECT {SESSION_COLUMNS} FROM claude_sessions \
-             WHERE cwd = $1 AND status = 'done' AND summary IS NOT NULL \
+             WHERE cwd = $1 \
+               AND (($3 AND status IN ('pending', 'done')) \
+                    OR (status = 'done' AND summary IS NOT NULL)) \
                AND ($2::text IS NULL OR session_id <> $2) \
              ORDER BY created_at DESC, id DESC LIMIT 1"
         ))
         .bind(cwd)
         .bind(exclude_session)
+        .bind(include_pending)
         .fetch_optional(&self.pool)
         .await
         .context("latest_for_cwd: querying claude_sessions")
@@ -352,7 +358,11 @@ mod tests {
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
     async fn latest_for_cwd_excludes_current_and_ignores_pending(pool: PgPool) {
         let store = ClaudeSessionStore::new(pool);
-        assert!(store.latest_for_cwd("/a", None).await.unwrap().is_none());
+        assert!(store
+            .latest_for_cwd("/a", None, false)
+            .await
+            .unwrap()
+            .is_none());
         store.upsert(&new("old", "/a")).await.unwrap();
         store
             .finish("old", "done", Some("old note"), None)
@@ -370,16 +380,20 @@ mod tests {
             .await
             .unwrap();
 
-        let latest = store.latest_for_cwd("/a", None).await.unwrap().unwrap();
+        let latest = store
+            .latest_for_cwd("/a", None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.session_id, "cur");
         let latest = store
-            .latest_for_cwd("/a", Some("cur"))
+            .latest_for_cwd("/a", Some("cur"), false)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(latest.session_id, "old");
         assert!(store
-            .latest_for_cwd("/a", Some("old"))
+            .latest_for_cwd("/a", Some("old"), false)
             .await
             .unwrap()
             .is_some());
@@ -389,7 +403,40 @@ mod tests {
             .finish("old", "skipped", Some("x"), None)
             .await
             .unwrap();
-        assert!(store.latest_for_cwd("/a", None).await.unwrap().is_none());
+        assert!(store
+            .latest_for_cwd("/a", None, false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn latest_for_cwd_include_pending_sees_pending_rows(pool: PgPool) {
+        let store = ClaudeSessionStore::new(pool);
+        store.upsert(&new("old", "/a")).await.unwrap();
+        store
+            .finish("old", "done", Some("old note"), None)
+            .await
+            .unwrap();
+        store.upsert(&new("pend", "/a")).await.unwrap();
+        store.upsert(&new("skip", "/a")).await.unwrap();
+        store.finish("skip", "skipped", None, None).await.unwrap();
+
+        let plain = store.latest_for_cwd("/a", None, false).await.unwrap();
+        assert_eq!(plain.unwrap().session_id, "old");
+        let with = store
+            .latest_for_cwd("/a", None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(with.session_id, "pend");
+        assert_eq!(with.status, "pending");
+        let excl = store
+            .latest_for_cwd("/a", Some("pend"), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(excl.session_id, "old");
     }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]

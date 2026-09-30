@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -162,19 +163,68 @@ class SaveTests(Base):
 
 
 class LoadTests(Base):
-    def test_load_prints_summary(self):
-        row = {"session_id": "old", "reason": "clear", "git_branch": "main", "summary": "DONE\n- x",
-               "created_at": "2026-09-30T12:34:56.1+00:00"}
-        with mock.patch.object(ss, "read_hook_input", return_value={"source": "startup", "cwd": "/w", "session_id": "cur"}), \
-                mock.patch.object(ss, "daemon_call", return_value=row) as dc, \
+    HOOK = {"source": "clear", "cwd": "/w", "session_id": "cur"}
+
+    def run_load(self, rows, monotonic=None):
+        """Run cmd_load with daemon_call answering from rows; returns (context, call params, sleeps)."""
+        answers = iter(rows)
+        clock = iter(monotonic) if monotonic else None
+        with mock.patch.object(ss, "read_hook_input", return_value=self.HOOK), \
+                mock.patch.object(ss, "daemon_call", side_effect=lambda m, p: next(answers)) as dc, \
                 mock.patch.object(ss, "find_transcript", return_value=None), \
+                mock.patch.object(ss.time, "sleep") as sl, \
+                mock.patch.object(ss.time, "monotonic", side_effect=(lambda: next(clock)) if clock else (lambda: 0.0)), \
                 mock.patch("builtins.print") as pr:
             ss.cmd_load()
-        self.assertEqual(dc.call_args[0][1], {"cwd": "/w", "exclude_session": "cur"})
-        ctx = json.loads(pr.call_args[0][0])["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("(2026-09-30 12:34, ended by clear, branch main)", ctx)
+        ctx = json.loads(pr.call_args[0][0])["hookSpecificOutput"]["additionalContext"] if pr.call_args else None
+        return ctx, dc, sl
+
+    @staticmethod
+    def row(status, summary=None, age=5):
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+        return {"session_id": "old", "reason": "clear", "git_branch": "main", "status": status,
+                "summary": summary, "created_at": ts, "updated_at": ts}
+
+    def test_done_row_prints_summary_with_local_time(self):
+        row = self.row("done", "DONE\n- x")
+        row["created_at"] = "2026-09-30T12:34:56.1+00:00"
+        ctx, dc, sl = self.run_load([row])
+        self.assertEqual(dc.call_args[0][1], {"cwd": "/w", "include_pending": True, "exclude_session": "cur"})
+        local = datetime(2026, 9, 30, 12, 34, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+        self.assertIn(f"({local}, ended by clear, branch main)", ctx)
         self.assertIn("DONE", ctx)
         self.assertNotIn("Full transcript", ctx)
+        sl.assert_not_called()
+
+    def test_pending_then_done_waits_and_prints_summary(self):
+        ctx, dc, sl = self.run_load([self.row("pending"), self.row("pending"), self.row("done", "the note")])
+        self.assertEqual(dc.call_count, 3)
+        self.assertEqual(sl.call_count, 2)
+        self.assertIn("Summary:\n\nthe note", ctx)
+
+    def test_pending_until_timeout_says_not_ready(self):
+        # monotonic: deadline base, then inside the window twice, then past it
+        ctx, dc, sl = self.run_load([self.row("pending")] * 3, monotonic=[0, 1, 3, 100])
+        self.assertEqual(sl.call_count, 2)
+        self.assertIn("Its summary is not ready yet.", ctx)
+        self.assertNotIn("Summary:", ctx)
+
+    def test_stale_pending_is_not_waited_for(self):
+        ctx, dc, sl = self.run_load([self.row("pending", age=ss.LOAD_PENDING_MAX_AGE + 60)])
+        sl.assert_not_called()
+        self.assertIn("not ready yet", ctx)
+
+    def test_no_row_prints_nothing(self):
+        ctx, dc, sl = self.run_load([None])
+        self.assertIsNone(ctx)
+
+    def test_fallback_query_includes_pending(self):
+        with mock.patch.object(ss, "psql", return_value="") as ps:
+            ss.latest_fallback({"cwd": "/w", "include_pending": True, "exclude_session": "cur"})
+        self.assertIn("status IN ('pending', 'done')", ps.call_args[0][0])
+        with mock.patch.object(ss, "psql", return_value="") as ps:
+            ss.latest_fallback({"cwd": "/w"})
+        self.assertIn("status = 'done' AND summary IS NOT NULL", ps.call_args[0][0])
 
 
 if __name__ == "__main__":
