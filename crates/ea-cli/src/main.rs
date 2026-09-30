@@ -87,6 +87,20 @@ enum Command {
     Facts,
     /// Delete one fact, by the id `ea facts` shows.
     Forget { id: i64 },
+    /// Search past Claude Code sessions (summaries and transcripts).
+    Sessions {
+        /// Words to look for. With none, lists the most recent sessions.
+        query: Option<String>,
+        /// Only sessions started in this directory (`.` works).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Only sessions from the last N days (the daemon checks the range).
+        #[arg(long)]
+        days: Option<i64>,
+        /// At most N sessions (the daemon checks the range).
+        #[arg(long)]
+        limit: Option<i64>,
+    },
 }
 
 #[tokio::main]
@@ -127,6 +141,32 @@ async fn main() -> anyhow::Result<()> {
         Command::Facts => {
             let data = client.call("facts", Value::Null).await?;
             print!("{}", render_facts(&data));
+        }
+        Command::Sessions {
+            query,
+            cwd,
+            days,
+            limit,
+        } => {
+            let mut params = serde_json::Map::new();
+            if let Some(query) = query {
+                params.insert("query".into(), json!(query));
+            }
+            if let Some(cwd) = cwd {
+                let abs = std::path::absolute(&cwd)
+                    .with_context(|| format!("resolving --cwd {}", cwd.display()))?;
+                params.insert("cwd".into(), json!(abs.to_string_lossy()));
+            }
+            if let Some(days) = days {
+                params.insert("days".into(), json!(days));
+            }
+            if let Some(limit) = limit {
+                params.insert("limit".into(), json!(limit));
+            }
+            let data = client
+                .call("claude_session.search", Value::Object(params))
+                .await?;
+            print!("{}", render_sessions(&data));
         }
         Command::Forget { id } => print_json(&client.call("forget", json!({ "id": id })).await?)?,
     }
@@ -228,6 +268,41 @@ fn render_facts(data: &Value) -> String {
         rows.len()
     ));
     out
+}
+
+/// Past Claude Code sessions, one block each: when, where, branch, summary,
+/// and the matching excerpt when there was a query.
+fn render_sessions(data: &Value) -> String {
+    let Some(rows) = data.as_array() else {
+        return format!("{data}\n");
+    };
+    if rows.is_empty() {
+        return "No matching sessions.\n".to_string();
+    }
+
+    let blocks: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            // RFC3339 "2026-09-01T09:00:00+00:00" -> "2026-09-01 09:00".
+            let when = row["created_at"]
+                .as_str()
+                .map(|t| t.chars().take(16).collect::<String>().replace('T', " "))
+                .unwrap_or_else(|| "?".to_string());
+            let mut out = format!("{when} UTC  {}", row["cwd"].as_str().unwrap_or("?"));
+            if let Some(branch) = row["git_branch"].as_str().filter(|b| !b.is_empty()) {
+                out.push_str(&format!("  ({branch})"));
+            }
+            out.push_str(&format!(
+                "\n{}",
+                row["summary"].as_str().unwrap_or("(no summary yet)")
+            ));
+            if let Some(excerpt) = row["excerpt"].as_str().filter(|e| !e.is_empty()) {
+                out.push_str(&format!("\nExcerpt: {excerpt}"));
+            }
+            out
+        })
+        .collect();
+    format!("{}\n", blocks.join("\n\n"))
 }
 
 fn print_json(value: &Value) -> anyhow::Result<()> {
@@ -368,6 +443,36 @@ mod tests {
     fn a_malformed_fact_row_still_prints() {
         let rendered = render_facts(&json!([{ "id": "not a number" }]));
         assert!(rendered.contains("#0  ?"), "{rendered}");
+    }
+
+    #[test]
+    fn no_sessions_says_so() {
+        assert_eq!(render_sessions(&json!([])), "No matching sessions.\n");
+    }
+
+    #[test]
+    fn sessions_show_when_where_summary_and_excerpt() {
+        let rendered = render_sessions(&json!([
+            {
+                "cwd": "/work/app",
+                "git_branch": "main",
+                "summary": "Fixed the bug",
+                "excerpt": "the >>bug<<",
+                "created_at": "2026-09-01T09:05:00+00:00",
+            },
+            { "cwd": "/work/other", "git_branch": null, "summary": null,
+              "excerpt": null, "created_at": "2026-09-02T10:00:00+00:00" }
+        ]));
+        assert!(
+            rendered.starts_with(
+                "2026-09-01 09:05 UTC  /work/app  (main)\nFixed the bug\nExcerpt: the >>bug<<\n\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("2026-09-02 10:00 UTC  /work/other\n(no summary yet)\n"),
+            "{rendered}"
+        );
     }
 
     #[test]
